@@ -1,5 +1,5 @@
 import { createReadStream } from 'node:fs';
-import { mkdir, open, readFile, realpath, rename, link, unlink, stat } from 'node:fs/promises';
+import { mkdir, open, readFile, realpath, rename, link, unlink, stat, lstat } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { positionKey } from '../src/rules.js';
@@ -68,33 +68,121 @@ export async function fileHash(file) {
   return digest.digest('hex');
 }
 
-/**
- * Hold this lock for the entire runner, including replay updates and promotion.
- * It coordinates runners using the same runDir, not unrelated external writers.
- * Stale locks require deliberate recovery: blindly unlinking one can remove a
- * replacement lock acquired by another process during the stale check.
- */
-export async function acquireRunLock(runDir) {
-  await mkdir(runDir, {recursive:true});
-  const file = join(resolve(runDir), '.selfplay.lock');
-  const token = randomUUID();
+const lockPath = runDir => join(resolve(runDir), '.selfplay.lock');
+const sameLockFile = (one, two) => one.isFile() && two.isFile()
+  // Windows lstat may report dev=0 while fstat returns the volume serial.
+  && (one.dev === two.dev || (process.platform === 'win32' && (one.dev === 0n || two.dev === 0n)))
+  && one.ino === two.ino && one.size === two.size
+  && one.mtimeNs === two.mtimeNs && one.ctimeNs === two.ctimeNs;
+
+async function readRunLock(runDir, exitedOwner) {
+  const file = lockPath(runDir);
+  const result = {file, owner:null, live:false, recoverable:false};
   let handle;
-  try { handle = await open(file, 'wx'); }
+  try {
+    const info = await lstat(file, {bigint:true});
+    if (!info.isFile()) return {...result, reason:info.isSymbolicLink() ? 'symbolic-link' : 'not-a-file'};
+    if (info.size > 4096n) return {...result, reason:'malformed'};
+    handle = await open(file, 'r');
+    if (!sameLockFile(info, await handle.stat({bigint:true}))) return {...result, reason:'lock-changed'};
+    // Keep reads bounded even if an outside writer grows the file after stat.
+    const bytes = Buffer.alloc(4097);
+    let length = 0;
+    while (length < bytes.length) {
+      const {bytesRead} = await handle.read(bytes, length, bytes.length - length, null);
+      if (!bytesRead) break;
+      length += bytesRead;
+    }
+    if (BigInt(length) !== info.size || !sameLockFile(info, await handle.stat({bigint:true}))
+      || !sameLockFile(info, await lstat(file, {bigint:true}))) return {...result, reason:'lock-changed'};
+    const raw = bytes.subarray(0, length);
+    let owner;
+    try { owner = JSON.parse(raw.toString('utf8')); }
+    catch { return {...result, reason:'malformed'}; }
+    result.owner = owner;
+    if (!owner || typeof owner !== 'object' || Array.isArray(owner)
+      || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 || owner.pid > 0x7fffffff
+      || typeof owner.token !== 'string' || !owner.token.trim() || owner.token.length > 256) {
+      return {...result, reason:'malformed'};
+    }
+    // Worker threads share the manager's PID. Its exit handler may attest that
+    // this exact invocation exited, while unrelated live owners remain guarded.
+    if (owner.pid === process.pid && exitedOwner?.pid === process.pid && owner.token === exitedOwner.token) {
+      return {...result, recoverable:true, reason:'execution-exited', raw, info};
+    }
+    try {
+      process.kill(owner.pid, 0);
+      return {...result, live:true, reason:'owner-running'};
+    } catch (error) {
+      // EPERM and unknown probe failures cannot prove that the owner exited.
+      if (error.code !== 'ESRCH') return {...result, live:true, reason:'owner-unverifiable'};
+    }
+    return {...result, recoverable:true, reason:'owner-exited', raw, info};
+  } catch (error) {
+    if (missing(error)) return null;
+    if (error.code === 'EACCES' || error.code === 'EPERM') return {...result, reason:'unreadable'};
+    throw error;
+  } finally { await handle?.close(); }
+}
+
+function lockInspection(snapshot) {
+  if (!snapshot) return null;
+  const {raw, info, ...inspection} = snapshot;
+  return inspection;
+}
+
+/** Inspect without modifying a lock. Only ESRCH with valid ownership is recoverable. */
+export async function inspectRunLock(runDir) { return lockInspection(await readRunLock(runDir)); }
+
+/**
+ * Recover a confirmed exited owner, retaining its exact lock bytes as evidence.
+ * The exclusive archive is also a permanent claim for this ownership token:
+ * competing recoverers cannot later unlink a new runner's replacement lock.
+ * A crash after claiming but before unlinking requires manual review of the
+ * claim; never discard claims and retry them automatically.
+ */
+export async function recoverRunLock(runDir, {exitedOwner} = {}) {
+  const snapshot = await readRunLock(runDir, exitedOwner);
+  if (!snapshot) return null;
+  const inspection = lockInspection(snapshot);
+  if (!snapshot.recoverable) return {...inspection, recovered:false};
+  const archivePath = `${snapshot.file}.recovered-${hash(snapshot.owner.token)}`;
+  let archive;
+  try { archive = await open(archivePath, 'wx'); }
   catch (error) {
     if (error.code !== 'EEXIST') throw error;
-    let owner;
-    try {
-      const info = await stat(file);
-      if (info.size <= 4096) owner = JSON.parse(await readFile(file, 'utf8'));
-    } catch { /* A malformed/incomplete lock is also never silently removed. */ }
-    let live = false;
-    if (Number.isSafeInteger(owner?.pid) && owner.pid > 0) {
-      try { process.kill(owner.pid, 0); live = true; }
-      catch (probe) { live = probe.code !== 'ESRCH'; }
-    }
-    if (live) throw new Error(`Self-play is already running under PID ${owner.pid}; lock: ${file}`);
-    throw new Error(`Stale or malformed self-play lock${owner?.pid ? ` for PID ${owner.pid}` : ''}: ${file}. Verify no runner is active, then remove this lock before restarting.`);
+    return {...inspection, recoverable:false, recovered:false, reason:'recovery-claimed', archivePath};
   }
+  try {
+    await archive.writeFile(snapshot.raw);
+    await archive.sync();
+  } finally { await archive.close(); }
+  const current = await readRunLock(runDir, exitedOwner);
+  if (!current?.recoverable || !sameLockFile(snapshot.info, current.info) || !snapshot.raw.equals(current.raw)) {
+    return {...inspection, recoverable:false, recovered:false, reason:'lock-changed', archivePath};
+  }
+  await unlink(snapshot.file);
+  return {...inspection, recovered:true, archivePath, recoveredAt:new Date().toISOString()};
+}
+
+/** Hold the lock across the runner, including replay updates and promotion. */
+export async function acquireRunLock(runDir, {token = randomUUID()} = {}) {
+  if (typeof token !== 'string' || !token.trim() || token.length > 256) throw new Error('Self-play lock token must be a nonempty string of at most 256 characters.');
+  await mkdir(runDir, {recursive:true});
+  const file = lockPath(runDir);
+  let handle;
+  // Bounded retries cover a disappearing lock and a successful stale recovery.
+  for (let attempt = 0; attempt < 4 && !handle; attempt++) {
+    try { handle = await open(file, 'wx'); }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const recovery = await recoverRunLock(runDir);
+      if (!recovery || recovery.recovered) continue;
+      if (recovery.live) throw new Error(`Self-play is already running under PID ${recovery.owner.pid}; lock: ${file}`);
+      throw new Error(`Stale or malformed self-play lock${recovery.owner?.pid ? ` for PID ${recovery.owner.pid}` : ''}: ${file} (${recovery.reason}). Verify no runner is active, then review and remove this lock before restarting.`);
+    }
+  }
+  if (!handle) throw new Error(`Self-play lock kept changing; retry starting the runner: ${file}`);
   try {
     await handle.writeFile(`${JSON.stringify({pid:process.pid, token, createdAt:new Date().toISOString()})}\n`);
     await handle.sync();

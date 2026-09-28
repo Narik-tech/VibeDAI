@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -240,6 +242,123 @@ test('external training locks remain owned by their runner and block local start
   await manager.close();
   assert.equal(await readFile(filename, 'utf8'), lock);
   assert.equal(workers.length, 0);
+});
+
+async function abandonedIteration(runDir, status = 'running') {
+  const folder = path.join(runDir, 'iteration-00000228');
+  const report = { runId: 'abandoned-run', iteration: 228, status, promoted: false,
+    startedAt: '2026-09-23T12:00:00.000Z', options: { games: 16 } };
+  await mkdir(folder);
+  await writeFile(path.join(runDir, 'run.json'), JSON.stringify({ version: 1, runId: report.runId, nextIteration: 229 }));
+  await writeFile(path.join(folder, 'iteration.json'), JSON.stringify(report));
+  await writeFile(path.join(folder, 'report.json'), JSON.stringify(report));
+  await writeFile(path.join(runDir, 'latest.json'), JSON.stringify(report));
+  return { folder, report };
+}
+
+async function exitedPid() {
+  const child = spawn(process.execPath, ['-e', ''], { windowsHide: true });
+  await once(child, 'exit');
+  return child.pid;
+}
+
+test('abandoned process locks and running iteration recover together without changing replay or numbering', async t => {
+  const { manager, runDir, workers } = await fixture(t);
+  const { folder } = await abandonedIteration(runDir);
+  const modelDir = `${manager.options.checkpoint}.selfplay-lock`;
+  await mkdir(modelDir);
+  const owner = { pid: await exitedPid(), token: 'dead-owner', createdAt: '2026-09-23T12:00:00.000Z' };
+  for (const directory of [runDir, modelDir]) await writeFile(path.join(directory, '.selfplay.lock'), JSON.stringify(owner));
+  await writeFile(path.join(runDir, 'replay.jsonl'), 'saved replay');
+  await writeFile(path.join(folder, 'selfplay-001.json'), 'saved game');
+  await writeFile(manager.options.checkpoint, 'saved checkpoint');
+  const snapshots = await Promise.all([manager.snapshot(), manager.snapshot()]);
+  for (const snapshot of snapshots) {
+    assert.equal(snapshot.status.state, 'interrupted');
+    assert.equal(snapshot.status.iteration, 228);
+    assert.equal(snapshot.iterations[0].status, 'interrupted');
+    assert.equal(snapshot.availability.available, true);
+  }
+  const saved = JSON.parse(await readFile(path.join(folder, 'report.json'), 'utf8'));
+  assert.match(saved.error, /process exited/i);
+  assert.equal(saved.interruption.previousStatus, 'running');
+  assert.equal(JSON.parse(await readFile(path.join(runDir, 'latest.json'), 'utf8')).status, 'interrupted');
+  assert.equal(JSON.parse(await readFile(path.join(runDir, 'run.json'), 'utf8')).nextIteration, 229);
+  assert.equal(await readFile(path.join(runDir, 'replay.jsonl'), 'utf8'), 'saved replay');
+  assert.equal(await readFile(path.join(folder, 'selfplay-001.json'), 'utf8'), 'saved game');
+  assert.equal(await readFile(manager.options.checkpoint, 'utf8'), 'saved checkpoint');
+  assert.equal(workers.length, 0);
+  await manager.start({});
+  assert.equal(workers.length, 1);
+});
+
+test('a live checkpoint owner blocks recovery even when the run directory lock is stale', async t => {
+  const { manager, runDir } = await fixture(t);
+  const { folder } = await abandonedIteration(runDir);
+  const stale = JSON.stringify({ pid: await exitedPid(), token: 'stale' });
+  await writeFile(path.join(runDir, '.selfplay.lock'), stale);
+  const modelDir = `${manager.options.checkpoint}.selfplay-lock`;
+  await mkdir(modelDir);
+  await writeFile(path.join(modelDir, '.selfplay.lock'), JSON.stringify({ pid: process.pid, token: 'active-other-run' }));
+  const snapshot = await manager.snapshot();
+  assert.equal(snapshot.status.state, 'external');
+  assert.equal(snapshot.availability.available, false);
+  assert.equal(await readFile(path.join(runDir, '.selfplay.lock'), 'utf8'), stale);
+  assert.equal(JSON.parse(await readFile(path.join(folder, 'report.json'), 'utf8')).status, 'running');
+});
+
+test('worker exit recovers only that invocation locks even while its server PID remains live', async t => {
+  const { manager, runDir, calls, workers } = await fixture(t);
+  await manager.start({});
+  const { folder } = await abandonedIteration(runDir);
+  const modelDir = `${manager.options.checkpoint}.selfplay-lock`;
+  await mkdir(modelDir);
+  for (const directory of [runDir, modelDir]) await writeFile(path.join(directory, '.selfplay.lock'),
+    JSON.stringify({ pid: process.pid, token: calls[0].lockToken }));
+  workers[0].emit('exit', 1);
+  const snapshot = await manager.snapshot();
+  assert.equal(snapshot.status.state, 'failed');
+  assert.equal(snapshot.availability.available, true);
+  assert.equal(JSON.parse(await readFile(path.join(folder, 'report.json'), 'utf8')).status, 'interrupted');
+  await manager.start({});
+});
+
+test('orphaned evaluated reports retain arena evidence and disclose uncertain promotion', async t => {
+  const { manager, runDir } = await fixture(t);
+  const { folder, report } = await abandonedIteration(runDir, 'evaluated');
+  report.arena = { decision: { promote: true } };
+  report.candidateSha256 = 'candidate-hash';
+  await writeFile(path.join(folder, 'report.json'), JSON.stringify(report));
+  const snapshot = await manager.snapshot();
+  assert.equal(snapshot.iterations[0].status, 'interrupted');
+  const saved = (await manager.getIteration('iteration-00000228')).report;
+  assert.equal(saved.arena.decision.promote, true);
+  assert.equal(saved.candidateSha256, 'candidate-hash');
+  assert.match(saved.error, /Promotion was in progress/);
+});
+
+test('recovery resynchronizes latest when the process exited between the two final report writes', async t => {
+  const { manager, runDir } = await fixture(t);
+  const { folder, report } = await abandonedIteration(runDir);
+  report.status = 'complete';
+  report.finishedAt = '2026-09-23T12:01:00.000Z';
+  const original = JSON.stringify(report);
+  await writeFile(path.join(folder, 'report.json'), original);
+  const snapshot = await manager.snapshot();
+  assert.equal(snapshot.status.state, 'completed');
+  assert.equal(snapshot.availability.available, true);
+  assert.deepEqual(JSON.parse(await readFile(path.join(runDir, 'latest.json'), 'utf8')), report);
+  assert.equal(await readFile(path.join(folder, 'report.json'), 'utf8'), original);
+});
+
+test('a corrupt latest summary does not prevent recovering an intact running report', async t => {
+  const { manager, runDir } = await fixture(t);
+  await abandonedIteration(runDir);
+  await writeFile(path.join(runDir, 'latest.json'), '{broken');
+  const snapshot = await manager.snapshot();
+  assert.equal(snapshot.status.state, 'interrupted');
+  assert.equal(snapshot.availability.available, true);
+  assert.equal(JSON.parse(await readFile(path.join(runDir, 'latest.json'), 'utf8')).status, 'interrupted');
 });
 
 test('interrupted iteration manifests and unreadable reports remain visible in saved history', async t => {

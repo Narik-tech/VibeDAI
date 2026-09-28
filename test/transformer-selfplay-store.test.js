@@ -1,11 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile, readdir, mkdir, link, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, readdir, mkdir, link, symlink, lstat, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { atomicWrite, fileHash, acquireRunLock, updateReplay, promoteCheckpoint, MAX_REPLAY_LINE_BYTES } from '../scripts/transformer-selfplay-store.js';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { atomicWrite, fileHash, acquireRunLock, inspectRunLock, recoverRunLock, updateReplay, promoteCheckpoint, MAX_REPLAY_LINE_BYTES } from '../scripts/transformer-selfplay-store.js';
 import { positionKey } from '../src/rules.js';
 
 async function fixture(t) {
@@ -16,6 +18,11 @@ async function fixture(t) {
 const sample = (id, source = 'seed') => ({position:{action:0, board:[[[[id % 25, Math.floor(id / 25) % 25]]]], promotions:[]}, value:id, source});
 const jsonl = records => records.map(record => JSON.stringify(record)).join('\n') + '\n';
 const recordsAt = async file => (await readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
+async function exitedPid() {
+  const child = spawn(process.execPath, ['-e', 'process.exit(0)'], {stdio:'ignore'});
+  await once(child, 'exit');
+  return child.pid;
+}
 const gameSample = (id, gameId, gameResult = 'UNFINISHED') => ({
   ...sample(id, 'transformer-selfplay'), gameId, gameResult,
 });
@@ -48,7 +55,13 @@ test('failed atomic publication removes its temporary file and preserves destina
 
 test('run lock rejects a live owner, releases idempotently, and can then be reacquired', async t => {
   const file = await fixture(t);
+  assert.equal(await inspectRunLock(file('run')), null);
   const release = await acquireRunLock(file('run'));
+  const inspection = await inspectRunLock(file('run'));
+  assert.equal(inspection.owner.pid, process.pid);
+  assert.equal(inspection.live, true);
+  assert.equal(inspection.recoverable, false);
+  assert.equal((await recoverRunLock(file('run'))).recovered, false);
   await assert.rejects(acquireRunLock(file('run')), new RegExp(`already running under PID ${process.pid}`));
   await release(); await release();
   const releaseAgain = await acquireRunLock(file('run'));
@@ -65,6 +78,100 @@ test('stale/malformed locks explain manual recovery and release does not remove 
   await writeFile(lock, JSON.stringify({pid:process.pid, token:'replacement'}));
   await assert.rejects(release(), /ownership changed/);
   assert.equal(JSON.parse(await readFile(lock, 'utf8')).token, 'replacement');
+});
+
+test('a confirmed exited owner is recovered with its exact lock preserved in an archive', async t => {
+  const file = await fixture(t), lock = file('.selfplay.lock');
+  const owner = {pid:await exitedPid(), token:'exited-owner', createdAt:'2026-09-25T00:00:00.000Z'};
+  const raw = `${JSON.stringify(owner)}\n`;
+  await writeFile(lock, raw);
+  assert.deepEqual(await inspectRunLock(file('.')), {file:lock, owner, live:false, recoverable:true, reason:'owner-exited'});
+  const recovery = await recoverRunLock(file('.'));
+  assert.equal(recovery.recovered, true);
+  assert.equal(await readFile(recovery.archivePath, 'utf8'), raw);
+  assert.equal(await inspectRunLock(file('.')), null);
+  assert.equal(await recoverRunLock(file('.')), null);
+});
+
+test('concurrent starts recover one stale lock and retain exactly one new runner lock', async t => {
+  const file = await fixture(t), lock = file('.selfplay.lock');
+  const raw = JSON.stringify({pid:await exitedPid(), token:'concurrent-dead-owner'});
+  await writeFile(lock, raw);
+  const starts = await Promise.allSettled(Array.from({length:16}, () => acquireRunLock(file('.'))));
+  const successful = starts.filter(result => result.status === 'fulfilled');
+  assert.equal(successful.length, 1);
+  assert.equal((await inspectRunLock(file('.'))).live, true);
+  const archives = (await readdir(file('.'))).filter(name => name.startsWith('.selfplay.lock.recovered-'));
+  assert.equal(archives.length, 1);
+  assert.equal(await readFile(file(archives[0]), 'utf8'), raw);
+  await successful[0].value();
+  assert.equal(await inspectRunLock(file('.')), null);
+});
+
+test('an interrupted recovery claim is preserved for manual review', async t => {
+  const file = await fixture(t), lock = file('.selfplay.lock'), token = 'interrupted-owner';
+  const raw = JSON.stringify({pid:await exitedPid(), token});
+  await writeFile(lock, raw);
+  const archive = `${lock}.recovered-${createHash('sha256').update(token).digest('hex')}`;
+  await writeFile(archive, 'incomplete recovery');
+  const recovery = await recoverRunLock(file('.'));
+  assert.equal(recovery.recovered, false);
+  assert.equal(recovery.reason, 'recovery-claimed');
+  await assert.rejects(acquireRunLock(file('.')), /recovery-claimed.*Verify no runner is active/);
+  assert.equal(await readFile(lock, 'utf8'), raw);
+  assert.equal(await readFile(archive, 'utf8'), 'incomplete recovery');
+});
+
+test('EPERM owner probes and malformed ownership never permit automatic recovery', async t => {
+  const file = await fixture(t), lock = file('.selfplay.lock');
+  const probe = t.mock.method(process, 'kill', () => { throw Object.assign(new Error('Access denied'), {code:'EPERM'}); });
+  const owner = {pid:1234, token:'protected-owner'};
+  const raw = JSON.stringify(owner);
+  await writeFile(lock, raw);
+  const inspection = await inspectRunLock(file('.'));
+  assert.equal(inspection.live, true);
+  assert.equal(inspection.recoverable, false);
+  assert.equal((await recoverRunLock(file('.'))).recovered, false);
+  assert.equal(await readFile(lock, 'utf8'), raw);
+  probe.mock.restore();
+  for (const invalid of ['null', '{}', JSON.stringify({pid:1234}), JSON.stringify({pid:1234, token:''}), JSON.stringify({pid:0x80000000, token:'invalid-pid'}), 'x'.repeat(4097)]) {
+    await writeFile(lock, invalid);
+    assert.equal((await inspectRunLock(file('.'))).reason, 'malformed');
+    assert.equal((await recoverRunLock(file('.'))).recovered, false);
+    assert.equal(await readFile(lock, 'utf8'), invalid);
+  }
+  assert.deepEqual(await readdir(file('.')), ['.selfplay.lock']);
+});
+
+test('symbolic-link locks are preserved without touching their target', async t => {
+  const file = await fixture(t), lock = file('.selfplay.lock'), target = file('target.json');
+  const raw = JSON.stringify({pid:await exitedPid(), token:'linked-owner'});
+  await writeFile(target, raw);
+  try { await symlink(target, lock, 'file'); }
+  catch (error) {
+    if (error.code === 'EPERM' || error.code === 'EACCES') return t.skip('Creating symlinks is unavailable for this account.');
+    throw error;
+  }
+  assert.equal((await inspectRunLock(file('.'))).reason, 'symbolic-link');
+  assert.equal((await recoverRunLock(file('.'))).recovered, false);
+  assert.equal((await lstat(lock)).isSymbolicLink(), true);
+  assert.equal(await readFile(target, 'utf8'), raw);
+});
+
+test('confirmed worker exit recovers only the current process and exact invocation token', async t => {
+  const file = await fixture(t);
+  const release = await acquireRunLock(file('.'), {token:'exited-worker'});
+  assert.equal((await inspectRunLock(file('.'))).recoverable, false);
+  assert.equal((await recoverRunLock(file('.'), {exitedOwner:{pid:process.pid + 1, token:'exited-worker'}})).recovered, false);
+  assert.equal((await recoverRunLock(file('.'), {exitedOwner:{pid:process.pid, token:'another-worker'}})).recovered, false);
+  const recovery = await recoverRunLock(file('.'), {exitedOwner:{pid:process.pid, token:'exited-worker'}});
+  assert.equal(recovery.recovered, true);
+  assert.equal(recovery.reason, 'execution-exited');
+  await release();
+  const releaseReplacement = await acquireRunLock(file('.'), {token:'replacement-worker'});
+  assert.equal((await recoverRunLock(file('.'), {exitedOwner:{pid:process.pid, token:'exited-worker'}})).recovered, false);
+  assert.equal((await inspectRunLock(file('.'))).owner.token, 'replacement-worker');
+  await releaseReplacement();
 });
 
 test('large incoming batch retains half historical reservoir and half newest unique samples', async t => {

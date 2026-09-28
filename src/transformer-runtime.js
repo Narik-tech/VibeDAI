@@ -75,8 +75,11 @@ export class TransformerRuntime {
         reject(error);
       };
       child.once('error', error => fail(new Error(`Cannot start transformer: ${error.message}. Run npm run transformer:setup.`)));
-      child.once('exit', code => fail(new Error(`Transformer exited (${code}). ${stderr.trim() || 'Run npm run transformer:doctor.'}`)));
+      child.once('exit', (code, signal) => fail(new Error(`Transformer exited (${signal || code}). ${stderr.trim() || 'Run npm run transformer:doctor.'}`)));
       child.stdin.on('error', error => fail(error));
+      child.stdout.on('error', error => fail(error));
+      child.stderr.on('error', error => fail(error));
+      lines.on('error', error => fail(error));
       lines.on('line', line => {
         // The old process can emit buffered output after checkpoint reload/close.
         if (this.child !== child) return;

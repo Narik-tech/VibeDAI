@@ -242,6 +242,7 @@ function renderIteration() {
   const games = iterationData?.games || [];
   const selfplay = report.selfplay;
   const arena = report.arena?.decision;
+  const stopped = ['failed','interrupted','incomplete'].includes(report.status);
   const selfplayGames = games.filter(game => game.kind === 'selfplay');
   const gameCount = selfplay?.games ?? selfplayGames.length;
   const finishedCount = selfplay?.finished ?? selfplayGames.filter(game => game.valid !== false && game.result && game.result !== 'UNFINISHED').length;
@@ -253,13 +254,15 @@ function renderIteration() {
   $('iteration-metrics').replaceChildren(
     metric('Self-play games',number(gameCount),`${number(finishedCount)} finished · ${number(unfinishedCount)} unfinished`),
     metric('New samples',number(samples),selfplay ? `${number(selfplay.outcomeSamples)} outcome · ${number(selfplay.bootstrapSamples)} search` : 'From completed search targets'),
-    metric('Replay buffer',number(report.replay?.samples),report.replay ? 'Unique retained positions' : 'Waiting for training'),
-    metric('Candidate score',percent(arena?.candidateScore),arena ? `${number(arena.eligiblePairs)} eligible pairs` : 'Waiting for arena results'),
+    metric('Replay buffer',number(report.replay?.samples),report.replay ? 'Unique retained positions' : stopped ? 'Training did not finish' : 'Waiting for training'),
+    metric('Candidate score',percent(arena?.candidateScore),arena ? `${number(arena.eligiblePairs)} eligible pairs` : stopped ? 'No arena result saved' : 'Waiting for arena results'),
   );
   const promotion = $('promotion-notice');
   promotion.classList.toggle('promoted', report.promoted === true);
-  const lead = report.promoted ? 'Candidate promoted. ' : arena ? 'Current model retained. ' : report.status === 'failed' ? 'Iteration failed. ' : report.status === 'interrupted' ? 'Iteration interrupted. ' : 'Promotion pending. ';
-  const reason = arena ? `${human(arena.reason)}. Required score: ${percent(arena.promotionScore)} with ${number(arena.minPairs)} complete, distinct pairs.` : report.error || 'The candidate is evaluated after self-play and training complete.';
+  const lead = stopped ? `Iteration ${human(report.status)}. ` : report.promoted ? 'Candidate promoted. ' : arena ? 'Current model retained. ' : 'Promotion pending. ';
+  const decision = arena ? `${human(arena.reason)}. Required score: ${percent(arena.promotionScore)} with ${number(arena.minPairs)} complete, distinct pairs.` : '';
+  const reason = [report.error, report.promoted && stopped ? 'The candidate was promoted before this iteration stopped.' : '', decision].filter(Boolean).join(' ')
+    || (stopped ? 'Saved games and completed results remain available. Start another run to continue training.' : 'The candidate is evaluated after self-play and training complete.');
   promotion.replaceChildren(element('strong','',lead),document.createTextNode(reason));
   const outcomes = element('div'); outcomes.append(element('strong','','Self-play outcomes'));
   if (selfplay) {

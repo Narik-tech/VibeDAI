@@ -291,11 +291,22 @@ an interrupted generation phase remain in its folder but are not automatically
 merged on restart. Training or arena failures leave the active model intact.
 
 A forced process kill or machine crash can leave `.selfplay.lock` in the run
-directory and/or `model.pt.selfplay-lock/`. The error reports the exact path and
-owner PID. Verify that process is no longer running, then remove only the named
-lock file and rerun. An abrupt crash immediately after atomic model publication
-can leave the report at `evaluated`; compare the active model hash with the
-recorded candidate hash and inspect its saved arena decision and `previous.pt`.
+directory and/or `model.pt.selfplay-lock/`. Opening the Training page or starting
+the runner automatically recovers locks whose recorded owner is confirmed to
+have exited. It archives each old lock as `.selfplay.lock.recovered-...`, marks
+unfinished iteration reports `interrupted`, and repairs `latest.json`. Completed
+games, replay data, checkpoints and the next iteration number are preserved;
+the next run starts a new iteration rather than resuming an unfinished game.
+Training does not restart automatically.
+
+Recovery checks both the run and checkpoint locks, and preserves live,
+unverifiable, malformed or symbolic-link owners. A recovery interrupted after
+claiming an old lock also requires manual review. In those cases the error gives
+the lock path: verify no runner is active before removing only that named lock.
+An abrupt crash immediately after atomic model publication can leave promotion
+uncertain; the recovered report explains this. Compare the active model hash
+with the recorded candidate hash and inspect its saved arena decision and
+`previous.pt`.
 
 To roll back after stopping the loop and current analysis:
 
@@ -316,6 +327,11 @@ exploration and full-rules terminal verification use cooperative work/time caps.
 Stopping prevents new games from starting, signals all active searches, and
 waits for their workers to exit before releasing the run locks. Completed game
 records are saved as they finish, including during a cooperative stop.
+If a trainer exits while another process still holds its output pipes, the
+runner drains output for up to one second before finishing the phase. A trainer
+that ignores a stop signal receives a forced termination after two seconds.
+Worker exits are tied to their invocation tokens, so the server can recover its
+own failed worker without treating the still-running server PID as training.
 
 ## Verification
 

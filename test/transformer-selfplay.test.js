@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { parseArguments, workerAnalyzer } from '../scripts/transformer-selfplay.js';
+import { parseArguments, trainCandidate, workerAnalyzer } from '../scripts/transformer-selfplay.js';
 import { evaluateCandidate } from '../scripts/transformer-selfplay-arena.js';
 import { createPosition } from '../src/rules.js';
 
@@ -129,4 +133,81 @@ test('closing a shared analyzer cancels and drains every search worker', async (
   await analyzer.close();
   await Promise.all(requests);
   await assert.rejects(analyzer(createPosition(), { timeMs: 10000 }), { name: 'AbortError' });
+});
+
+test('closing an analyzer interrupts every shared startup wait', { timeout: 2000 }, async () => {
+  const analyzer = workerAnalyzer({ start: () => new Promise(() => {}) }, undefined, 2);
+  const requests = Array.from({ length: 3 }, () => assert.rejects(analyzer(createPosition(), {
+    maxDepth: 2, maxNodes: 20000, timeMs: 10000,
+  }), { name: 'AbortError' }));
+  await analyzer.close();
+  await Promise.all(requests);
+});
+
+test('a per-search stop interrupts startup before a worker exists', { timeout: 2000 }, async () => {
+  let stop = false;
+  const analyzer = workerAnalyzer({ start: () => new Promise(() => {}) });
+  const request = assert.rejects(analyzer(createPosition(), {
+    timeMs: 10000, shouldStop: () => stop,
+  }), { name: 'AbortError' });
+  stop = true;
+  try { await request; }
+  finally { await analyzer.close(); }
+});
+
+async function trainingFixture(t, onSpawn, shouldStop = () => false) {
+  const directory = await mkdtemp(path.join(tmpdir(), 'vibe-selfplay-trainer-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const files = Object.fromEntries(['replay', 'incumbent', 'candidate', 'log', 'command']
+    .map(name => [name, path.join(directory, name)]));
+  const child = new EventEmitter();
+  child.stdout = new PassThrough(); child.stderr = new PassThrough();
+  child.kill = () => { queueMicrotask(() => child.emit('exit', null, 'SIGTERM')); return true; };
+  const training = trainCandidate({ python: 'python', steps: 1, batchSize: 1, learningRate: .001, device: 'cpu' },
+    files, 42, shouldStop, () => {}, {
+      exitGraceMs: 10, stopGraceMs: 10,
+      spawnProcess() { queueMicrotask(() => onSpawn(child)); return child; },
+    });
+  return { child, files, training };
+}
+
+test('trainer exit settles without waiting forever for inherited pipes to close', { timeout: 2000 }, async t => {
+  const { child, files, training } = await trainingFixture(t, child => {
+    child.stdout.write('final training update\n');
+    child.emit('exit', 0, null);
+    // No close event: a descendant still owns the inherited output pipes.
+  });
+  await training;
+  assert.equal(child.stdout.destroyed, true);
+  assert.equal(child.stderr.destroyed, true);
+  assert.equal(await readFile(files.log, 'utf8'), 'final training update\n');
+});
+
+test('failed trainer exit preserves its status and stderr when pipes remain open', { timeout: 2000 }, async t => {
+  const { training } = await trainingFixture(t, child => {
+    child.stderr.write('training failed before checkpoint save\n');
+    child.emit('exit', 7, null);
+  });
+  await assert.rejects(training, /Training exited \(7\).*training failed before checkpoint save/);
+});
+
+test('trainer cancellation escalates an ignored termination signal and drains output', { timeout: 2000 }, async t => {
+  let stop = false;
+  const signals = [];
+  const { child, training } = await trainingFixture(t, child => {
+    child.kill = (signal = 'SIGTERM') => {
+      signals.push(signal);
+      if (signal === 'SIGKILL') queueMicrotask(() => child.emit('exit', null, signal));
+      return true;
+    };
+    stop = true;
+  }, () => stop);
+  await assert.rejects(training, { name: 'AbortError' });
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+  assert.equal(child.stdout.destroyed, true);
+});
+
+test('a trainer output error stops the child and reports the stream failure', { timeout: 2000 }, async t => {
+  const { training } = await trainingFixture(t, child => child.stdout.emit('error', new Error('output pipe failed')));
+  await assert.rejects(training, /output pipe failed/);
 });

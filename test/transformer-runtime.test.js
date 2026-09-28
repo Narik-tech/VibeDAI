@@ -117,6 +117,35 @@ test('inference timeout clears pending requests and allows a fresh process', asy
   assert.equal(runtime.state, 'ready');
 });
 
+test('unexpected process exit rejects startup and active inference without waiting for timeouts', async t => {
+  const { runtime, children, ready } = await fixture(t);
+  const startup = assert.rejects(runtime.start(), /Transformer exited \(SIGKILL\)/);
+  children[0].emit('exit', null, 'SIGKILL');
+  await startup;
+  const child = await ready();
+  const next = once(child, 'request');
+  const evaluation = assert.rejects(runtime.evaluate([{}]), /Transformer exited \(9\)/);
+  await next;
+  child.emit('exit', 9, null);
+  await evaluation;
+  assert.equal(runtime.pending.size, 0);
+  assert.equal(runtime.state, 'error');
+});
+
+test('output pipe errors reject inference and stop the service without an uncaught error', async t => {
+  for (const stream of ['stdout', 'stderr']) {
+    const { runtime, ready } = await fixture(t);
+    const child = await ready();
+    const next = once(child, 'request');
+    const evaluation = assert.rejects(runtime.evaluate([{}]), /output pipe failed/);
+    await next;
+    child[stream].emit('error', new Error('output pipe failed'));
+    await evaluation;
+    assert.equal(runtime.pending.size, 0);
+    assert.equal(child.killed, true);
+  }
+});
+
 test('server close interrupts an HTTP request waiting for model startup', async t => {
   const {runtime} = await fixture(t);
   let didStart;

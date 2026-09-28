@@ -2,6 +2,8 @@
 import { spawn } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
 import { createWriteStream } from 'node:fs';
+import { once } from 'node:events';
+import { finished } from 'node:stream/promises';
 import { readFile, mkdir, readdir, lstat, realpath, unlink, rmdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +15,7 @@ import { generateSelfPlayGames } from './transformer-selfplay-games.js';
 import { createInferenceQueue } from './transformer-selfplay-inference.js';
 import { evaluateCandidate } from './transformer-selfplay-arena.js';
 import { atomicWrite, fileHash, acquireRunLock, updateReplay, promoteCheckpoint } from './transformer-selfplay-store.js';
+import { recoverInterruptedIterations } from './transformer-selfplay-recovery.js';
 
 const defaults = {
   iterations: 1, games: 8, gameConcurrency: 1, maxPlies: 40, maxNodes: 20000, maxDepth: 2, timeMs: 3000,
@@ -125,7 +128,14 @@ export function workerAnalyzer(runtime, shouldStop = () => false, maxConcurrency
   const search = async (position, options) => {
     const stopped = () => closed || shouldStop() || Boolean(options.shouldStop?.());
     checkStop(stopped);
-    const info = await runtime.start();
+    let stopStartup, startupPoll, info;
+    const startupCancelled = new Promise((resolve, reject) => {
+      stopStartup = () => reject(cancelled());
+      cancellations.add(stopStartup);
+      startupPoll = setInterval(() => { if (stopped()) stopStartup(); }, 25);
+    });
+    try { info = await Promise.race([runtime.start(), startupCancelled]); }
+    finally { clearInterval(startupPoll); cancellations.delete(stopStartup); }
     checkStop(stopped);
     // A game can hit its transport timeout before its old worker has exited.
     // Hold a physical slot through termination so its replacement cannot
@@ -191,7 +201,8 @@ export function workerAnalyzer(runtime, shouldStop = () => false, maxConcurrency
   return analyze;
 }
 
-async function trainCandidate(options, files, seed, shouldStop, onEvent = emit) {
+export async function trainCandidate(options, files, seed, shouldStop, onEvent = emit,
+  { spawnProcess = spawn, exitGraceMs = 1000, stopGraceMs = 2000 } = {}) {
   checkStop(shouldStop);
   const args = ['-u', path.join(PROJECT_ROOT, 'neural/train.py'), '--data', files.replay,
     '--resume', files.incumbent, '--output', files.candidate, '--steps', String(options.steps),
@@ -201,25 +212,57 @@ async function trainCandidate(options, files, seed, shouldStop, onEvent = emit) 
     '--label', 'Experimental transformer self-play value model; promotion arena recorded separately'];
   await atomicWrite(files.command, json({ executable: options.python, args }));
   const log = createWriteStream(files.log, { flags: 'wx' });
-  const child = spawn(options.python, args, { cwd: PROJECT_ROOT, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-  let tail = '';
-  child.stdout.on('data', chunk => { log.write(chunk); tail = (tail + chunk.toString()).slice(-6000); });
-  child.stderr.on('data', chunk => { log.write(chunk); tail = (tail + chunk.toString()).slice(-6000); });
-  const poll = setInterval(() => { if (shouldStop()) child.kill(); }, 100);
-  const heartbeat = setInterval(() => onEvent('training-progress', { log: files.log }), 30000);
+  let poll, heartbeat, exitTimer, killTimer;
   try {
+    // Do not launch a trainer unless its exclusive log opened successfully.
+    await once(log, 'open');
+    checkStop(shouldStop);
+    const child = spawnProcess(options.python, args, { cwd: PROJECT_ROOT, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let tail = '', failure, exited = false, stopping = false;
+    const output = chunk => {
+      if (!log.destroyed) log.write(chunk);
+      tail = (tail + chunk.toString()).slice(-6000);
+    };
+    child.stdout.on('data', output);
+    child.stderr.on('data', output);
     await new Promise((resolve, reject) => {
-      log.once('error', error => { child.kill(); reject(error); });
-      child.once('error', reject);
-      child.once('close', code => {
+      const stop = () => {
+        if (stopping || exited) return;
+        stopping = true;
+        child.kill();
+        killTimer = setTimeout(() => { if (!exited) child.kill('SIGKILL'); }, stopGraceMs);
+      };
+      const finish = (code, signal) => {
         if (shouldStop()) reject(cancelled());
+        else if (failure) reject(failure);
         else if (code === 0) resolve();
-        else reject(new Error(`Training exited (${code}). ${tail.trim()}`));
+        else reject(new Error(`Training exited (${signal || code}). ${tail.trim()}`));
+      };
+      const failOutput = error => { failure ??= error; stop(); };
+      log.once('error', failOutput);
+      child.stdout.once('error', failOutput);
+      child.stderr.once('error', failOutput);
+      child.once('error', reject);
+      child.once('exit', (code, signal) => {
+        exited = true;
+        clearTimeout(killTimer);
+        // Descendants can retain inherited pipes after the trainer has exited,
+        // preventing ChildProcess.close forever. Allow buffered output to drain,
+        // then release those handles and settle from the actual exit status.
+        exitTimer = setTimeout(() => {
+          child.stdout.destroy(); child.stderr.destroy();
+          finish(code, signal);
+        }, exitGraceMs);
       });
+      child.once('close', finish);
+      poll = setInterval(() => { if (shouldStop()) stop(); }, 100);
+      heartbeat = setInterval(() => onEvent('training-progress', { log: files.log }), 30000);
     });
   } finally {
     clearInterval(poll); clearInterval(heartbeat);
-    await new Promise(resolve => log.end(resolve));
+    clearTimeout(exitTimer); clearTimeout(killTimer);
+    if (!log.destroyed) log.end();
+    await finished(log).catch(() => {});
   }
 }
 
@@ -243,7 +286,7 @@ async function pruneIterations(runDir, runId, keep) {
   }
 }
 
-export async function runSelfPlay(options, { shouldStop = () => false, onRuntime = () => {}, onEvent = emit } = {}) {
+export async function runSelfPlay(options, { shouldStop = () => false, onRuntime = () => {}, onEvent = emit, lockToken } = {}) {
   options = { ...options };
   await mkdir(options.runDir, { recursive: true });
   // Resolve existing symlinks before output validation and checkpoint locking.
@@ -251,7 +294,7 @@ export async function runSelfPlay(options, { shouldStop = () => false, onRuntime
     options[name] = await realpath(options[name]).catch(error => { if (error.code !== 'ENOENT') throw error; return options[name]; });
   }
   validateManagedPaths(options);
-  const release = await acquireRunLock(options.runDir);
+  const release = await acquireRunLock(options.runDir, { token: lockToken });
   let releaseModel;
   const runtimes = new Set(), analyzers = new Set();
   const openRuntime = checkpoint => {
@@ -270,7 +313,8 @@ export async function runSelfPlay(options, { shouldStop = () => false, onRuntime
   };
   try {
     // A common checkpoint lock also excludes runners using different run directories.
-    releaseModel = await acquireRunLock(`${options.checkpoint}.selfplay-lock`);
+    releaseModel = await acquireRunLock(`${options.checkpoint}.selfplay-lock`, { token: lockToken });
+    await recoverInterruptedIterations(options);
     const marker = path.join(options.runDir, 'run.json');
     let run;
     try { run = JSON.parse(await readFile(marker, 'utf8')); }

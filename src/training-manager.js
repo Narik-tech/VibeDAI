@@ -1,7 +1,10 @@
 import path from 'node:path';
 import { open, readdir, lstat, stat, realpath } from 'node:fs/promises';
 import { Worker } from 'node:worker_threads';
+import { randomUUID } from 'node:crypto';
 import { getSelfPlayDefaults, parseArguments } from '../scripts/transformer-selfplay.js';
+import { acquireRunLock, inspectRunLock, recoverRunLock } from '../scripts/transformer-selfplay-store.js';
+import { findInterruptedIterations, recoverInterruptedIterations } from '../scripts/transformer-selfplay-recovery.js';
 import { DEFAULT_CHECKPOINT, DEFAULT_PYTHON } from './transformer-runtime.js';
 import { raw, positionKey, validateAction } from './rules.js';
 
@@ -86,7 +89,7 @@ function assertPosition(position) {
   if (!boards) throw failure('The saved game has no starting boards.');
 }
 
-/** Owns UI-launched work only; external runner locks are inspected, never changed. */
+/** Owns UI-launched work; recovers abandoned runs only after verifying their owner exited. */
 export class TrainingManager {
   constructor({ runDir = runnerDefaults.runDir, checkpoint = runnerDefaults.checkpoint, python = runnerDefaults.python,
     workerFactory = data => new Worker(new URL('./training-worker.js', import.meta.url), { workerData: data }), availability } = {}) {
@@ -107,32 +110,57 @@ export class TrainingManager {
     this.worker = null;
   }
 
-  async lockInfo() {
+  async lockDirectories() {
     const checkpoint = await realpath(this.options.checkpoint).catch(error => { if (!missing(error)) throw error; return this.options.checkpoint; });
-    for (const file of [path.join(this.options.runDir, '.selfplay.lock'), path.join(`${checkpoint}.selfplay-lock`, '.selfplay.lock')]) {
-      let owner;
-      try { owner = await readJSON(file, 4096); }
-      catch (error) {
-        if (missing(error)) continue;
-        return { available: false, reason: `A malformed or unreadable self-play lock needs manual review: ${file}` };
-      }
-      let live = false;
-      if (Number.isSafeInteger(owner?.pid) && owner.pid > 0) {
-        try { process.kill(owner.pid, 0); live = true; }
-        catch (error) { live = error.code !== 'ESRCH'; }
-      }
-      return { available: false, external: live, startedAt: owner?.createdAt,
-        reason: live ? `Training is running outside this page (PID ${owner.pid}). Review is available; stop it in its owning terminal.`
-          : 'A stale self-play lock needs manual review before starting. Verify that its runner has stopped before removing the lock.' };
-    }
+    return [this.options.runDir, `${checkpoint}.selfplay-lock`];
+  }
+
+  async locks() { return (await Promise.all((await this.lockDirectories()).map(directory => inspectRunLock(directory)))).filter(Boolean); }
+
+  lockFailure(locks) {
+    // A stale run lock must never hide a live owner of the shared checkpoint.
+    const lock = locks.find(item => item.live) ?? locks.find(item => !item.recoverable) ?? locks[0];
+    if (lock) return { available: false, external: lock.live, startedAt: lock.owner?.createdAt,
+      reason: lock.live ? `Training is running outside this page (PID ${lock.owner.pid}). Review is available; stop it in its owning terminal.`
+        : `A self-play lock needs manual review (${lock.reason || 'unknown owner'}): ${lock.file}` };
     return null;
   }
 
+  async lockInfo() { return this.lockFailure(await this.locks()); }
+
+  async reconcile() {
+    if (this.recovering) return this.recovering;
+    const recovering = (async () => {
+      const locks = await this.locks();
+      if (locks.some(lock => lock.live || !lock.recoverable)) return this.lockFailure(locks);
+      if (!locks.length && !(await findInterruptedIterations(this.options)).length) return null;
+      const releases = [];
+      try {
+        // Holding both locks closes the race with a terminal-launched runner.
+        for (const directory of await this.lockDirectories()) releases.push(await acquireRunLock(directory));
+        const recovered = await recoverInterruptedIterations(this.options);
+        const latest = recovered.at(-1);
+        if (latest && this.state.state === 'idle') {
+          const state = latest.status === 'complete' ? 'completed' : latest.status;
+          Object.assign(this.state, { state, phase: state, iteration: latest.iteration,
+            startedAt: latest.startedAt, finishedAt: latest.finishedAt, error: latest.error ?? null });
+        }
+        return null;
+      } catch (error) {
+        return { available: false, reason: `Training recovery could not finish: ${error.message}` };
+      } finally { for (const release of releases.reverse()) await release(); }
+    })();
+    this.recovering = recovering;
+    try { return await recovering; }
+    finally { if (this.recovering === recovering) this.recovering = null; }
+  }
+
   async availability({ ignoreOwned = false } = {}) {
+    if (this.settling) await this.finished;
     if (this.closed) return { available: false, reason: 'The local server is shutting down.' };
     if (!ignoreOwned && (this.worker || this.starting)) return { available: false, reason: 'A training run is already active.' };
     if (this.configurationError) return { available: false, reason: this.configurationError };
-    const lock = await this.lockInfo();
+    const lock = await this.reconcile();
     if (lock) return lock;
     if (this.checkAvailability) return this.checkAvailability();
     for (const [name, file, reason] of [
@@ -178,7 +206,8 @@ export class TrainingManager {
       if (!available.available) throw failure(available.reason, available.external ? 409 : 503);
       this.cancellation = new Int32Array(new SharedArrayBuffer(4));
       this.state = { state: 'running', phase: 'starting', iteration: null, startedAt: new Date().toISOString(), error: null, events: [] };
-      const worker = this.workerFactory({ options: { ...this.options, ...editable }, cancelBuffer: this.cancellation.buffer });
+      const lockToken = randomUUID();
+      const worker = this.workerFactory({ options: { ...this.options, ...editable }, cancelBuffer: this.cancellation.buffer, lockToken });
       this.worker = worker;
       let finished;
       this.finished = new Promise(resolve => { finished = resolve; });
@@ -201,8 +230,16 @@ export class TrainingManager {
         const result = this.result ?? (this.state.state === 'stopping' ? { state: 'interrupted', error: null }
           : { state: 'failed', error: `Training worker exited without a completion report (${code}).` });
         Object.assign(this.state, result, { phase: result.state, finishedAt: new Date().toISOString() });
-        this.result = null; this.worker = null;
-        finished();
+        this.result = null;
+        this.settling = true;
+        (async () => {
+          try {
+            for (const directory of await this.lockDirectories()) await recoverRunLock(directory, { exitedOwner: { pid: process.pid, token: lockToken } });
+            const recovery = await this.reconcile();
+            if (recovery && !this.state.error) this.state.error = recovery.reason;
+          } catch (error) { this.state.error = [this.state.error, `Training recovery failed: ${error.message}`].filter(Boolean).join(' '); }
+          finally { this.worker = null; this.settling = false; finished(); }
+        })();
       });
       return this.status();
     } catch (error) {
@@ -212,6 +249,7 @@ export class TrainingManager {
   }
 
   stop() {
+    if (this.settling) return this.status();
     if (this.starting && !this.worker) {
       this.pendingStop = true;
       this.state = { state: 'stopping', phase: 'starting', iteration: null, startedAt: null, error: null, events: [] };

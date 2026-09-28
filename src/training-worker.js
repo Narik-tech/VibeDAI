@@ -11,6 +11,7 @@ const stop = () => {
 parentPort.on('message', message => { if (message?.type === 'stop') stop(); });
 try {
   await runSelfPlay(workerData.options, {
+    lockToken: workerData.lockToken,
     shouldStop,
     onRuntime(runtime) {
       for (const previous of runtimes) if (previous.closed) runtimes.delete(previous);
