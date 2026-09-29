@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   raw, generateActions, applyMove, parseMove, canSubmit, inCheck, positionKey, validateAction,
-  createPosition, pseudoMoves, isTacticalMove,
+  createPosition, pseudoMoves, isTacticalMove, createSearchRoyalSafety,
 } from '../src/rules.js';
 
 const clearBoard = () => [[12, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 11]];
@@ -222,6 +222,33 @@ test('source-indexed geometry preserves move order, policy omissions and travers
       return { actions, ticks, skipped };
     };
     assert.deepEqual(run(true), run(false), 'indexing may not change order, legality, work budgets or policy evidence');
+  }
+});
+
+test('search-scoped royal scans preserve action order and work across repeated traversals', () => {
+  const first = clearBoard(); first[0][1] = 4;
+  const starts = [createPosition(), position([[first], [checkedBoard()], [clearBoard()]])];
+  for (const start of starts) {
+    const royalSafety = createSearchRoyalSafety(), before = positionKey(start);
+    for (const skipOptionalSpatial of [false, true]) for (const tacticalOnly of [false, true]) {
+      const run = safety => {
+        let ticks = 0;
+        const actions = [...generateActions(start, {
+          royalSafety: safety, skipOptionalSpatial, tacticalOnly, tick: () => ticks++,
+        })];
+        return { actions, ticks };
+      };
+      const expected = run(undefined);
+      assert.deepEqual(run(royalSafety), expected);
+      assert.deepEqual(run(royalSafety), expected);
+      for (const child of expected.actions.slice(0, 5)) {
+        assert.equal(royalSafety.inCheck(child.position), inCheck(child.position));
+        const options = { skipOptionalSpatial, tacticalOnly };
+        assert.deepEqual([...generateActions(child.position, { ...options, royalSafety })],
+          [...generateActions(child.position, options)]);
+      }
+    }
+    assert.equal(positionKey(start), before);
   }
 });
 

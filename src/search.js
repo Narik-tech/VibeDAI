@@ -1,5 +1,5 @@
-import { createPositionKeyCache, generateActions, inCheck } from './rules.js';
-import { evaluate, pieceValuesFor } from './evaluate.js';
+import { createPositionKeyCache, createSearchRoyalSafety, generateActions } from './rules.js';
+import { createEvaluator, pieceValuesFor } from './evaluate.js';
 import { normalizeHeuristics } from './heuristics.js';
 import { SearchCache } from './search-cache.js';
 
@@ -66,6 +66,7 @@ export function createSearchSession(position, options = {}) {
   const heuristics = qDepth === configuredHeuristics.quiescenceDepth ? configuredHeuristics
     : normalizeHeuristics({ ...configuredHeuristics, quiescenceDepth: qDepth });
   const pieceValues = pieceValuesFor(heuristics);
+  const evaluate = createEvaluator(heuristics), royalSafety = createSearchRoyalSafety();
   const timeMs = finiteOption(options.timeMs, 3000, 0, 3_600_000);
   const maxDepth = Math.floor(finiteOption(options.maxDepth, 8, 1, 64));
   const maxNodes = Math.floor(finiteOption(options.maxNodes, 2_000_000, 0, 1_000_000_000));
@@ -100,11 +101,11 @@ export function createSearchSession(position, options = {}) {
     }
   }
   function staticScore(pos) {
-    if (!evalCache.has(pos)) evalCache.set(pos, Math.max(-MATE_THRESHOLD + 1, Math.min(MATE_THRESHOLD - 1, evaluate(pos, heuristics) * colorSign(pos))));
+    if (!evalCache.has(pos)) evalCache.set(pos, Math.max(-MATE_THRESHOLD + 1, Math.min(MATE_THRESHOLD - 1, evaluate(pos) * colorSign(pos))));
     return evalCache.get(pos);
   }
   function checked(pos) {
-    if (!checkCache.has(pos)) checkCache.set(pos, inCheck(pos));
+    if (!checkCache.has(pos)) checkCache.set(pos, royalSafety.inCheck(pos));
     return checkCache.get(pos);
   }
   function orderingFeatures(pos, move) {
@@ -118,8 +119,9 @@ export function createSearchSession(position, options = {}) {
     }
     return features;
   }
-  function orderMoves(pos, moves, favorites, killerMoves, spatialFirst = false) {
-    const ordered = new Array(moves.length);
+  function* orderMoves(pos, moves, favorites, killerMoves, spatialFirst = false) {
+    const priorities = new Float64Array(moves.length);
+    let first = 0;
     for (let index = 0; index < moves.length; index++) {
       const move = moves[index];
       const f = orderingFeatures(pos, move);
@@ -134,14 +136,19 @@ export function createSearchSession(position, options = {}) {
       // Unforced early branching expands the reply tree enormously. Explore
       // ordinary development before speculative travel unless it wins material.
       if (f.temporal) priority -= spatialFirst ? heuristics.temporalMovePenalty : 100;
-      f.priority = priority;
-      ordered[index] = f;
+      priorities[index] = priority;
+      if (priority > priorities[first]) first = index;
     }
-    // Sorting is synchronous and stable: reusing feature records preserves
-    // tied move order and needs no per-pass wrapper objects or index fields.
-    ordered.sort((a, b) => b.priority - a.priority);
-    for (let index = 0; index < ordered.length; index++) ordered[index] = ordered[index].move;
-    return ordered;
+    if (!moves.length) return;
+    yield moves[first];
+    // A beta cutoff often needs only the best component. Defer sorting and
+    // allocating its remaining indices until another component is requested.
+    // Numeric snapshots remain stable when deeper sibling visits reuse the
+    // same move features and update history while this iterator is suspended.
+    const ordered = [];
+    for (let index = 0; index < moves.length; index++) if (index !== first) ordered.push(index);
+    ordered.sort((a, b) => priorities[b] - priorities[a]);
+    for (const index of ordered) yield moves[index];
   }
   function actions(pos, preferred, ply, { spatialFirst = true, tacticalOnly = false, restricted = true } = {}) {
     // The iterator is suspended while deeper plies search; only those deeper
@@ -149,7 +156,7 @@ export function createSearchSession(position, options = {}) {
     // including its many alternative component sequences.
     let favorites, killerMoves;
     const iterator = generateActions(pos, {
-      tick: () => tick(), tacticalOnly, preferredAction: preferred, keyPosition, skipOptionalSpatial: restricted,
+      tick: () => tick(), tacticalOnly, preferredAction: preferred, keyPosition, royalSafety, skipOptionalSpatial: restricted,
       onSkipOptionalSpatial: () => policyPruned.add(iterator),
       orderMoves: (current, moves) => orderMoves(current, moves,
         favorites ??= new Set((preferred || []).map(moveKey)),

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { raw, createPosition, pseudoMoves, applyMove, positionKey } from '../src/rules.js';
+import { raw, createPosition, pseudoMoves, applyMove, positionKey, inCheck, createSearchRoyalSafety } from '../src/rules.js';
 import { createRoyalSafety } from '../src/royal-safety.js';
 
 const { attackedByNextPlayer, findRoyalAttack } = createRoyalSafety(raw);
@@ -140,4 +140,38 @@ test('real histories and every next component retain upstream attack results', (
       compare({ ...next, action: next.action + 1 });
     }
   }
+});
+
+test('search royal safety reuses immutable siblings and forced passes without changing results', () => {
+  const freeze = value => {
+    if (Array.isArray(value)) { for (const item of value) freeze(item); Object.freeze(value); }
+  };
+  for (const setup of [{}, { variant: 'two_timelines' }, { pgn: '1. Nf3 / Nf6 2. Nc3 / Nc6' },
+    { pgn: '1. e4 / a6 2. e5 / d5' }]) {
+    const start = createPosition(setup), before = positionKey(start), safety = createSearchRoyalSafety();
+    freeze(start.board);
+    const positions = [start, ...pseudoMoves(start).map(move => applyMove(start, move))];
+    for (const pos of positions) {
+      freeze(pos.board);
+      for (const current of [pos, { ...pos, action: pos.action + 1 }]) {
+        const attack = attackedByNextPlayer(current), check = inCheck(current);
+        assert.equal(safety.attackedByNextPlayer(current), attack);
+        assert.equal(safety.inCheck(current), check);
+        assert.equal(safety.inCheck(current), check, 'repeated forced passes preserve the cache');
+      }
+    }
+    assert.equal(positionKey(start), before);
+  }
+});
+
+test('public check and a fresh search observe caller edits after a cached search', () => {
+  const position = createPosition({ pgn: '[Board "Custom"]\n[7k/8/8/8/8/8/8/K7:0:1:w]' });
+  assert.equal(createSearchRoyalSafety().inCheck(position), false);
+  assert.equal(inCheck(position), false);
+  position.board[0][0][0][7] = 7;
+  assert.equal(inCheck(position), true, 'public check must rescan edited boards');
+  assert.equal(createSearchRoyalSafety().inCheck(position), true, 'new searches must use fresh scans');
+  position.board[0][0][0][7] = 0;
+  assert.equal(inCheck(position), false);
+  assert.equal(createSearchRoyalSafety().inCheck(position), false);
 });

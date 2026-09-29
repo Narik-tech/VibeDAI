@@ -63,6 +63,12 @@ tactical suite checks its expected mates against unrestricted legal replies.
   and ordinary king zones avoid coordinate strings and maps. Overlapping royal
   zones in variants retain their deduplication. These changes preserve scores,
   including custom heuristic contributions.
+- Classical search shares immutable piece and royal scans across action
+  generation and forced-pass check detection for the entire search session.
+  Evaluation also reuses board-local king zones and pawn-defender counts.
+  Timeline coordinates, historical weights and corridor blockers are still
+  evaluated in each position's history. These weak caches do not keep discarded
+  boards alive; public rule checks and evaluation still observe caller edits.
 
 These changes target deeper completed searches within a fixed budget. They
 do not establish an Elo gain. `node scripts/strength.js --nodes
@@ -169,6 +175,57 @@ with:
 ```sh
 node scripts/snapshot-engine.js 9de95b5 artifacts/classical-depth-speed-baseline
 node scripts/benchmark-classical.js --baseline artifacts/classical-depth-speed-baseline/search.js --repeat 5 --warmup 2 --time-ms 500 --json
+```
+
+### Search session reuse and lazy ordering
+
+Classical search now shares immutable royal-safety scans across complete-turn
+generation and forced-pass checks. Its evaluator caches board-local king zones
+and pawn-defender counts, then applies the current history, coordinates and
+weights on each visit. Each search owns fresh weak caches, so discarded boards
+can be collected and later searches observe caller edits. Public evaluation
+and rule checks remain uncached.
+
+Move ordering selects the highest-priority component in one pass and defers
+sorting the rest until another move is requested. Stable ties and the original
+floating-point arithmetic are preserved. Priorities are captured before yielding
+so a deeper sibling's history updates cannot change a suspended ordering pass.
+
+On 2026-09-29 with Node 22.15.1, five warmed, alternating comparisons against
+`f9a0ba9` produced these median work counts at a one-second time limit:
+
+| Position | Previous nodes | Current nodes | Throughput gain | Completed depth, both |
+| --- | ---: | ---: | ---: | ---: |
+| Standard | 53,263 | 60,568 | 13.7% | 4 |
+| Opening | 27,526 | 30,422 | 10.5% | 2 |
+| Two timelines | 53,217 | 60,635 | 13.9% | 2 |
+| Temporal | 37,095 | 44,778 | 20.7% | 2 |
+
+All fixed-depth runs retained the baseline scores and work counts. An additional
+three-repeat standard depth-five comparison completed the same 161,075 work
+nodes in median 3,353 → 2,943 ms, a 12.2% reduction. Timings were variable:
+the shallower combined benchmark's total fixed-depth time fell only 1.7%, and
+its standard depth-four median increased from 304 to 438 ms. At three seconds,
+both engines still completed depth four; current median work was 3.5% lower.
+These measurements support lower cost in several cases, without a consistent
+extra completed ply or a universal timing improvement.
+
+All 543 tests passed, including tied and fractional move priorities, sibling
+history updates, immutable cache reuse, caller edits, and parallel search. The
+twelve-case tactical suite passed twice at 20,000 work nodes with no invalid
+lines. Baseline evaluation scores and complete feature inspections matched on
+228 position/profile combinations.
+
+Reports are saved locally in `artifacts/classical-session-cache-final.json`,
+`artifacts/classical-session-cache-deeper.json`, and
+`artifacts/classical-session-cache-strength.json`. Timing reports include
+source hashes, individual runs, PV legality and input-immutability validation.
+Reproduce with:
+
+```sh
+node scripts/snapshot-engine.js f9a0ba9 artifacts/session-cache-baseline
+node scripts/benchmark-classical.js --baseline artifacts/session-cache-baseline/search.js --repeat 5 --warmup 2 --time-ms 1000 --depth-time-ms 20000 --json
+node scripts/benchmark-classical.js --baseline artifacts/session-cache-baseline/search.js --case standard --depth 5 --repeat 3 --warmup 2 --time-ms 3000 --depth-time-ms 20000 --json
 ```
 
 ## Checkmate detection

@@ -152,16 +152,16 @@ function kingZone(squares, kings) {
   const sharedZones = kings.length > 2 || (kings.length === 2 && kings[0].color === kings[1].color);
   const targets = sharedZones ? new Map() : [];
   for (const king of kings) {
-    const royal = { l: king.l, line: king.line, t: king.t, r: king.r, f: king.f,
-      color: king.color, weight: king.weight, pawn: false, defenders: 0, importance: 1.5 };
+    const royal = { r: king.r, f: king.f,
+      color: king.color, pawn: false, defenders: 0, importance: 1.5 };
     if (sharedZones) targets.set(`${king.r},${king.f}`, royal);
     else targets.push(royal);
     for (const [dr, df] of DIRECTIONS) {
       const r = king.r + dr, f = king.f + df, piece = squares[r]?.[f];
       if (!piece || owner(piece) !== king.color || ![1, 8].includes(Math.ceil(Math.abs(piece) / 2))) continue;
       const defenders = pawnDefenders(squares, r, f, king.color);
-      const pawn = { l: king.l, line: king.line, t: king.t, r, f, color: king.color,
-        weight: king.weight, pawn: true, defenders, importance: 1 / (1 + 0.5 * defenders) };
+      const pawn = { r, f, color: king.color,
+        pawn: true, defenders, importance: 1 / (1 + 0.5 * defenders) };
       if (sharedZones) targets.set(`${r},${f}`, pawn);
       else targets.push(pawn);
     }
@@ -169,7 +169,24 @@ function kingZone(squares, kings) {
   return sharedZones ? [...targets.values()] : targets;
 }
 
-function corridorRisk(timeline, latest, target, enemyCorridors) {
+function boardTargets(squares, currentKings, cache) {
+  let targets = cache?.get(squares);
+  if (targets) return targets;
+  // These facts depend only on the squares, not their timeline, time, active
+  // status or heuristic weights. The same immutable snapshot can occur in
+  // many sibling histories, including at different coordinates after travel.
+  const kings = currentKings
+    ? currentKings.map(({ r, f, color }) => ({ r, f, color })) : [];
+  if (!currentKings) for (let r = 0; r < squares.length; r++) for (let f = 0; f < squares[r].length; f++) {
+    const piece = squares[r][f];
+    if (ROYAL_TYPES.has(Math.ceil(Math.abs(piece) / 2))) kings.push({ r, f, color: owner(piece) });
+  }
+  targets = { kings, zone: kingZone(squares, kings) };
+  cache?.set(squares, targets);
+  return targets;
+}
+
+function corridorRisk(timeline, latest, target, enemyCorridors, targetTime) {
   const forward = target.color === 0 ? 1 : -1;
   let risk = 0;
   for (const df of [-1, 0, 1]) {
@@ -178,7 +195,7 @@ function corridorRisk(timeline, latest, target, enemyCorridors) {
     if (!(enemyCorridors & (1 << (df + 1)))) continue;
     let open = 0, enemyEntry = false;
     for (let distance = 1; distance <= 6; distance++) {
-      const t = target.t + distance * 2;
+      const t = targetTime + distance * 2;
       // Existing history is immutable. Project the frontier arrangement only
       // beyond recorded time; this rewards prophylaxis before an attack exists.
       const squares = t <= latest ? timeline[t] : timeline[latest];
@@ -216,7 +233,7 @@ function spatialActivity(board, r, f, type, color) {
 
 // Evaluate only the frontier of each timeline, never add up historical copies.
 // Inactive timelines retain some value because they can reactivate later.
-function evaluatePosition(position, heuristics, inspect = false, scoreOnly = false) {
+function evaluatePosition(position, heuristics, inspect = false, scoreOnly = false, targetCache = null) {
   const settings = normalizeHeuristics(heuristics);
   const pieceValues = pieceValuesFor(settings);
   const { board } = position;
@@ -280,21 +297,20 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
     for (const past of entryTimes) {
       const snapshot = timeline[past];
       if (!snapshot) continue;
-      const pastKings = past === t ? kings : [];
-      if (past !== t) for (let r = 0; r < snapshot.length; r++) for (let f = 0; f < snapshot[r].length; f++) {
-        const piece = snapshot[r][f];
-        if (ROYAL_TYPES.has(Math.ceil(Math.abs(piece) / 2))) pastKings.push({ l, line, t: past, r, f, color: owner(piece), weight: weight * settings.historicalPressureWeight });
-      }
+      const targets = boardTargets(snapshot, past === t ? kings : null, targetCache);
       // These snapshots were just scanned for king zones. Reuse their royals
       // for temporal pressure instead of scanning the same boards again below.
-      if (past < t && past >= t - 12 && (t - past) % 2 === 0) royals.push(...pastKings);
+      if (past < t && past >= t - 12 && (t - past) % 2 === 0) {
+        for (const king of targets.kings) royals.push({ l, line, t: past, r: king.r, f: king.f,
+          color: king.color, weight: weight * settings.historicalPressureWeight });
+      }
       const risk = [0, 0];
-      for (const target of kingZone(snapshot, pastKings)) {
-        if (sampleTimes.has(past)) risk[target.color] += corridorRisk(timeline, t, target, enemyCorridors[target.color]);
+      for (const target of targets.zone) {
+        if (sampleTimes.has(past)) risk[target.color] += corridorRisk(timeline, t, target, enemyCorridors[target.color], past);
         if (past < t && target.pawn && target.defenders === 0 && resources.available[1 - target.color] > 0) {
           // Being historical is what makes this an entry opportunity; unlike
           // royal pressure, it should not itself discount the target's value.
-          entryPawns.push({ ...target, weight });
+          entryPawns.push({ l, line, t: past, r: target.r, f: target.f, color: target.color, weight });
         }
       }
       // Shelter matters most with armies still on the board. Use the worst
@@ -473,3 +489,11 @@ export function inspectEvaluation(position, heuristics) { return evaluatePositio
 
 /** Positive values favor White. Mate scores are assigned by search only. */
 export function evaluate(position, heuristics) { return evaluatePosition(position, heuristics, false, true); }
+
+/** Reuse board-local facts for one immutable search, without retaining boards.
+ * Public evaluation stays uncached so edits to caller-owned squares are seen.
+ */
+export function createEvaluator(heuristics) {
+  const settings = normalizeHeuristics(heuristics), targets = new WeakMap();
+  return position => evaluatePosition(position, settings, false, true, targets);
+}

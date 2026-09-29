@@ -266,10 +266,23 @@ export function submitPosition(position) {
 }
 
 /** Forced-pass check, for classifying an exhausted turn tree as mate/stalemate. */
-export function inCheck(position) {
+function checkAfterPass(position, attackedByNextPlayer) {
   const board = position.board.map(timeline => timeline?.slice() ?? timeline);
   raw.mateFuncs.blankAction(board, position.action);
   return attackedByNextPlayer({ ...position, board });
+}
+
+export function inCheck(position) {
+  return checkAfterPass(position, attackedByNextPlayer);
+}
+
+/** Reuse immutable board scans within one search; never retain across edits. */
+export function createSearchRoyalSafety() {
+  const safety = royalSafety.createCached();
+  return {
+    attackedByNextPlayer: safety.attackedByNextPlayer,
+    inCheck: position => checkAfterPass(position, safety.attackedByNextPlayer),
+  };
 }
 
 // History matters: a past royal or empty square can determine a temporal move.
@@ -466,8 +479,8 @@ export async function* generateActionsAsync(position, options = {}) {
 
 // Both drivers share every legality, deduplication and pruning decision. The
 // traversal pauses only to request move ordering or expose a legal submission.
-function* generateActionSteps(position, { tick = () => {}, preferredAction = null, pruneUnsafe = true, tacticalOnly = false, cacheMoves = true, cacheUnsafeMoves = true, keyPosition = positionKey, skipOptionalSpatial = false, onSkipOptionalSpatial } = {}) {
-  const { attackedByNextPlayer } = royalSafety.createCached();
+function* generateActionSteps(position, { tick = () => {}, preferredAction = null, pruneUnsafe = true, tacticalOnly = false, cacheMoves = true, cacheUnsafeMoves = true, keyPosition = positionKey, skipOptionalSpatial = false, onSkipOptionalSpatial, royalSafety: searchRoyalSafety } = {}) {
+  const { attackedByNextPlayer } = searchRoyalSafety ?? royalSafety.createCached();
   const visited = new Set();
   const path = [];
   const unsafeSpatialMoves = new Set(), testedSpatialMoves = new Set(), moveKeys = new WeakMap();
