@@ -8,6 +8,29 @@ const request = (position, horizon, extra = {}) => ({
   position, horizon, remaining: 0, ply: 1, alpha: -1000000, beta: 1000000, ...extra,
 });
 
+test('root aspiration retries preserve both bound directions and retain an exact result', () => {
+  const position = createPosition(), original = structuredClone(position);
+  const search = { remaining: 3, alpha: -1000000, beta: 1000000 };
+  const reference = createSearchSession(position, { ...limits, maxTableEntries: 0 }).root(search);
+  for (const [alpha, beta] of [[reference.score - 11, reference.score - 10],
+    [reference.score + 10, reference.score + 11]]) {
+    const session = createSearchSession(position, limits);
+    const bounded = session.root({ ...search, alpha, beta });
+    assert(alpha > reference.score ? bounded.score <= alpha : bounded.score >= beta);
+    const retried = session.root(search);
+    assert.equal(retried.score, reference.score);
+    let current = position;
+    for (const action of retried.pv) current = validateAction(current, action);
+    const before = session.statistics();
+    assert.deepEqual(session.root(search), retried);
+    const after = session.statistics();
+    assert.equal(after.generationNodes, before.generationNodes,
+      'an exact root result must not reconstruct the complete-turn tree');
+    assert.equal(after.ttHits, before.ttHits + 1);
+    assert.deepEqual(position, original);
+  }
+});
+
 test('quiet warmup reuses legal-turn proofs across cloned positions and tactical horizons', () => {
   const position = createPosition();
   const warmed = createSearchSession(position, limits);

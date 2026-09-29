@@ -171,3 +171,46 @@ test('custom heuristic breakdown remains color-symmetric and does not multiply h
   position.board[0].push(structuredClone(squares), structuredClone(squares));
   assert.equal(featuresOf(inspectEvaluation(position, settings)).knightValue, white.knightValue);
 });
+
+test('pawn file summaries preserve mixed pawn and brawn structure on wide boards', () => {
+  const squares = Array.from({ length: 8 }, () => Array(10).fill(0));
+  for (const [r, f, piece] of [
+    [0, 4, 12], [7, 4, 11], [1, 0, 2], [3, 0, 16], [2, 1, 2], [4, 4, 2], [5, 8, 16],
+    [6, 0, 1], [5, 1, 15], [3, 4, 1], [4, 5, 15], [2, 9, 1], [0, 8, 8], [7, 2, 7],
+  ]) squares[r][f] = piece;
+  const position = { board: [[squares]], action: 0 };
+  // Literal contributions from the original evaluator cover doubled files,
+  // edge files, adjacent blockers, and enemy pawns behind an advanced pawn.
+  const features = featuresOf(inspectEvaluation(position));
+  assert.deepEqual(Object.fromEntries(['doubledPawnWeight', 'isolatedPawnWeight', 'passedPawnWeight', 'rookFileWeight']
+    .map(key => [key, features[key]])), {
+    doubledPawnWeight: -18, isolatedPawnWeight: -9, passedPawnWeight: -26, rookFileWeight: -14,
+  });
+  assert.equal(evaluate(position), -81);
+  // Reusing a position after a caller edits it must recompute the summaries.
+  squares[5][8] = 0;
+  assert.equal(featuresOf(inspectEvaluation(position)).rookFileWeight, 0);
+});
+
+test('overlapping royal zones preserve evaluation across sparse, extended history', () => {
+  const history = Array.from({ length: 19 }, () => {
+    const squares = empty();
+    squares[0][3] = 12;
+    squares[0][5] = 20;
+    squares[1][4] = 2; // Shared by White's king and royal queen.
+    squares[7][4] = 11;
+    squares[6][3] = 1;
+    squares[5][7] = 9;
+    return squares;
+  });
+  history[2] = null;
+  history[9] = null;
+  history[18][4][5] = 10;
+  const position = { board: [history], action: 0 };
+  const before = structuredClone(position);
+  assert.deepEqual(evaluateDetailed(position), {
+    material: 0, activity: 18, kingSafety: -24, temporal: 0, timelines: 0, travel: 140, total: 133,
+  });
+  assert.equal(featuresOf(inspectEvaluation(position)).corridorWeight, -18.4);
+  assert.deepEqual(position, before);
+});

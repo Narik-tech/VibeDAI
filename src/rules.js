@@ -215,7 +215,19 @@ export function applyMove(position, move) {
   if (destination !== source && board[destination]?.length - 1 === move[1][1]) {
     board[destination] = board[destination].slice();
   }
-  raw.boardFuncs.move(board, move);
+  const [from, to] = move;
+  if (move.length === 2 && source === destination && from[1] === to[1]
+      && raw.boardFuncs.positionIsLatest(board, from) && pieceAt(board, from)) {
+    // An ordinary spatial move edits at most two ranks. Keep untouched ranks
+    // shared just like historical boards, while preserving the upstream piece
+    // flags, promotion handling and sparse-container normalization.
+    const previous = board[source][from[1]], next = previous.slice();
+    next[from[2]] = previous[from[2]].slice();
+    if (to[2] !== from[2]) next[to[2]] = previous[to[2]].slice();
+    next[from[2]][from[3]] = 0;
+    next[to[2]][to[3]] = to[4] || Math.abs(previous[from[2]][from[3]]);
+    raw.boardFuncs.setTurn(board, source, from[1] + 1, next);
+  } else raw.boardFuncs.move(board, move);
   return { ...position, board };
 }
 
@@ -269,29 +281,35 @@ export function positionKey(position) {
 /**
  * Exact history keys for one immutable search. Public positions can be edited,
  * so positionKey deliberately does not share this cache between calls/searches.
- * Single boards share encodings across sibling histories. Whole histories are
- * weakly cached by their immutable outer container, so a yielded submission or
- * a repeated search window can reuse its body without retaining dead positions.
+ * Single boards and unchanged timelines share encodings across sibling
+ * histories. Whole histories are weakly cached by their immutable outer
+ * container, so submissions and repeated windows reuse their body without
+ * retaining dead positions.
  */
 export function createPositionKeyCache() {
-  const boards = new WeakMap(), histories = new WeakMap();
+  const boards = new WeakMap(), timelineKeys = new WeakMap(), histories = new WeakMap();
   return position => {
     let history = histories.get(position.board);
     if (history === undefined) {
       const timelines = [];
       for (const timeline of position.board) {
         if (!timeline) { timelines.push('null'); continue; }
-        const turns = [];
-        for (const board of timeline) {
-          if (!board) { turns.push('null'); continue; }
-          let serialized = boards.get(board);
-          if (serialized === undefined) {
-            serialized = JSON.stringify(board);
-            boards.set(board, serialized);
+        let timelineKey = timelineKeys.get(timeline);
+        if (timelineKey === undefined) {
+          const turns = [];
+          for (const board of timeline) {
+            if (!board) { turns.push('null'); continue; }
+            let serialized = boards.get(board);
+            if (serialized === undefined) {
+              serialized = JSON.stringify(board);
+              boards.set(board, serialized);
+            }
+            turns.push(serialized);
           }
-          turns.push(serialized);
+          timelineKey = `[${turns.join(',')}]`;
+          timelineKeys.set(timeline, timelineKey);
         }
-        timelines.push(`[${turns.join(',')}]`);
+        timelines.push(timelineKey);
       }
       history = `[${timelines.join(',')}]`;
       histories.set(position.board, history);
@@ -477,16 +495,45 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
       if (attackedByNextPlayer(applyMove(position, move))) unsafeSpatialMoves.add(key);
     }
   }
-  let initialMoves, preferredKey;
+  let sourceMoves, preferredKey;
   const availableMoves = (current, restrict = skipOptionalSpatial, present) => {
-    const moves = cacheMoves
-      ? (initialMoves ??= pseudoMoves(position)).filter(move => current.board[move[0][0]].length - 1 === move[0][1])
-      : pseudoMoves(current);
-    if (!restrict) return moves;
-    present ??= presentTimelines(current);
-    const allowed = moves.filter(([from, to]) => from[0] !== to[0] || from[1] !== to[1] || present.includes(from[0]));
-    if (allowed.length !== moves.length) onSkipOptionalSpatial?.();
-    return allowed;
+    if (restrict) present ??= presentTimelines(current);
+    if (!cacheMoves) {
+      const moves = pseudoMoves(current);
+      if (!restrict) return moves;
+      const allowed = moves.filter(move => !spatial(move) || present.includes(move[0][0]));
+      if (allowed.length !== moves.length) onSkipOptionalSpatial?.();
+      return allowed;
+    }
+    // Upstream emits moves in source-timeline order. Index that fixed geometry
+    // once, then test availability once per source instead of once per move.
+    // A consumed board often has hundreds of moves and contributes none to
+    // the rest of the action. Optional boards keep only their temporal moves.
+    if (!sourceMoves) {
+      const initialMoves = pseudoMoves(position);
+      sourceMoves = [];
+      if (position.board.length === 1) {
+        if (initialMoves.length) sourceMoves.push({ line: 0, turn: initialMoves[0][0][1], moves: initialMoves });
+      } else {
+        for (const move of initialMoves) {
+          const [line, turn] = move[0];
+          let source = sourceMoves.at(-1);
+          if (!source || source.line !== line) sourceMoves.push(source = { line, turn, moves: [] });
+          source.moves.push(move);
+        }
+      }
+    }
+    const moves = [];
+    let skipped = false;
+    for (const source of sourceMoves) {
+      if (current.board[source.line].length - 1 !== source.turn) continue;
+      const allowed = restrict && !present.includes(source.line)
+        ? (source.temporal ??= source.moves.filter(move => !spatial(move))) : source.moves;
+      skipped ||= allowed.length !== source.moves.length;
+      for (const move of allowed) moves.push(move);
+    }
+    if (skipped) onSkipOptionalSpatial?.();
+    return moves;
   };
   // A preferred turn is an ordered sequence, not a set of favorite component
   // moves. Replay it before enumerating shorter legal prefixes or alternative

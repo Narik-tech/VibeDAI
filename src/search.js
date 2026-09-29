@@ -27,8 +27,13 @@ function moveFeatures(position, move, pieceValues) {
   const moverValue = pieceValues[Math.ceil(Math.abs(mover) / 2)] || 0;
   const promotion = isPromotion ? (pieceValues[Math.ceil(Math.abs(to[4]) / 2)] || 0) - moverValue : 0;
   const captureValue = pieceValues[Math.ceil(Math.abs(captured) / 2)] || (move.length === 3 ? pieceValues[1] : 0);
+  // Create every field together so repeated ordering reads use a consistent
+  // object layout without intermediate spread allocations.
   return { moverValue, captureValue, promotion, isCapture,
-    temporal: from[0] !== to[0] || from[1] !== to[1] };
+    temporal: from[0] !== to[0] || from[1] !== to[1],
+    key: null, history: null,
+    move, priority: 0,
+    centralGain: Math.abs(from[2] - 3.5) + Math.abs(from[3] - 3.5) - Math.abs(to[2] - 3.5) - Math.abs(to[3] - 3.5) };
 }
 
 function tacticalMove(position, move) {
@@ -106,24 +111,37 @@ export function createSearchSession(position, options = {}) {
     // Generated move objects are shared across partial-turn siblings. Their
     // mover, target and coordinates cannot change within that turn; only the
     // learned ordering bonuses below need refreshing on each visit.
-    if (!moveCache.has(move)) {
-      const from = move[0], to = move[1];
-      const centralGain = Math.abs(from[2] - 3.5) + Math.abs(from[3] - 3.5) - Math.abs(to[2] - 3.5) - Math.abs(to[3] - 3.5);
-      moveCache.set(move, { ...moveFeatures(pos, move, pieceValues), key: moveKey(move), history: historyKey(pos, move), centralGain });
+    let features = moveCache.get(move);
+    if (!features) {
+      features = moveFeatures(pos, move, pieceValues);
+      moveCache.set(move, features);
     }
-    return moveCache.get(move);
+    return features;
   }
   function orderMoves(pos, moves, favorites, killerMoves, spatialFirst = false) {
-    return moves.map((move, index) => {
+    const ordered = new Array(moves.length);
+    for (let index = 0; index < moves.length; index++) {
+      const move = moves[index];
       const f = orderingFeatures(pos, move);
-      let priority = (favorites.has(f.key) ? 10_000_000 : 0) + f.promotion * 100;
+      // Most fresh tactical nodes have neither preferred nor killer moves.
+      // Build string keys only when an ordering lookup can actually use them.
+      if (favorites.size || (!f.isCapture && killerMoves.size)) f.key ??= moveKey(move);
+      let priority = (favorites.size && favorites.has(f.key) ? 10_000_000 : 0) + f.promotion * 100;
       if (f.isCapture) priority += 1_000_000 + f.captureValue * 100 - f.moverValue;
-      else priority += (killerMoves.has(f.key) ? heuristics.killerBonus : 0) + (history.get(f.history) || 0) + f.centralGain * heuristics.quietCentralization;
+      else priority += (killerMoves.size && killerMoves.has(f.key) ? heuristics.killerBonus : 0)
+        + (history.size ? history.get(f.history ??= historyKey(pos, move)) || 0 : 0)
+        + f.centralGain * heuristics.quietCentralization;
       // Unforced early branching expands the reply tree enormously. Explore
       // ordinary development before speculative travel unless it wins material.
       if (f.temporal) priority -= spatialFirst ? heuristics.temporalMovePenalty : 100;
-      return { move, priority, index };
-    }).sort((a, b) => b.priority - a.priority || a.index - b.index).map(item => item.move);
+      f.priority = priority;
+      ordered[index] = f;
+    }
+    // Sorting is synchronous and stable: reusing feature records preserves
+    // tied move order and needs no per-pass wrapper objects or index fields.
+    ordered.sort((a, b) => b.priority - a.priority);
+    for (let index = 0; index < ordered.length; index++) ordered[index] = ordered[index].move;
+    return ordered;
   }
   function actions(pos, preferred, ply, { spatialFirst = true, tacticalOnly = false, restricted = true } = {}) {
     // The iterator is suspended while deeper plies search; only those deeper
@@ -269,7 +287,9 @@ export function createSearchSession(position, options = {}) {
     beta = Math.min(beta, MATE_SCORE - ply - 1);
     if (alpha >= beta) return { score: alpha, pv: [] };
     const key = keyPosition(pos), entry = tt.get(key);
-    if (entry && entry.depth >= remaining && entry.quiescenceDepth >= activeQDepth && ply > 0) {
+    // A failed aspiration pass also leaves a valid root bound. Reuse it when
+    // retrying that depth, just as for an internal principal-variation probe.
+    if (entry && entry.depth >= remaining && entry.quiescenceDepth >= activeQDepth) {
       ttHits++;
       const value = fromTable(entry.score, ply);
       if (entry.flag === 'exact') return { score: value, pv: entry.pv };

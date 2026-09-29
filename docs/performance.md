@@ -50,6 +50,19 @@ tactical suite checks its expected mates against unrestricted legal replies.
 - Mate-distance bounds avoid searching scores that cannot improve an already
   found mate. Iterative search uses a 60-centipawn aspiration window starting
   at depth two, with a full-window retry whenever the estimate falls outside.
+- Aspiration retries now reuse the previous root bound. Cached move features
+  have a consistent object layout and are reused during stable sorting;
+  string keys are built only when a preferred, killer, or history lookup needs
+  them. Learned priorities are refreshed on every ordering pass.
+- Move generation indexes moves by source timeline, so consuming a board skips
+  its remaining moves together. Exact position keys reuse unchanged timeline
+  encodings. Ordinary spatial moves copy only the ranks they change; temporal
+  moves, castling, and en passant still use the upstream move implementation.
+- Evaluation uses shared movement tables, pawn counts and rank bounds per
+  file, and precomputed corridor directions. Historical royal scans are reused,
+  and ordinary king zones avoid coordinate strings and maps. Overlapping royal
+  zones in variants retain their deduplication. These changes preserve scores,
+  including custom heuristic contributions.
 
 These changes target deeper completed searches within a fixed budget. They
 do not establish an Elo gain. `node scripts/strength.js --nodes
@@ -121,6 +134,42 @@ The local reports `artifacts/classical-search-final.json` and
 hashes, and validation results. Their baseline is the initial working-tree
 snapshot in `artifacts/classical-search-before/src`, including the local
 evaluation changes already present when the comparison began.
+
+### Allocation and root-cache comparison
+
+Against commit `9de95b5`, five warmed, alternating comparisons on Node 22.15.1
+produced these medians. Every run completed the requested full-turn depth and
+tactical horizon with the same score as the baseline.
+
+| Position | Depth / tactical horizon | Previous work nodes | Current work nodes | Previous ms | Current ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Standard | 4 / 2 | 17,947 | 17,676 | 323 | 279 |
+| Opening | 2 / 2 | 4,361 | 4,361 | 58 | 51 |
+| Two timelines | 2 / 1 | 23,579 | 23,579 | 478 | 391 |
+| Temporal | 2 / 1 | 9,393 | 9,393 | 201 | 156 |
+
+Total fixed-depth elapsed time fell by 16.4% over the twenty measured searches.
+At 500 ms, completed depths were unchanged on all four fixtures, while median
+work throughput increased. Under a fixed 17,700-work-node budget, the standard
+position completed depth four instead of depth three in all three repeats,
+with tactical horizon two. Most of the gain is lower cost per node; root bound
+reuse also removes 271 work nodes from the standard depth-four search.
+
+All 535 tests passed. The twelve-case tactical suite passed twice at 20,000
+work nodes per case. Evaluation scores, component contributions, and inspected
+features also matched the baseline on 300 seeded varied positions. Timings
+depend on hardware and load; these fixtures do not establish playing strength.
+
+The local reports are `artifacts/classical-depth-speed-final.json`,
+`artifacts/classical-depth-speed-work.json`, and
+`artifacts/classical-depth-speed-strength.json`. The timing and work reports
+include source hashes, settings, and per-run results. Repeat the timing check
+with:
+
+```sh
+node scripts/snapshot-engine.js 9de95b5 artifacts/classical-depth-speed-baseline
+node scripts/benchmark-classical.js --baseline artifacts/classical-depth-speed-baseline/search.js --repeat 5 --warmup 2 --time-ms 500 --json
+```
 
 ## Checkmate detection
 

@@ -203,6 +203,28 @@ test('cached geometry matches fresh moves after an arrival makes two source boar
   assert(cachedActions.some(action => positionKey(action.position) === positionKey(completed)));
 });
 
+test('source-indexed geometry preserves move order, policy omissions and traversal ticks', () => {
+  const first = clearBoard(); first[0][1] = 4;
+  const capture = clearBoard(); capture[0][1] = 4; capture[1][2] = 1;
+  const positions = [
+    createPosition(),
+    position([[first], [clearBoard()], [clearBoard()]]),
+    position([[first], null, [capture, structuredClone(capture), structuredClone(capture)]]),
+  ];
+  for (const start of positions) for (const skipOptionalSpatial of [false, true]) for (const tacticalOnly of [false, true]) {
+    const run = cacheMoves => {
+      let ticks = 0, skipped = 0;
+      const actions = [...generateActions(start, {
+        cacheMoves, skipOptionalSpatial, tacticalOnly,
+        tick: () => ticks++, onSkipOptionalSpatial: () => skipped++,
+        orderMoves: (_current, moves) => moves.toReversed(),
+      })];
+      return { actions, ticks, skipped };
+    };
+    assert.deepEqual(run(true), run(false), 'indexing may not change order, legality, work budgets or policy evidence');
+  }
+});
+
 test('a preferred full turn precedes legal prefixes without changing the exhaustive action set', () => {
   const captureBoard = clearBoard(); captureBoard[0][1] = 4; captureBoard[1][2] = 1;
   const start = position([[clearBoard()], null, Array.from({ length: 3 }, () => structuredClone(captureBoard))]);

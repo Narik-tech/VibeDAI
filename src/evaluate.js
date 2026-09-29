@@ -23,6 +23,12 @@ const KNIGHT_STEPS = [[1, 2], [2, 1], [-1, 2], [-2, 1], [1, -2], [2, -1], [-1, -
 const AXES = [[1, 0], [-1, 0], [0, 1], [0, -1]];
 const DIAGONALS = [[1, 1], [1, -1], [-1, 1], [-1, -1]];
 const DIRECTIONS = [...AXES, ...DIAGONALS];
+// Reuse board-plane geometry instead of rebuilding direction arrays for every
+// piece at every leaf. The fairy-piece activity model deliberately stays as-is.
+const SPATIAL_STEPS = Array.from({ length: PIECE_VALUES.length }, (_, type) =>
+  type === 3 ? KNIGHT_STEPS : type === 2 ? DIAGONALS : type === 4 ? AXES
+    : [5, 6, 7, 9, 10].includes(type) ? DIRECTIONS : []);
+const SPATIAL_SLIDERS = new Set([2, 4, 5, 7, 10]);
 // Keep variant-piece geometry in sync with the rules library. These profiles
 // describe attacks only: king safety and complete-turn legality remain search's
 // responsibility, and pawns/brawns have separate directional capture rules.
@@ -34,7 +40,11 @@ const MOVEMENT = Array.from({ length: PIECE_VALUES.length }, (_, type) => {
   const steps = new Uint8Array(625), rays = new Uint8Array(81);
   for (const v of raw.pieceFuncs.movePos(type * 2)) steps[stepKey(...v)] = 1;
   for (const v of raw.pieceFuncs.moveVecs(type * 2)) rays[rayKey(...v)] = 1;
-  return { steps, rays };
+  const corridors = [0, 0];
+  for (let color = 0; color < 2; color++) for (let df = -1; df <= 1; df++) {
+    if (rays[rayKey(0, -1, color === 0 ? -1 : 1, -df)]) corridors[color] |= 1 << (df + 1);
+  }
+  return { steps, rays, corridors };
 });
 
 /** Compile once per immutable profile; search reuses the numeric lookup table. */
@@ -136,26 +146,36 @@ function pawnDefenders(squares, r, f, color) {
 }
 
 function kingZone(squares, kings) {
-  const targets = new Map();
+  // Zones of opposing kings cannot share friendly pawns. Most boards therefore
+  // need neither coordinate strings nor a Map; variants with extra same-color
+  // royals still deduplicate their overlapping zones exactly as before.
+  const sharedZones = kings.length > 2 || (kings.length === 2 && kings[0].color === kings[1].color);
+  const targets = sharedZones ? new Map() : [];
   for (const king of kings) {
-    targets.set(`${king.r},${king.f}`, { ...king, importance: 1.5 });
+    const royal = { l: king.l, line: king.line, t: king.t, r: king.r, f: king.f,
+      color: king.color, weight: king.weight, pawn: false, defenders: 0, importance: 1.5 };
+    if (sharedZones) targets.set(`${king.r},${king.f}`, royal);
+    else targets.push(royal);
     for (const [dr, df] of DIRECTIONS) {
       const r = king.r + dr, f = king.f + df, piece = squares[r]?.[f];
       if (!piece || owner(piece) !== king.color || ![1, 8].includes(Math.ceil(Math.abs(piece) / 2))) continue;
       const defenders = pawnDefenders(squares, r, f, king.color);
-      targets.set(`${r},${f}`, { ...king, r, f, pawn: true, defenders, importance: 1 / (1 + 0.5 * defenders) });
+      const pawn = { l: king.l, line: king.line, t: king.t, r, f, color: king.color,
+        weight: king.weight, pawn: true, defenders, importance: 1 / (1 + 0.5 * defenders) };
+      if (sharedZones) targets.set(`${r},${f}`, pawn);
+      else targets.push(pawn);
     }
   }
-  return [...targets.values()];
+  return sharedZones ? [...targets.values()] : targets;
 }
 
-function corridorRisk(timeline, latest, target, enemyTypes) {
+function corridorRisk(timeline, latest, target, enemyCorridors) {
   const forward = target.color === 0 ? 1 : -1;
   let risk = 0;
   for (const df of [-1, 0, 1]) {
     // A potential attacker comes back along time/rank or time/rank/file.
     // Only score corridors that an opposing slider can actually use.
-    if (!enemyTypes.some(type => MOVEMENT[type].rays[rayKey(0, -1, -forward, -df)])) continue;
+    if (!(enemyCorridors & (1 << (df + 1)))) continue;
     let open = 0, enemyEntry = false;
     for (let distance = 1; distance <= 6; distance++) {
       const t = target.t + distance * 2;
@@ -167,7 +187,7 @@ function corridorRisk(timeline, latest, target, enemyTypes) {
       if (piece && owner(piece) === target.color) break;
       open++;
       if (piece) {
-        enemyEntry = Boolean(MOVEMENT[Math.ceil(Math.abs(piece) / 2)].rays[rayKey(0, -1, -forward, -df)]);
+        enemyEntry = Boolean(MOVEMENT[Math.ceil(Math.abs(piece) / 2)].corridors[target.color] & (1 << (df + 1)));
         break;
       }
     }
@@ -179,9 +199,8 @@ function corridorRisk(timeline, latest, target, enemyTypes) {
 }
 
 function spatialActivity(board, r, f, type, color) {
-  const steps = type === 3 ? KNIGHT_STEPS : type === 2 ? DIAGONALS : type === 4 ? AXES
-    : type === 5 || type === 7 || ROYAL_TYPES.has(type) || type === 9 ? [...AXES, ...DIAGONALS] : [];
-  const slider = [2, 4, 5, 7, 10].includes(type);
+  const steps = SPATIAL_STEPS[type];
+  const slider = SPATIAL_SLIDERS.has(type);
   let count = 0;
   for (const [dr, df] of steps) {
     let y = r + dr, x = f + df;
@@ -220,7 +239,8 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
     totalWeight += weight;
     let material = 0, activity = 0, kingSafety = 0;
     const record = inspect ? (key, value) => { featureValues[key] += weight * value; } : null;
-    const pawns = [[], []], pieces = [], kings = [];
+    const pawnFiles = [[], []], pawnRanks = [[], []], pieces = [], kings = [];
+    const enemyCorridors = [0, 0];
     let phase = 0;
     for (let r = 0; r < squares.length; r++) {
       for (let f = 0; f < squares[r].length; f++) {
@@ -233,13 +253,18 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
         material += sign * value;
         if (record && VALUE_KEYS[type]) record(VALUE_KEYS[type], sign * value);
         if ([2, 3, 4, 5, 7].includes(type)) phase += value;
-        if (type === 1 || type === 8) pawns[color].push(entry);
+        if (type === 1 || type === 8) {
+          pawnFiles[color][f] = (pawnFiles[color][f] || 0) + 1;
+          // For Black's passed-pawn test keep White's lowest rank; for White's
+          // test keep Black's highest. Scan order already supplies both bounds.
+          if (color === 1 || pawnRanks[color][f] === undefined) pawnRanks[color][f] = r;
+        }
+        enemyCorridors[1 - color] |= MOVEMENT[type].corridors[1 - color];
         if (ROYAL_TYPES.has(type)) { kings.push(entry); royals.push(entry); }
         attackers.push(entry);
       }
     }
     const middleGame = Math.min(1, phase / settings.phaseDivisor);
-    const enemyTypes = [0, 1].map(color => [...new Set(pieces.filter(p => p.color !== color).map(p => p.type))]);
     const zoneRisk = [0, 0];
     // Keep the first king zone of each half-turn color as well as recent history:
     // a late blocker cannot erase an open route through early f-pawn snapshots.
@@ -260,9 +285,12 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
         const piece = snapshot[r][f];
         if (ROYAL_TYPES.has(Math.ceil(Math.abs(piece) / 2))) pastKings.push({ l, line, t: past, r, f, color: owner(piece), weight: weight * settings.historicalPressureWeight });
       }
+      // These snapshots were just scanned for king zones. Reuse their royals
+      // for temporal pressure instead of scanning the same boards again below.
+      if (past < t && past >= t - 12 && (t - past) % 2 === 0) royals.push(...pastKings);
       const risk = [0, 0];
       for (const target of kingZone(snapshot, pastKings)) {
-        if (sampleTimes.has(past)) risk[target.color] += corridorRisk(timeline, t, target, enemyTypes[target.color]);
+        if (sampleTimes.has(past)) risk[target.color] += corridorRisk(timeline, t, target, enemyCorridors[target.color]);
         if (past < t && target.pawn && target.defenders === 0 && resources.available[1 - target.color] > 0) {
           // Being historical is what makes this an entry opportunity; unlike
           // royal pressure, it should not itself discount the target's value.
@@ -283,16 +311,20 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
         const centerScore = centrality * 3 * settings.pawnCenterWeight;
         activity += sign * (advance + centerScore);
         if (record) { record('pawnAdvanceWeight', sign * advance); record('pawnCenterWeight', sign * centerScore); }
-        const sameFile = pawns[color].filter(p => p.f === f).length;
+        const sameFile = pawnFiles[color][f];
         if (sameFile > 1) {
           activity -= sign * 9 * settings.doubledPawnWeight;
           if (record) record('doubledPawnWeight', -sign * 9 * settings.doubledPawnWeight);
         }
-        if (!pawns[color].some(p => Math.abs(p.f - f) === 1)) {
+        if (!pawnFiles[color][f - 1] && !pawnFiles[color][f + 1]) {
           activity -= sign * 9 * settings.isolatedPawnWeight;
           if (record) record('isolatedPawnWeight', -sign * 9 * settings.isolatedPawnWeight);
         }
-        if (!pawns[1 - color].some(p => Math.abs(p.f - f) <= 1 && (color === 0 ? p.r > r : p.r < r))) {
+        const enemyRanks = pawnRanks[1 - color];
+        const blocked = color === 0
+          ? Math.max(enemyRanks[f - 1] ?? -Infinity, enemyRanks[f] ?? -Infinity, enemyRanks[f + 1] ?? -Infinity) > r
+          : Math.min(enemyRanks[f - 1] ?? Infinity, enemyRanks[f] ?? Infinity, enemyRanks[f + 1] ?? Infinity) < r;
+        if (!blocked) {
           const passed = sign * (8 + rank * rank * 2) * settings.passedPawnWeight;
           activity += passed;
           if (record) record('passedPawnWeight', passed);
@@ -310,7 +342,7 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
           activity -= development;
           if (record) record('developmentWeight', -development);
         }
-        if (type === 4 && !pawns[color].some(p => p.f === f)) {
+        if (type === 4 && !pawnFiles[color][f]) {
           activity += sign * 14 * settings.rookFileWeight;
           if (record) record('rookFileWeight', sign * 14 * settings.rookFileWeight);
         }
@@ -349,16 +381,6 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
     frontier.push({ l, t, weight, material });
     if (inspect) boards.push({ timeline: l, coordinate: line, turn: t, active: active.has(l), weight, material: weight * material,
       activity: weight * activity, kingSafety: weight * kingSafety, phase: middleGame });
-    // Sample historical royal squares for potential time attacks. Historical
-    // copies contribute pressure only, never additional material.
-    for (let past = t - 2, sampled = 0; past >= 0 && sampled < 6; past -= 2, sampled++) {
-      const snapshot = timeline[past];
-      if (!snapshot) continue;
-      for (let r = 0; r < snapshot.length; r++) for (let f = 0; f < snapshot[r].length; f++) {
-        const piece = snapshot[r][f], type = Math.ceil(Math.abs(piece || 0) / 2);
-        if (ROYAL_TYPES.has(type)) royals.push({ l, line, t: past, r, f, color: owner(piece), weight: weight * settings.historicalPressureWeight });
-      }
-    }
   }
   if (!totalWeight) return finishEvaluation(totals, settings, featureValues, boards, scoreOnly);
   for (const key of ['material', 'activity', 'kingSafety']) totals[key] /= totalWeight;
