@@ -540,15 +540,17 @@ export function validateAction(position, moves) {
  * time travel can change which timelines are active and required.
  * orderMoves(current, moves, prefix) receives a copy of the component prefix
  * leading from the initial position to current, without submitting the turn.
+ * firstOnly proves legal-turn existence, stopping after the first submission.
  */
 export function* generateActions(position, options = {}) {
   const steps = generateActionSteps(position, options);
-  const orderMoves = options.orderMoves;
+  const orderMoves = options.orderMoves, firstOnly = options.firstOnly;
   try {
     let step = steps.next();
     while (!step.done) {
       if (step.value.candidate) {
         yield step.value.candidate;
+        if (firstOnly) return;
         step = steps.next();
       } else {
         const { current, moves, prefix } = step.value;
@@ -565,7 +567,7 @@ export function* generateActions(position, options = {}) {
  */
 export async function* generateActionsAsync(position, options = {}) {
   const steps = generateActionSteps(position, options);
-  const orderMoves = options.orderMoves;
+  const orderMoves = options.orderMoves, firstOnly = options.firstOnly;
   const batches = new Set();
   async function nextBatch(iterator) {
     const next = await iterator.next();
@@ -577,6 +579,7 @@ export async function* generateActionsAsync(position, options = {}) {
     while (!step.done) {
       if (step.value.candidate) {
         yield step.value.candidate;
+        if (firstOnly) return;
         step = steps.next();
       } else if (step.value.nextBatch) {
         step = steps.next(await nextBatch(step.value.nextBatch));
@@ -600,8 +603,38 @@ export async function* generateActionsAsync(position, options = {}) {
 
 // Both drivers share every legality, deduplication and pruning decision. The
 // traversal pauses only to request move ordering or expose a legal submission.
-function* generateActionSteps(position, { tick = () => {}, preferredAction = null, pruneUnsafe = true, tacticalOnly = false, cacheMoves = true, cacheUnsafeMoves = true, keyPosition = positionKey, generateMoves = pseudoMoves, skipOptionalSpatial = false, onSkipOptionalSpatial, royalSafety: searchRoyalSafety } = {}) {
+function* generateActionSteps(position, { tick = () => {}, preferredAction = null, pruneUnsafe = true, tacticalOnly = false, firstOnly = false, cacheMoves = true, cacheUnsafeMoves = true, keyPosition = positionKey, generateMoves = pseudoMoves, skipOptionalSpatial = false, onSkipOptionalSpatial, royalSafety: searchRoyalSafety } = {}) {
   const { attackedByNextPlayer } = searchRoyalSafety ?? royalSafety.createCached();
+  const timeline = position.board.length === 1 ? position.board[0] : null;
+  if (firstOnly && !tacticalOnly && !Array.isArray(preferredAction)
+      && timeline?.at(-1) && (timeline.length - 1) % 2 === position.action % 2) {
+    // There is exactly one playable source. Every move consumes it and only
+    // creates opponent-color frontiers, even when it branches into the past.
+    // Thus royal safety alone proves submission after a move. An existence
+    // probe needs no partial-state traversal or history serialization here.
+    tick();
+    const moves = generateMoves(position);
+    let ordered = yield { current: position, moves, prefix: [] };
+    const unsafe = new Set();
+    while (ordered) {
+      const batch = Object.hasOwn(ordered, 'more') ? ordered.moves : ordered;
+      for (const move of batch) {
+        const spatial = move[0][0] === move[1][0] && move[0][1] === move[1][1];
+        if (pruneUnsafe && spatial && unsafe.size && unsafe.has(JSON.stringify(move))) continue;
+        tick();
+        const current = applyMove(position, move);
+        tick();
+        if (!attackedByNextPlayer(current)) {
+          yield { candidate: { moves: [move], position: { ...current, action: current.action + 1 } } };
+          return;
+        }
+        if (pruneUnsafe && cacheUnsafeMoves && spatial) unsafe.add(JSON.stringify(move));
+      }
+      if (!ordered.more) break;
+      ordered = yield { nextBatch: ordered.more };
+    }
+    return;
+  }
   const keyState = keyPosition.forAction?.(position) ?? keyPosition;
   const visited = new Set();
   const path = [];
@@ -688,7 +721,7 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
       tick();
     }
     if (legal && (!tacticalOnly || tactical) && presentTimelines(current).length === 0 && !attackedByNextPlayer(current)) {
-      preferredKey = keyState(current);
+      if (!firstOnly) preferredKey = keyState(current);
       yield { candidate: { moves, position: { ...current, action: current.action + 1 } } };
     }
   }

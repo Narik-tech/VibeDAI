@@ -139,13 +139,13 @@ export function createSearchSession(position, options = {}) {
     ordered.sort((a, b) => priorities[b] - priorities[a]);
     for (const index of ordered) yield moves[index];
   }
-  function actions(pos, preferred, ply, { spatialFirst = true, tacticalOnly = false, restricted = true } = {}) {
+  function actions(pos, preferred, ply, { spatialFirst = true, tacticalOnly = false, restricted = true, firstOnly = false } = {}) {
     // The iterator is suspended while deeper plies search; only those deeper
     // plies can update their killers. Build these sets once for a whole turn,
     // including its many alternative component sequences.
     let favorites, killerMoves;
     const iterator = generateActions(pos, {
-      tick: () => tick(), tacticalOnly, preferredAction: preferred, keyPosition, generateMoves, royalSafety, skipOptionalSpatial: restricted,
+      tick: () => tick(), tacticalOnly, firstOnly, preferredAction: preferred, keyPosition, generateMoves, royalSafety, skipOptionalSpatial: restricted,
       onSkipOptionalSpatial: () => policyPruned.add(iterator),
       orderMoves: (current, moves) => orderMoves(current, moves,
         favorites ??= new Set((preferred || []).map(moveKey)),
@@ -174,7 +174,7 @@ export function createSearchSession(position, options = {}) {
     // Policy exhaustion is not checkmate or stalemate. An unrestricted witness
     // is used only to validate terminal status, never as a searched candidate
     // or fallback action. Internally it establishes a static policy boundary.
-    const witness = actions(pos, null, ply, { restricted: false });
+    const witness = actions(pos, null, ply, { restricted: false, firstOnly: true });
     const next = witness.next();
     witness.return?.();
     if (next.done) return { score: terminal(pos, ply), pv: [], terminal: true };
@@ -230,11 +230,12 @@ export function createSearchSession(position, options = {}) {
     // terminal. Reuse it instead of constructing and abandoning a separate
     // legal turn first, which is costly when several boards must be played.
     const tacticalOnly = remaining > 0 && !isCheck && best < beta;
-    let iterator = actions(pos, entry?.pv[0], ply, { tacticalOnly });
+    const firstOnly = remaining < 0 || (!isCheck && (best >= beta || remaining === 0));
+    let iterator = actions(pos, entry?.pv[0], ply, { tacticalOnly, firstOnly });
     let next = iterator.next();
     if (next.done && tacticalOnly) {
       if (hasLegalAction) return finish(best, [], true);
-      iterator = actions(pos, null, ply);
+      iterator = actions(pos, null, ply, { firstOnly: true });
       const witness = iterator.next();
       iterator.return?.();
       // No captures does not prove stalemate: quiet legal turns still count.
@@ -344,7 +345,7 @@ export function createSearchSession(position, options = {}) {
   }
   function* iterations() {
     try {
-      const fallbackIterator = actions(position, null, 0);
+      const fallbackIterator = actions(position, null, 0, { firstOnly: true });
       const fallback = fallbackIterator.next();
       fallbackIterator.return?.();
       if (fallback.done) {

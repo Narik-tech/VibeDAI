@@ -479,6 +479,58 @@ node scripts/benchmark-classical.js --baseline artifacts/classical-speed-baselin
 node --test --test-concurrency=2
 ```
 
+### Direct legal-turn existence probes
+
+Classical search now uses a `firstOnly` action probe when it only needs to
+establish that a legal turn exists: fallback selection, static quiescence
+boundaries, and terminal verification. From a single timeline with a valid
+mover-color frontier, each generated move consumes the only playable source.
+Any new branch belongs to the opponent, so checking royal safety proves that
+the move completes the turn. This avoids constructing the general partial-turn
+traversal and serializing histories solely to deduplicate a result that will
+never be requested again.
+
+Preferred turns, tactical-only requests, sparse frontiers, and multiboard
+positions retain the general traversal. Checked quiescence horizons still
+search every required evasion. Both synchronous and asynchronous probes close
+their suspended ordering iterators after the first result.
+
+A local comparison on 2026-09-29 used Node 22.15.1, revision
+`f07d8c14de088c5b6f5d52a85dc7643a541a4915` as the baseline, five alternating
+pairs, and three warm-up rounds. Garbage from previous searches was collected
+before each timed run using `--expose-gc`. Median fixed-depth wall times were:
+
+| Position | Depth / quiescence | Baseline | Updated |
+| --- | --- | ---: | ---: |
+| Standard | 4 / 2 | 223 ms | 206 ms |
+| Opening | 2 / 2 | 47 ms | 40 ms |
+| Two timelines | 2 / 1 | 347 ms | 352 ms |
+| Temporal | 2 / 1 | 124 ms | 117 ms |
+| Standard | 5 / 2 | 2,490 ms | 2,175 ms |
+
+The depth-five median fell by 12.7%. Completed scores and work counts matched
+in every pair; all returned PVs were legal and inputs remained unchanged.
+Timing varied across trials. An equal-time check at 2.3 seconds reached depth
+five in three of five baseline runs and two of five updated runs, so this
+measurement does **not** establish a consistent extra completed depth at that
+budget. The two-timeline fixed-depth case was also slightly slower.
+
+The regression suite passed all 581 tests, including first-result equivalence,
+preferred replay, unsafe-move options, sparse histories, asynchronous cleanup,
+checked horizons, policy boundaries, and exact search-order traces.
+
+The raw reports are `artifacts/classical-direct-witness-depth.json`,
+`artifacts/classical-direct-witness-depth5.json`, and
+`artifacts/classical-direct-witness-time.json`. Reproduce them with:
+
+```sh
+node scripts/snapshot-engine.js f07d8c14de088c5b6f5d52a85dc7643a541a4915 artifacts/classical-opt-baseline-20260929
+node --expose-gc scripts/benchmark-classical.js --baseline artifacts/classical-opt-baseline-20260929/search.js --mode depth --depth-time-ms 15000 --repeat 5 --warmup 3 --json
+node --expose-gc scripts/benchmark-classical.js --baseline artifacts/classical-opt-baseline-20260929/search.js --case standard --mode depth --depth 5 --depth-time-ms 15000 --repeat 5 --warmup 3 --json
+node --expose-gc scripts/benchmark-classical.js --baseline artifacts/classical-opt-baseline-20260929/search.js --case standard --mode time --time-ms 2300 --repeat 5 --warmup 3 --json
+node --test --test-concurrency=2
+```
+
 ## Parallel CPU search
 
 Classical analysis supports a configurable root-search pool through the app's

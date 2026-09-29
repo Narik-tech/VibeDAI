@@ -134,6 +134,8 @@ Repeated search passes also reuse move geometry from immutable histories. Move o
 
 Partial-turn duplicate detection now encodes only newly appended boards, while search-table keys retain the complete history. A further five-run comparison reduced total fixed-depth time by 15.7% across four fixtures with identical scores and work counts. See [the measurements and reproduction commands](docs/performance.md#deduplicating-appended-history-within-a-turn).
 
+Classical search also uses direct legal-turn existence probes on single timelines, avoiding partial-turn traversal and history serialization at static leaves. A local comparison reduced the standard depth-five median from 2.49 to 2.18 seconds, with identical scores and work counts. Equal-time trials did not show a consistent extra completed depth; see [the measurements and limits](docs/performance.md#direct-legal-turn-existence-probes).
+
 The locked-king puzzle in `examples/locked-king.5dpgn` is a performance regression: depth three with two capture-extension plies must complete within 20,000 search/generation work nodes. The original search stalled at depth one because it explored already-lost partial turns and lengthy sequences of checks at the tactical horizon. Search now rejects irreversible royal attacks early, reuses unchanged move geometry within a turn, and directly generates tactical actions during quiescence. The app reports live work counts and the depth currently being searched separately from completed depth.
 
 For longer diagnostics, set `BENCH_TIME_MS`, `SELFPLAY_TIME_MS`, or `SELFPLAY_PLIES` in your shell. Increase think time before increasing depth: requested depth is only a ceiling, and the full-turn branching factor can grow rapidly.

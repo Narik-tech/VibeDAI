@@ -29,6 +29,7 @@ Warm-ups use the same targets with a 250 ms limit. Fixed-depth speedups are
 reported only for pairs that finish the requested depth and tactical horizon.
 Timing excludes legality checks and formatting. All best turns and PVs are
 validated; work counters and input immutability are checked on every run.
+With node --expose-gc, garbage from earlier runs is collected before timing.
 `;
 
 function integer(value, minimum, maximum, label) {
@@ -94,6 +95,7 @@ function validate(position, original, result) {
 }
 
 function run(engine, fixture, limits) {
+  globalThis.gc?.();
   const position = createPosition(fixture.setup), original = structuredClone(position);
   const start = performance.now();
   const result = engine.analyze(position, limits);
@@ -107,6 +109,7 @@ function run(engine, fixture, limits) {
     targetReached: result.completed && result.stoppedReason === 'depth' && result.depth === limits.maxDepth
       && result.effectiveQuiescenceDepth === limits.quiescenceDepth,
     nodes: result.nodes, searchNodes: result.searchNodes, generationNodes: result.generationNodes,
+    tableEntries: result.tableEntries, cacheMemoryBytes: result.cacheMemoryBytes,
     qnodes: result.qnodes, ttHits: result.ttHits, qTtHits: result.qTtHits ?? 0, cutoffs: result.cutoffs,
     searchMs: result.elapsedMs, wallMs, nps: Math.round(result.nodes * 1000 / wallMs),
     score: result.score, scoreType: result.scoreType, status: result.status,
@@ -135,6 +138,7 @@ function summaries(rows) {
     quiescenceDepths: [...new Set(group.map(row => row.quiescenceDepth))],
     scores: [...new Set(group.map(row => row.score))],
     medianNodes: median(group.map(row => row.nodes)), totalNodes: group.reduce((sum, row) => sum + row.nodes, 0),
+    medianCacheMemoryBytes: median(group.map(row => row.cacheMemoryBytes)),
     medianWallMs: median(group.map(row => row.wallMs)), totalWallMs: group.reduce((sum, row) => sum + row.wallMs, 0),
     minWallMs: Math.min(...group.map(row => row.wallMs)), maxWallMs: Math.max(...group.map(row => row.wallMs)),
     comparableScoreRuns: group.filter(row => row.sameScore !== null).length,
@@ -191,7 +195,7 @@ async function main() {
     row.nodeReduction = row.speedup === null ? null : 1 - row.nodes / baseline.nodes;
   }
   const summary = summaries(rows);
-  if (options.json) console.log(JSON.stringify({ options, nodeVersion: process.version,
+  if (options.json) console.log(JSON.stringify({ options, nodeVersion: process.version, gcBetweenRuns: typeof globalThis.gc === 'function',
     engines: engines.map(({ analyze, ...engine }) => engine), results: rows, summary }, null, 2));
   else {
     console.table(summary.map(row => ({
