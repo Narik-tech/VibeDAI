@@ -9,6 +9,7 @@ import path from 'node:path';
 import { TrainingManager, TRAINING_DEFAULTS, validateTrainingOptions } from '../src/training-manager.js';
 import { generateSelfPlayGames } from '../scripts/transformer-selfplay-games.js';
 import { evaluateCandidate } from '../scripts/transformer-selfplay-arena.js';
+import { runSelfPlay } from '../scripts/transformer-selfplay.js';
 import { createPosition, generateActions, positionKey, validateAction } from '../src/rules.js';
 
 function fakeWorker({ stopExits = false } = {}) {
@@ -428,4 +429,169 @@ test('replay refuses corrupted trajectories instead of displaying an unvalidated
   game.moves[0].action = [[[0, 0, 3, 3], [0, 0, 4, 3]]];
   await writeFile(path.join(folder, 'selfplay-001.json'), JSON.stringify(game));
   await assert.rejects(manager.getGame(id, 'selfplay-001', 1));
+});
+
+test('fresh 20M training works without a legacy checkpoint and keeps outputs in a unique run', async t => {
+  const { manager, directory, calls, workers } = await fixture(t, { availability: undefined });
+  await writeFile(path.join(directory, 'python'), 'fixture executable');
+  const before = await manager.snapshot();
+  assert.equal(before.availability.available, false);
+  assert.equal(before.freshAvailability.available, true);
+  assert.equal(before.model20m.available, false);
+  assert.equal(before.freshDefaults.batchSize, 1);
+  assert.equal(before.freshDefaults.maxTokens, 512);
+  assert.equal(Object.hasOwn(before.freshDefaults, 'python'), false);
+  const started = await manager.startFresh({ steps: 3, samples: 16, device: 'cpu' });
+  assert.equal(started.mode, 'fresh20m');
+  assert.equal(calls[0].mode, 'fresh20m');
+  assert.equal(path.dirname(calls[0].options.runDir), manager.freshRoot);
+  assert.equal(calls[0].options.checkpoint, path.join(calls[0].options.runDir, 'model.pt'));
+  assert.equal(calls[0].options.steps, 3);
+  assert.equal(calls[0].options.samples, 16);
+  assert.equal(calls[0].options.resume, undefined);
+  await assert.rejects(manager.start({}), error => error.statusCode === 409);
+  await assert.rejects(manager.startFresh({}), error => error.statusCode === 409);
+  workers[0].emit('message', { type: 'event', event: { event: 'data-progress', samples: 8, total: 16 } });
+  assert.equal(manager.status().phase, 'data');
+  manager.stop();
+  await manager.finished;
+  assert.equal(manager.status().state, 'interrupted');
+  await manager.startFresh({ steps: 1 });
+  assert.notEqual(calls[1].options.runDir, calls[0].options.runDir);
+});
+
+test('20M self-play selects the latest complete isolated checkpoint after a server restart', async t => {
+  const { manager, directory, calls } = await fixture(t, { availability: undefined });
+  await writeFile(path.join(directory, 'python'), 'fixture executable');
+  const old = path.join(manager.freshRoot, 'fresh-11111111-1111-4111-8111-111111111111');
+  const latest = path.join(manager.freshRoot, 'fresh-22222222-2222-4222-8222-222222222222');
+  const failed = path.join(manager.freshRoot, 'fresh-33333333-3333-4333-8333-333333333333');
+  for (const [folder, status, startedAt] of [[old, 'complete', '2026-09-20'], [latest, 'complete', '2026-09-21'], [failed, 'failed', '2026-09-22']]) {
+    await mkdir(folder, { recursive: true });
+    await writeFile(path.join(folder, 'model.pt'), 'saved checkpoint');
+    await writeFile(path.join(folder, 'training.jsonl'), 'saved data');
+    await writeFile(path.join(folder, 'report.json'), JSON.stringify({ status, startedAt, parameters: 20000257, trainedSteps: 1000,
+      checkpoint: 'C:/outside/ignored.pt', loss: .12 }));
+  }
+  const snapshot = await manager.snapshot();
+  assert.equal(snapshot.freshRuns.length, 3);
+  assert.equal(snapshot.model20m.checkpoint, path.join(latest, 'model.pt'));
+  assert.equal(snapshot.training20mAvailability.available, true);
+  assert.equal(snapshot.availability.available, false, 'A missing old checkpoint does not disable the new model.');
+  await manager.start({ model: '20m', maxTokens: 512, batchSize: 1 });
+  assert.equal(calls[0].options.checkpoint, path.join(latest, 'model.pt'));
+  assert.equal(calls[0].options.seedData, path.join(latest, 'training.jsonl'));
+  assert.equal(calls[0].options.maxTokens, 512);
+  assert.equal(calls[0].options.batchSize, 1);
+});
+
+test('20M selection rejects absent or unfinished checkpoints and fresh options cannot choose paths', async t => {
+  const { manager, workers } = await fixture(t);
+  await assert.rejects(manager.start({ model: '20m' }), /Complete a Fresh 20M/);
+  for (const key of ['python', 'runDir', 'checkpoint', 'resume', 'sharedRunDir', 'width', '__proto__']) {
+    await assert.rejects(manager.startFresh(JSON.parse(`{"${key}":"outside"}`)), /unknown|unsupported|allowed|unexpected/i);
+  }
+  for (const options of [{ maxTokens: 15 }, { maxTokens: 4097 }, { samples: '1' }, { steps: true }, { teacherNodes: 9 }, { device: 'shell' }]) {
+    await assert.rejects(manager.startFresh(options));
+  }
+  await assert.rejects(manager.start({ model: 'outside.pt' }), /model/);
+  assert.equal(workers.length, 0);
+});
+
+test('abandoned fresh reports remain visible as interrupted without selecting their partial checkpoints', async t => {
+  const { manager } = await fixture(t);
+  const folder = path.join(manager.freshRoot, 'fresh-44444444-4444-4444-8444-444444444444');
+  await mkdir(folder, { recursive: true });
+  await writeFile(path.join(folder, 'model.pt'), 'partial checkpoint');
+  await writeFile(path.join(folder, 'report.json'), JSON.stringify({ status: 'running', parameters: 20000257, trainedSteps: 100 }));
+  const snapshot = await manager.snapshot();
+  assert.equal(snapshot.freshRuns[0].status, 'interrupted');
+  assert.equal(snapshot.freshRuns[0].checkpointAvailable, true);
+  assert.equal(snapshot.model20m.available, false);
+  assert.equal(JSON.parse(await readFile(path.join(folder, 'report.json'), 'utf8')).status, 'interrupted');
+  assert.equal(await readFile(path.join(folder, 'model.pt'), 'utf8'), 'partial checkpoint');
+});
+
+async function completedFreshRun(manager, id, startedAt = '2026-09-24') {
+  const folder = path.join(manager.freshRoot, id);
+  await mkdir(folder, { recursive: true });
+  await writeFile(path.join(folder, 'model.pt'), 'saved 20M checkpoint');
+  await writeFile(path.join(folder, 'training.jsonl'), 'saved training data');
+  await writeFile(path.join(folder, 'report.json'), JSON.stringify({ status: 'complete', startedAt,
+    parameters: 20000257, trainedSteps: 1000, config: { policy_head: true } }));
+  return folder;
+}
+
+test('each selected20M model has its own self-play marker while the current model keeps its history', async t => {
+  const { manager, runDir, calls } = await fixture(t);
+  const legacy = JSON.stringify({ version: 1, runId: 'legacy-run', nextIteration: 4, checkpoint: manager.options.checkpoint });
+  await writeFile(path.join(runDir, 'run.json'), legacy);
+  const first = await completedFreshRun(manager, 'fresh-55555555-5555-4555-8555-555555555555');
+  await manager.start({ model: '20m' });
+  assert.equal(calls[0].options.runDir, path.join(first, 'selfplay'));
+  assert.equal(calls[0].options.sharedRunDir, runDir);
+  // Exercise real run-marker setup without starting games, inference or training.
+  await assert.rejects(runSelfPlay(calls[0].options, { shouldStop: () => true, onEvent() {} }), { name: 'AbortError' });
+  assert.equal(JSON.parse(await readFile(path.join(first, 'selfplay/run.json'), 'utf8')).checkpoint, path.join(first, 'model.pt'));
+  assert.equal(await readFile(path.join(runDir, 'run.json'), 'utf8'), legacy);
+  manager.stop(); await manager.finished;
+  const second = await completedFreshRun(manager, 'fresh-66666666-6666-4666-8666-666666666666', '2026-09-25');
+  await manager.start({ model: '20m' });
+  assert.equal(calls[1].options.runDir, path.join(second, 'selfplay'));
+  assert.notEqual(calls[1].options.runDir, calls[0].options.runDir);
+  await assert.rejects(runSelfPlay(calls[1].options, { shouldStop: () => true, onEvent() {} }), { name: 'AbortError' });
+  assert.equal(JSON.parse(await readFile(path.join(second, 'selfplay/run.json'), 'utf8')).checkpoint, path.join(second, 'model.pt'));
+  assert.equal(await readFile(path.join(runDir, 'run.json'), 'utf8'), legacy);
+});
+
+test('merged iteration IDs distinguish current and20M games and preserve qualified review', async t => {
+  const { manager, runDir } = await fixture(t);
+  const current = await persistedIteration(runDir);
+  const freshId = 'fresh-77777777-7777-4777-8777-777777777777';
+  const fresh = await completedFreshRun(manager, freshId);
+  const selectedDir = path.join(fresh, 'selfplay');
+  await mkdir(selectedDir);
+  const selected = await persistedIteration(selectedDir);
+  const id = `${freshId}__${selected.id}`;
+  const snapshot = await manager.snapshot();
+  assert.deepEqual(new Set(snapshot.iterations.map(item => item.id)), new Set([current.id, id]));
+  const listing = snapshot.iterations.find(item => item.id === id);
+  assert.equal(listing.model, '20m');
+  assert.equal(listing.modelRunId, freshId);
+  assert.equal((await manager.getIteration(id)).games.length, 3);
+  const game = await manager.getGame(id, 'selfplay-001', 2);
+  assert.equal(game.ply, 2);
+  assert.equal(positionKey(game.position), selected.records[0].finalKey);
+  for (const invalid of [`${freshId}__../${selected.id}`, `${freshId}__${selected.id}__extra`, `outside__${selected.id}`]) {
+    await assert.rejects(manager.getIteration(invalid), /Invalid training iteration ID/);
+  }
+});
+
+test('snapshot recovers interrupted20M self-play only after the selected checkpoint owner exits', async t => {
+  const { manager } = await fixture(t);
+  const freshId = 'fresh-88888888-8888-4888-8888-888888888888';
+  const fresh = await completedFreshRun(manager, freshId);
+  const runDir = path.join(fresh, 'selfplay');
+  await mkdir(runDir);
+  const { folder } = await abandonedIteration(runDir);
+  const checkpointLock = `${path.join(fresh, 'model.pt')}.selfplay-lock`;
+  await mkdir(checkpointLock);
+  await writeFile(path.join(checkpointLock, '.selfplay.lock'), JSON.stringify({ pid: process.pid, token: 'external-selected-model' }));
+  const locked = await manager.snapshot();
+  assert.equal(locked.training20mAvailability.available, false);
+  assert.equal(JSON.parse(await readFile(path.join(folder, 'report.json'), 'utf8')).status, 'running');
+  await writeFile(path.join(checkpointLock, '.selfplay.lock'), JSON.stringify({ pid: await exitedPid(), token: 'exited-selected-model' }));
+  const recovered = await manager.snapshot();
+  assert.equal(recovered.training20mAvailability.available, true);
+  assert.equal(recovered.iterations.find(item => item.id === `${freshId}__iteration-00000228`).status, 'interrupted');
+  assert.equal(JSON.parse(await readFile(path.join(folder, 'report.json'), 'utf8')).status, 'interrupted');
+});
+
+test('fresh training availability does not require an arena suite', async t => {
+  const { manager, directory } = await fixture(t, { availability: undefined });
+  await writeFile(path.join(directory, 'python'), 'fixture executable');
+  manager.options.arenaSuite = path.join(directory, 'absent-arena.json');
+  assert.equal((await manager.availability({ mode: 'fresh20m' })).available, true);
+  await writeFile(manager.options.checkpoint, 'saved checkpoint');
+  assert.match((await manager.availability()).reason, /evaluation starting-position suite/);
 });

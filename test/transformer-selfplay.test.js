@@ -15,6 +15,7 @@ test('self-play CLI defaults to one bounded cycle and accepts continuous mode', 
   assert.equal(defaults.gameConcurrency, 1);
   assert.equal(defaults.arenaConcurrency, 1);
   assert.equal(defaults.maxDepth, 2);
+  assert.equal(defaults.maxTokens, 4096);
   assert.equal(defaults.device, process.env.TRANSFORMER_DEVICE || 'auto');
   assert.ok(defaults.minPairs <= defaults.arenaPairs);
   const options = parseArguments(['--iterations', '0', '--seed-data', 'none', '--device', 'cpu', '--steps', '3', '--game-concurrency', '4', '--arena-concurrency', '3']);
@@ -25,12 +26,16 @@ test('self-play CLI defaults to one bounded cycle and accepts continuous mode', 
   assert.equal(options.arenaConcurrency, 3);
   assert.equal(parseArguments(['--depth', '64']).maxDepth, 64);
   assert.equal(parseArguments(['--depth', '0']).maxDepth, 0);
+  assert.equal(parseArguments(['--max-tokens', '16']).maxTokens, 16);
+  assert.equal(parseArguments(['--max-tokens', '512']).maxTokens, 512);
+  assert.equal(parseArguments(['--max-tokens', '4096']).maxTokens, 4096);
 });
 
 test('self-play CLI rejects malformed limits and unsafe promotion thresholds', () => {
   for (const args of [ ['--games', '0'], ['--steps', '1.5'], ['--nodes', 'NaN'], ['--iterations', '-1'],
     ['--game-concurrency', '0'], ['--game-concurrency', '9'], ['--game-concurrency', '1.5'], ['--game-concurrency', 'NaN'],
     ['--arena-concurrency', '0'], ['--arena-concurrency', '9'], ['--arena-concurrency', '1.5'], ['--arena-concurrency', 'NaN'],
+    ['--max-tokens', '15'], ['--max-tokens', '4097'], ['--max-tokens', '512.5'], ['--max-tokens', 'NaN'],
     ['--exploration', '1.1'], ['--outcome-weight', '-.1'], ['--promotion-score', '.5'], ['--depth', '-1'], ['--depth', '65'],
     ['--arena-pairs', '2', '--min-pairs', '3'], ['--batch-size', '129'], ['--device', 'bogus'], ['--steps'], ['--bogus', '1'] ]) {
     assert.throws(() => parseArguments(args), undefined, args.join(' '));
@@ -163,13 +168,26 @@ async function trainingFixture(t, onSpawn, shouldStop = () => false) {
   const child = new EventEmitter();
   child.stdout = new PassThrough(); child.stderr = new PassThrough();
   child.kill = () => { queueMicrotask(() => child.emit('exit', null, 'SIGTERM')); return true; };
-  const training = trainCandidate({ python: 'python', steps: 1, batchSize: 1, learningRate: .001, device: 'cpu' },
+  const training = trainCandidate({ python: 'python', steps: 1, batchSize: 1, maxTokens: 512, learningRate: .001, device: 'cpu' },
     files, 42, shouldStop, () => {}, {
       exitGraceMs: 10, stopGraceMs: 10,
-      spawnProcess() { queueMicrotask(() => onSpawn(child)); return child; },
+      spawnProcess(executable, args) { queueMicrotask(() => onSpawn(child, executable, args)); return child; },
     });
   return { child, files, training };
 }
+
+test('candidate training uses and records the selected context limit', async t => {
+  let spawnedCommand;
+  const { files, training } = await trainingFixture(t, (child, executable, args) => {
+    spawnedCommand = { executable, args };
+    child.emit('exit', 0, null);
+  });
+  await training;
+  const command = JSON.parse(await readFile(files.command, 'utf8'));
+  assert.deepEqual(command, spawnedCommand);
+  assert.equal(command.args[command.args.indexOf('--max-tokens') + 1], '512');
+  assert.equal(command.args[command.args.indexOf('--resume') + 1], files.incumbent);
+});
 
 test('trainer exit settles without waiting forever for inherited pipes to close', { timeout: 2000 }, async t => {
   const { child, files, training } = await trainingFixture(t, child => {

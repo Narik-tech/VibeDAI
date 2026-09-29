@@ -1,4 +1,4 @@
-"""Small pre-norm Transformer with explicit multiverse coordinate features."""
+"""Pre-norm Transformer with explicit multiverse coordinate features."""
 
 import math
 from dataclasses import asdict, dataclass
@@ -19,10 +19,11 @@ ARCHITECTURE = "5d-transformer-value-v1"
 
 @dataclass
 class ModelConfig:
-    width: int = 128
-    heads: int = 4
-    layers: int = 4
-    feedforward: int = 384
+    # Approximately 20M parameters with the optional component policy.
+    width: int = 512
+    heads: int = 8
+    layers: int = 6
+    feedforward: int = 2048
     max_tokens: int = MAX_TOKENS
     dropout: float = 0.1
     policy_head: bool = False
@@ -33,10 +34,10 @@ class ModelConfig:
         for key in ("width", "heads", "layers", "feedforward", "max_tokens"):
             if type(getattr(self, key)) is not int:
                 raise ValueError(f"config.{key} must be an integer")
-        if not 32 <= self.width <= 256 or self.heads not in (1, 2, 4, 8) or self.width % self.heads:
-            raise ValueError("width must be 32–256 and divisible by heads (1, 2, 4, or 8)")
-        if not 1 <= self.layers <= 8 or not self.width <= self.feedforward <= 1024:
-            raise ValueError("layers must be 1–8 and feedforward width must be width–1024")
+        if not 32 <= self.width <= 512 or self.heads not in (1, 2, 4, 8) or self.width % self.heads:
+            raise ValueError("width must be 32–512 and divisible by heads (1, 2, 4, or 8)")
+        if not 1 <= self.layers <= 8 or not self.width <= self.feedforward <= 2048:
+            raise ValueError("layers must be 1–8 and feedforward width must be width–2048")
         if not 16 <= self.max_tokens <= MAX_TOKENS or not 0 <= self.dropout < 1:
             raise ValueError(f"max_tokens must be 16–{MAX_TOKENS} and dropout must be in [0,1)")
 

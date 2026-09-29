@@ -103,6 +103,9 @@ export function createApp({ transformerRuntime = new TransformerRuntime(), train
       if (req.method !== 'POST') return send(res, 404, { error: 'Not found.' });
       const body = await readBody(req);
       switch (url.pathname) {
+        case '/api/training/fresh/start':
+          if (Object.keys(body).some(key => key !== 'options')) throw new Error('Only training options may be supplied.');
+          return send(res, 202, await trainingManager.startFresh(body.options));
         case '/api/training/start':
           if (Object.keys(body).some(key => key !== 'options')) throw new Error('Only training options may be supplied.');
           return send(res, 202, await trainingManager.start(body.options));

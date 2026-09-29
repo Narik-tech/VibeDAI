@@ -148,6 +148,30 @@ test('training HTTP validation rejects untrusted options and foreign origins bef
   assert.equal(workers.length, 0);
 });
 
+test('fresh 20M HTTP flow validates settings, starts data generation and shares the stop control', async t => {
+  const { request, workers, invocations, base } = await fixture(t);
+  const snapshot = (await request('/api/training')).data;
+  assert.equal(snapshot.freshAvailability.available, true);
+  assert.equal(snapshot.freshDefaults.batchSize, 1);
+  assert.equal(snapshot.model20m.available, false);
+  for (const options of [{ checkpoint: 'outside.pt' }, { python: 'cmd.exe' }, { resume: 'old.pt' }, { samples: 0 }, { maxTokens: 15 }, { device: 'shell' }]) {
+    const rejected = await request('/api/training/fresh/start', { options });
+    assert.equal(rejected.status, 400, JSON.stringify(options));
+  }
+  assert.equal((await fetch(base + '/api/training/fresh/start', { method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: 'https://example.com' }, body: JSON.stringify({ options: {} }) })).status, 403);
+  const started = await request('/api/training/fresh/start', { options: { steps: 5, samples: 32, maxTokens: 512, device: 'cpu' } });
+  assert.equal(started.status, 202, started.data.error);
+  assert.equal(started.data.mode, 'fresh20m');
+  assert.equal(invocations[0].mode, 'fresh20m');
+  assert.equal(invocations[0].options.steps, 5);
+  assert.equal((await request('/api/training/start', { options: {} })).status, 409);
+  workers[0].emit('message', { type: 'event', event: { event: 'data-progress', samples: 16, total: 32 } });
+  assert.equal((await request('/api/training')).data.status.phase, 'data');
+  assert.equal((await request('/api/training/stop', {})).status, 200);
+  assert.equal((await request('/api/training')).data.status.state, 'interrupted');
+});
+
 test('saved game browsing returns legal replay positions without touching the analysis game', async t => {
   const { request, runDir, workers } = await fixture(t);
   const { id, game } = await writeGame(runDir);

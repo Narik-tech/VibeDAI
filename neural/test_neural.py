@@ -135,6 +135,27 @@ class TrainingDataTests(unittest.TestCase):
                 dataset_weight_mean(data)
 
 
+class ServiceBatchTests(unittest.TestCase):
+    def test_default_batch_size_tracks_checkpoint_size(self):
+        from neural.service import inference_batch_size
+        self.assertEqual(inference_batch_size(694_017), 16)
+        self.assertEqual(inference_batch_size(9_999_999), 16)
+        self.assertEqual(inference_batch_size(10_000_000), 1)
+        self.assertEqual(inference_batch_size(20_000_257), 1)
+
+    def test_explicit_batch_sizes_override_both_defaults(self):
+        from neural.service import inference_batch_size
+        for parameters in (694_017, 20_000_257):
+            for requested in (1, 16, 128):
+                self.assertEqual(inference_batch_size(parameters, requested), requested)
+
+    def test_invalid_batch_sizes_are_rejected(self):
+        from neural.service import inference_batch_size
+        for requested in (0, -1, 129, 1.5, True, "16"):
+            with self.subTest(requested=requested), self.assertRaisesRegex(ValueError, "batch-size"):
+                inference_batch_size(20_000_257, requested)
+
+
 @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is not installed")
 class ModelTests(unittest.TestCase):
     @classmethod
@@ -170,9 +191,22 @@ class ModelTests(unittest.TestCase):
             self.assertEqual(response.returncode, 0, response.stderr)
             messages = [json.loads(line) for line in response.stdout.splitlines()]
             self.assertTrue(messages[0]["ready"])
+            self.assertEqual(messages[0]["batchSize"], 16)
             self.assertEqual(messages[1]["id"], "test")
             self.assertTrue(math.isfinite(messages[1]["values"][0]))
             self.assertIn("error", messages[2])
+            for requested, valid in (("2", True), ("0", False)):
+                with self.subTest(batch_size=requested):
+                    response = subprocess.run([sys.executable, "neural/service.py", "--checkpoint", str(checkpoint),
+                                               "--device", "cpu", "--batch-size", requested],
+                                              input="", capture_output=True, text=True, cwd=ROOT, timeout=60)
+                    ready = json.loads(response.stdout.splitlines()[0])
+                    self.assertEqual(ready["ready"], valid)
+                    self.assertEqual(response.returncode, 0 if valid else 1, response.stderr)
+                    if valid:
+                        self.assertEqual(ready["batchSize"], 2)
+                    else:
+                        self.assertIn("batch-size", ready["error"])
 
     def test_padding_does_not_change_single_position_value(self):
         import torch
@@ -202,7 +236,7 @@ class ModelTests(unittest.TestCase):
             output = Path(directory) / "model.pt"
             data.write_text(json.dumps({"position": position(), "value": 400}) + "\n", encoding="utf-8")
             command = [sys.executable, "neural/train.py", "--data", str(data), "--output", str(output), "--device", "cpu",
-                       "--steps", "2", "--batch-size", "2", "--width", "32", "--layers", "1", "--feedforward", "64", "--max-tokens", "64"]
+                       "--steps", "2", "--batch-size", "2", "--width", "32", "--heads", "4", "--layers", "1", "--feedforward", "64", "--max-tokens", "64"]
             first = subprocess.run(command, capture_output=True, text=True, cwd=ROOT, timeout=60)
             self.assertEqual(first.returncode, 0, first.stderr)
             self.assertEqual(json.loads(first.stdout.splitlines()[0])["sampleWeightMean"], 1)
@@ -261,7 +295,7 @@ class ModelTests(unittest.TestCase):
             expected_first_loss = 0.5 * (prediction - math.tanh(0.4)) ** 2
             command = [sys.executable, "neural/train.py", "--data", str(data), "--output", str(output), "--device", "cpu",
                        "--steps", "2", "--batch-size", "1", "--shuffle-buffer", "1", "--dropout", "0",
-                       "--width", "32", "--layers", "1", "--feedforward", "64", "--max-tokens", "64"]
+                       "--width", "32", "--heads", "4", "--layers", "1", "--feedforward", "64", "--max-tokens", "64"]
             first = subprocess.run(command, capture_output=True, text=True, cwd=ROOT, timeout=60)
             self.assertEqual(first.returncode, 0, first.stderr)
             events = [json.loads(line) for line in first.stdout.splitlines()]

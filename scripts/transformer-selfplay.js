@@ -20,7 +20,7 @@ import { recoverInterruptedIterations } from './transformer-selfplay-recovery.js
 const defaults = {
   iterations: 1, games: 8, gameConcurrency: 1, maxPlies: 40, maxNodes: 20000, maxDepth: 2, timeMs: 3000,
   terminalWork: 20000, exploration: .2, explorationPlies: 12, outcomeWeight: .5,
-  steps: 500, batchSize: 16, learningRate: .0001, replaySize: 8192, seed: 42,
+  steps: 500, batchSize: 16, maxTokens: 4096, learningRate: .0001, replaySize: 8192, seed: 42,
   arenaPairs: 8, arenaConcurrency: 1, minPairs: 4, arenaPlies: 80, promotionScore: .55, keepIterations: 5,
   device: process.env.TRANSFORMER_DEVICE || 'auto',
   checkpoint: process.env.TRANSFORMER_CHECKPOINT || DEFAULT_CHECKPOINT,
@@ -48,6 +48,7 @@ Continuous shortcut: npm run transformer:selfplay:continuous
   --outcome-weight X   Finished-game outcome weight vs search target (0.5)
   --steps N            Additional training updates/cycle (500)
   --batch-size N       Training batch (16)
+  --max-tokens N       Training context limit, 16..4096 (4096)
   --learning-rate X    AdamW learning rate (0.0001)
   --replay-size N      Maximum unique replay positions (8192)
   --seed-data FILE     Initial replay JSONL; "none" starts from self-play only
@@ -72,7 +73,7 @@ export function parseArguments(args, initialOptions = defaults) {
   const options = { ...initialOptions };
   const names = { iterations: 'iterations', games: 'games', 'game-concurrency': 'gameConcurrency', plies: 'maxPlies', nodes: 'maxNodes', depth: 'maxDepth',
     'time-ms': 'timeMs', 'terminal-work': 'terminalWork', exploration: 'exploration', 'exploration-plies': 'explorationPlies',
-    'outcome-weight': 'outcomeWeight', steps: 'steps', 'batch-size': 'batchSize', 'learning-rate': 'learningRate',
+    'outcome-weight': 'outcomeWeight', steps: 'steps', 'batch-size': 'batchSize', 'max-tokens': 'maxTokens', 'learning-rate': 'learningRate',
     'replay-size': 'replaySize', seed: 'seed', 'arena-pairs': 'arenaPairs', 'arena-concurrency': 'arenaConcurrency', 'min-pairs': 'minPairs',
     'arena-plies': 'arenaPlies', 'promotion-score': 'promotionScore', 'keep-iterations': 'keepIterations' };
   const paths = { checkpoint: 'checkpoint', python: 'python', 'run-dir': 'runDir', 'seed-data': 'seedData', suite: 'suite', 'arena-suite': 'arenaSuite' };
@@ -91,7 +92,7 @@ export function parseArguments(args, initialOptions = defaults) {
   for (const [name, min, max] of [
     ['iterations', 0, 1000000], ['games', 1, 128], ['gameConcurrency', 1, 8], ['maxPlies', 1, 256], ['maxNodes', 1, 10000000],
     ['maxDepth', 0, 64], ['timeMs', 1, 60000], ['terminalWork', 1, 10000000], ['explorationPlies', 0, 256],
-    ['steps', 1, 1000000], ['batchSize', 1, 128], ['replaySize', 1, 100000], ['seed', 0, 0xffffffff],
+    ['steps', 1, 1000000], ['batchSize', 1, 128], ['maxTokens', 16, 4096], ['replaySize', 1, 100000], ['seed', 0, 0xffffffff],
     ['arenaPairs', 1, 128], ['arenaConcurrency', 1, 8], ['minPairs', 1, 128], ['arenaPlies', 1, 256], ['keepIterations', 1, 100],
   ]) if (!Number.isSafeInteger(options[name]) || options[name] < min || options[name] > max) throw new Error(`Invalid ${name}: expected integer ${min}..${max}.`);
   for (const name of ['exploration', 'outcomeWeight']) if (!Number.isFinite(options[name]) || options[name] < 0 || options[name] > 1) throw new Error(`Invalid ${name}.`);
@@ -206,7 +207,7 @@ export async function trainCandidate(options, files, seed, shouldStop, onEvent =
   checkStop(shouldStop);
   const args = ['-u', path.join(PROJECT_ROOT, 'neural/train.py'), '--data', files.replay,
     '--resume', files.incumbent, '--output', files.candidate, '--steps', String(options.steps),
-    '--batch-size', String(options.batchSize), '--learning-rate', String(options.learningRate),
+    '--batch-size', String(options.batchSize), '--max-tokens', String(options.maxTokens), '--learning-rate', String(options.learningRate),
     '--seed', String(seed), '--device', options.device, '--save-every', String(options.steps),
     '--log-every', String(Math.max(1, Math.ceil(options.steps / 20))),
     '--label', 'Experimental transformer self-play value model; promotion arena recorded separately'];
@@ -372,7 +373,7 @@ export async function runSelfPlay(options, { shouldStop = () => false, onRuntime
         if (!play.samples.length) throw new Error('No completed finite search targets. Increase --nodes/--time-ms or change --suite.');
         report.replay = await updateReplay({ replayPath: replay, newSamples: play.samples, seedData: options.seedData,
           maxSamples: options.replaySize, seed, excludePositionKeys: arenaKeys });
-        onEvent('training-start', { iteration, replay: report.replay, steps: options.steps, batchSize: options.batchSize });
+        onEvent('training-start', { iteration, replay: report.replay, steps: options.steps, batchSize: options.batchSize, maxTokens: options.maxTokens });
         await saveReport();
         await trainCandidate(options, files, seed, shouldStop, onEvent);
         checkStop(shouldStop);

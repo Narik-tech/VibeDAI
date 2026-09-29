@@ -119,7 +119,7 @@ class PolicyModelTests(unittest.TestCase):
             data.write_text(json.dumps(row) + "\n", encoding="utf-8")
             command = [sys.executable, "neural/train.py", "--data", str(data), "--output", str(output),
                        "--device", "cpu", "--steps", "2", "--batch-size", "1", "--width", "32",
-                       "--layers", "1", "--feedforward", "64", "--max-tokens", "64"]
+                       "--heads", "4", "--layers", "1", "--feedforward", "64", "--max-tokens", "64"]
             first = subprocess.run(command, capture_output=True, text=True, cwd=ROOT, timeout=60)
             self.assertEqual(first.returncode, 0, first.stderr)
             self.assertEqual(torch.load(output, weights_only=True)["policyTrainedSteps"], 0)

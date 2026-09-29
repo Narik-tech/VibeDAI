@@ -203,10 +203,10 @@ These development fixtures do not establish Elo or independent playing strength.
 
 | Component | Default |
 | --- | --- |
-| Transformer blocks | 4, pre-normalization |
-| Hidden width / attention heads | 128 / 4 |
-| Feed-forward width | 384, GELU |
-| Value-only parameters | 694,017; optional policy head adds parameters |
+| Transformer blocks | 6, pre-normalization |
+| Hidden width / attention heads | 512 / 8 |
+| Feed-forward width | 2,048, GELU |
+| Parameters | 20,000,257 with the optional policy head (~20M); 19,142,657 value-only |
 | Context | At most 4,096 tokens including CLS |
 | Training | AdamW, batch 16, CUDA float16 AMP, gradient norm clipped to 1 |
 | Prediction | CLS value head, scalar white-relative score; optional component policy logits |
@@ -237,24 +237,26 @@ fits. Every prediction reports token counts, `truncated`, and
 hide relevant tactics from evaluation; legal search still uses full history.
 Training and inference share this selection policy.
 
-On this workstation's **NVIDIA GeForce RTX 3060, 12 GiB**, PyTorch
-2.14.0+cu126 completed three full-length training updates at batch 16 × 512
+With the previous 694,017-parameter model on this workstation's
+**NVIDIA GeForce RTX 3060, 12 GiB**, PyTorch
+2.14.0+cu126 completed three training updates at batch 16 × 512
 tokens in **0.379 seconds**, with **206.4 MiB peak allocated** and **262 MiB
 peak reserved** CUDA memory. These allocator figures exclude driver/context and
-other applications. This is a synthetic architecture feasibility measurement,
-not a playing-strength benchmark. Reproduce it with:
+other applications. These historical measurements do not describe the new 20M
+model. Benchmark the current default architecture with:
 
 ```powershell
-npm run transformer:doctor -- --benchmark --device cuda
+node scripts/transformer.js doctor --benchmark --device cuda --batch-size 1
 ```
 
 The benchmark creates no checkpoint. It exercises forward/backward passes,
-mixed precision, and optimizer state at a fixed 512-token workload; these earlier
-measurements do not describe the current 4,096-token maximum. Model data and
-optimizer memory are small relative to this GPU's capacity; sparse encoding and
-JavaScript legal move generation may dominate end-to-end search time.
+mixed precision, and optimizer state at a fixed 512-token workload. It does not
+measure the 4,096-token maximum. The 20M model needs about 76 MiB for float32
+weights alone; gradients, AdamW state, activations, and attention add to that.
+Start at batch 1 and measure memory with representative positions before
+increasing the batch or context length, especially when training the policy head.
 
-The initial local bootstrap trained for 1,000 updates on 256 teacher positions
+The initial local bootstrap of the previous small model trained for 1,000 updates on 256 teacher positions
 in **41.213 seconds**, reaching **206.4 MiB peak allocated / 264 MiB reserved**.
 An end-to-end HTTP smoke check on this workstation completed standard-position
 analysis in about 650 ms and a two-timeline position in about 85 ms, and verified
@@ -263,6 +265,36 @@ small smoke cases with bounded candidate search; they are not a general speed
 or strength estimate. The bootstrap has no held-out validation claim.
 
 ## Training
+
+### Training the 20M model
+
+The **Training** page can run this workflow directly. Select **Fresh 20M model**,
+adjust the data and learning settings, then select **Start fresh 20M**. The server
+generates policy-labeled teacher data and trains the full 20,000,257-parameter
+model in a separate run folder. Progress, loss, saved checkpoint paths, and stop
+controls are shown on the page. After completion, **Self-play · 20M model** uses
+the latest completed fresh model. Each model has its own self-play history;
+the current analysis checkpoint remains separately selectable.
+
+New training runs use the 20M architecture by default (19.14M value-only;
+20.00M when policy labels enable the optional policy head). Existing checkpoints
+retain their saved dimensions when loaded or resumed, including in self-play.
+Changing the defaults does not enlarge trained weights; start a fresh run to
+train the larger architecture. For a separate candidate with a smaller initial
+memory budget:
+
+```powershell
+node scripts/transformer.js train --data artifacts/transformer/training.jsonl --output artifacts/transformer/model-20m.pt --batch-size 1 --max-tokens 512 --device cuda
+```
+
+The standard context budget remains 4,096; this example explicitly uses 512
+during training to reduce memory. Evaluate the candidate on held-out data before
+selecting it with `TRANSFORMER_CHECKPOINT`. Self-play can then resume that larger
+checkpoint. Its CLI defaults to a 4,096-token training budget; use `--max-tokens`
+to adjust it. The 20M UI starts at 512 tokens. Resuming the old checkpoint
+continues training the old architecture.
+To create a model with the previous dimensions, pass
+`--width 128 --heads 4 --layers 4 --feedforward 384`.
 
 ### Component policy head
 
@@ -377,9 +409,12 @@ playing strength. Logs report elapsed time and truncation; completion reports
 peak CUDA allocator memory. An interrupted run can resume from the last saved
 checkpoint.
 
-Use `--batch-size 8` if available memory is constrained by other applications.
+For the 20M model, start with `--batch-size 1`; the default batch remains 16.
+Reduce `--max-tokens` as needed if long positions exceed available memory.
 `--width`, `--heads`, `--layers`, and `--feedforward` configure new models and
-cannot change an existing model via resume. `--max-tokens` accepts 16–4,096 and
+cannot change an existing model via resume. Width accepts 32–512, heads accepts
+1, 2, 4, or 8 and must divide width, layers accepts 1–8, and feed-forward
+width accepts hidden width–2,048. `--max-tokens` accepts 16–4,096 and
 defaults to 4,096 for both new and resumed training. Training saves the effective
 budget with the checkpoint. Inference and evaluation load existing weights with
 the current 4,096-token budget, including older checkpoints trained with smaller
@@ -413,7 +448,9 @@ Startup emits `{ "ready": true, "device": "cuda", "model": { ... } }` or
 `{ "id": 1, "positions": [position] }` returns `{ "id": 1, "values": [125.0],
 "context": [{ "tokens": 34, "totalTokens": 34, "truncated": false,
 "frontierTruncated": false }], "device": "cuda" }`. Requests accept 1–128
-positions and are internally evaluated in batches of 16. Invalid requests
+positions and are internally evaluated in batches of 1 for models with at least
+10M parameters, or 16 for smaller models. `--batch-size` overrides this default;
+the ready response includes the effective `batchSize`. Invalid requests
 return `{ "id": 1, "error": "..." }`. Input lines are limited to 32 MiB.
 
 Implementation references: [PyTorch TransformerEncoder](https://docs.pytorch.org/docs/2.14/generated/torch.nn.TransformerEncoder.html),

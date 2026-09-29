@@ -16,27 +16,34 @@
       <div class="topbar-right"><nav class="workspace-nav" aria-label="Workspace"><a href="/">Analysis</a><a href="/training" aria-current="page">Training</a></nav><span class="connection" id="training-connection"><span class="status-dot"></span>Connecting</span></div>
     </header>
     <main class="training-workspace">
-      <div class="training-heading"><div><p class="eyebrow">LEARN · EVALUATE · EVOLVE</p><h1>Training workspace</h1><p class="subtitle">Run self-play cycles. Inspect the games. Shape the next model.</p></div><span class="experimental-label">EXPERIMENTAL TRANSFORMER</span></div>
+      <div class="training-heading"><div><p class="eyebrow">LEARN · EVALUATE · EVOLVE</p><h1>Training workspace</h1><p class="subtitle">Train a fresh 20M model, then improve it through self-play.</p></div><span class="experimental-label">EXPERIMENTAL TRANSFORMER</span></div>
       <div class="training-layout">
         <aside class="parameter-rail" aria-label="Training configuration">
           <form id="training-form" class="panel parameter-panel" novalidate>
             <div class="panel-heading"><h2>Run configuration</h2><button class="text-button" type="button" id="reset-parameters" disabled>Reset</button></div>
-            <p class="section-description">Parameters apply to the next run.</p>
+            <label class="parameter-field run-mode-field" for="training-mode"><span>Training mode</span><select id="training-mode" disabled><option value="fresh20m">Fresh 20M model</option><option value="selfplay20m">Self-play · 20M model</option><option value="current">Self-play · current model</option></select></label>
+            <div class="model-summary" id="model-summary"><strong>20,000,257 parameters</strong><span>6 layers · width 512 · 8 heads · feed-forward 2,048</span><span>Value + policy heads</span></div>
+            <p class="section-description" id="mode-description">Generate labeled positions, then train a new model from scratch.</p>
             <fieldset id="parameter-fields" disabled><legend class="sr-only">Training parameters</legend><div id="parameter-groups"></div></fieldset>
             <p class="form-error" id="parameter-error" role="alert" hidden></p>
             <div class="run-actions"><button class="button primary" type="submit" id="start-training" disabled><span aria-hidden="true">▷</span> Start training</button><button class="button quiet stop-button" type="button" id="stop-training" disabled>Stop run</button></div>
             <p class="run-hint" id="run-hint">Checking local training availability…</p>
-            <p class="parameter-note">Each cycle generates games, trains a candidate, then tests it against the current model. Passing the arena gate promotes the candidate automatically.</p>
+            <p class="parameter-note" id="parameter-note">Each fresh run starts with new weights and saves its own checkpoint. Completed 20M models are available for self-play.</p>
           </form>
-          <div class="local-note"><i class="legend-dot current"></i><p>Runs locally with your existing checkpoint. Completed games and replay samples are retained when you stop.</p></div>
+          <div class="local-note"><i class="legend-dot current"></i><p>Runs locally. Fresh models and labeled data are saved in separate run folders. Training starts only when you select Start.</p></div>
         </aside>
         <div class="training-content">
           <section class="panel run-panel" aria-labelledby="run-heading">
             <div class="panel-heading"><div class="heading-with-dot"><i class="engine-dot" id="run-dot"></i><h2 id="run-heading">Run monitor</h2></div><div class="monitor-heading-actions"><span class="small-badge" id="run-state">CONNECTING</span><button class="text-button" id="refresh-training" type="button">Refresh</button></div></div>
-            <div class="run-summary"><div><h3 id="run-title">Connecting to training</h3><p id="run-detail">Reading local runs and retained games…</p></div><div class="run-counter"><span class="eyebrow">ITERATION</span><strong id="current-iteration">—</strong></div></div>
+            <div class="run-summary"><div><h3 id="run-title">Connecting to training</h3><p id="run-detail">Reading local runs and retained games…</p></div><div class="run-counter"><span class="eyebrow" id="run-counter-label">UPDATE</span><strong id="current-iteration">—</strong></div></div>
             <ol class="pipeline" aria-label="Training cycle"><li data-phase="selfplay"><span>01</span><div><strong>Self-play</strong><small>Generate experience</small></div></li><li data-phase="training"><span>02</span><div><strong>Train</strong><small>Update candidate</small></div></li><li data-phase="arena"><span>03</span><div><strong>Arena</strong><small>Evaluate both colors</small></div></li><li data-phase="complete"><span>04</span><div><strong>Promotion</strong><small>Apply the score gate</small></div></li></ol>
             <p class="notice error-notice" id="run-error" role="alert" hidden></p>
             <details class="event-details"><summary>Live events <span id="event-count">0 events</span></summary><pre id="event-log" class="log-output">No events for this server session.</pre></details>
+          </section>
+          <section class="panel fresh-model-panel" aria-labelledby="fresh-model-heading">
+            <div class="panel-heading"><div><p class="eyebrow">SAVED CHECKPOINTS</p><h2 id="fresh-model-heading">20M model runs</h2></div><span class="small-badge" id="model20m-state">NO MODEL YET</span></div>
+            <p class="section-description" id="model20m-detail">Complete a fresh run to make its checkpoint available for self-play.</p>
+            <div id="fresh-runs" class="fresh-runs"><p class="library-empty">No fresh runs yet.</p></div>
           </section>
           <section class="panel iteration-panel" aria-labelledby="iteration-heading">
             <div class="panel-heading"><div><p class="eyebrow">RETAINED HISTORY</p><h2 id="iteration-heading">Iteration results</h2></div><label class="iteration-choice"><span class="sr-only">Retained iteration</span><select id="iteration-select" disabled><option>No retained iterations</option></select></label></div>

@@ -197,10 +197,10 @@ def main():
     parser.add_argument("--validation-batches", type=int, default=16)
     parser.add_argument("--best-output", help="save lowest-validation-MSE checkpoint separately, including a resumed baseline if it remains best")
     parser.add_argument("--label", default="Experimental supervised value model; strength unverified")
-    parser.add_argument("--width", type=int, default=128)
-    parser.add_argument("--heads", type=int, default=4)
-    parser.add_argument("--layers", type=int, default=4)
-    parser.add_argument("--feedforward", type=int, default=384)
+    parser.add_argument("--width", type=int, help="override the default 20M model's hidden width")
+    parser.add_argument("--heads", type=int, help="override the default 20M model's attention heads")
+    parser.add_argument("--layers", type=int, help="override the default 20M model's transformer blocks")
+    parser.add_argument("--feedforward", type=int, help="override the default 20M model's feed-forward width")
     parser.add_argument("--max-tokens", type=int, default=MAX_TOKENS,
                         help=f"input token budget, including resumed training (16–{MAX_TOKENS}; default {MAX_TOKENS})")
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -245,7 +245,9 @@ def main():
         if args.resume:
             model, checkpoint = load_checkpoint(args.resume, device, max_tokens=args.max_tokens)
         else:
-            config = ModelConfig(args.width, args.heads, args.layers, args.feedforward, args.max_tokens, args.dropout)
+            architecture = {key: getattr(args, key) for key in ("width", "heads", "layers", "feedforward")
+                            if getattr(args, key) is not None}
+            config = ModelConfig(**architecture, max_tokens=args.max_tokens, dropout=args.dropout)
             model = TransformerValue(config).to(device)
         # Restore the old optimizer before adding new parameters, preserving
         # momentum when a legacy value checkpoint gains its first policy head.

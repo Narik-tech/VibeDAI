@@ -2,8 +2,9 @@
 
 The runner repeatedly plays the current transformer against itself, adds value
 targets to a bounded replay buffer, trains a candidate on the local GPU, and
-tests it against the incumbent. Only a passing candidate replaces the checkpoint
-used by **Transformer · experimental** in the UI. Classical search and the
+tests it against the incumbent. Only a passing candidate replaces the selected
+checkpoint. The current analysis checkpoint is used by **Transformer · experimental**
+in the UI. Classical search and the
 existing `npm run selfplay` diagnostic are separate.
 
 ## Run it
@@ -11,22 +12,33 @@ existing `npm run selfplay` diagnostic are separate.
 ### Browser controls and game review
 
 Start the local server with `npm start` and open **Training** in the app header
-at `http://127.0.0.1:5173/training`. The page uses the same runner and saved
-history as the commands below. An existing trained checkpoint and the local
-transformer Python environment are required to start training; saved games can
-be reviewed without starting a model.
+at `http://127.0.0.1:5173/training`. The local transformer Python environment
+is required to start training. Choose a run mode:
+
+- **Fresh 20M model** generates new training data, initializes the 20M model from
+  scratch, and saves its checkpoint in a new run folder. It starts with 1,000
+  updates, batch size 1, a 512-token training context, 4,096 data samples, and
+  2,000 search nodes per sample. Each run keeps its data and checkpoint;
+  fresh training leaves the current analysis checkpoint in place.
+- **Self-play · 20M model** improves the latest completed fresh 20M checkpoint through
+  the self-play and promotion loop described below.
+- **Self-play · current model** runs self-play using the existing analysis checkpoint.
+
+The page runs one training job at a time across these modes. It shows saved
+fresh runs and self-play history; saved games can be reviewed without starting
+a model.
 
 Adjust the parameters before starting a run. Settings cover cycle count
 (`0` means continuous), self-play games, independent self-play and arena concurrency,
 turn limits, search budgets,
-training updates, batch size, learning rate, replay capacity, exploration,
+training updates, batch size, training context, learning rate, replay capacity, exploration,
 device, and the paired promotion gate. Changes apply to the next run.
 Browser preferences are saved locally; each cycle also records its exact
 settings in `iteration.json` and `report.json`.
 
-The run view shows its current phase, retained cycle reports, promotion
-decisions, and training log. **Stop run** cooperatively stops a run started by
-this server and preserves completed records and replay. Closing a browser tab
+The run view shows its current phase, saved fresh runs, retained cycle reports,
+promotion decisions, and training log. **Stop run** cooperatively stops the
+active job and preserves saved artifacts and completed records. Closing a browser tab
 does not stop training; stopping the server requests cancellation. An external
 command-line runner is detected through its lock and must be stopped from its
 own terminal.
@@ -69,6 +81,9 @@ game searches in its own CPU worker, sharing one loaded inference model. The
 inference queue drops cancelled work before sending it to Python and keeps at
 most one request in flight. This avoids multiplying GPU model memory. Training
 updates and the paired promotion arena still run after generation as separate phases.
+Inference defaults to one position per batch for models with at least 10M
+parameters, including the 20M model; smaller checkpoints retain batches of 16.
+The inference context remains 4,096 tokens independently of the training limit.
 
 To also play up to four arena games concurrently:
 
@@ -120,9 +135,17 @@ node scripts/transformer-selfplay.js --iterations 0 --device cuda --games 16 --p
 ```
 
 These settings can take substantial time. Legal move generation runs on the
-CPU, so low GPU utilization during games is expected. Training uses the existing
-compact transformer and CUDA mixed precision. Reduce `--batch-size` to 8 if GPU
-memory is shared with other applications. Use `--device cpu` without CUDA.
+CPU, so low GPU utilization during games is expected. Training uses the saved
+checkpoint's architecture and CUDA mixed precision. The batch-32 example above
+was intended for the previous small model. Start with `--batch-size 1 --max-tokens 512`
+for a 20M checkpoint and measure memory before increasing either setting.
+`--max-tokens` accepts integers from 16 to 4096 and limits the board history
+encoded for each training example. Lower limits reduce training memory and
+discard more distant board history when a position exceeds the limit. The command-line
+default stays at 4096; the Training page's 20M settings use 512.
+Self-play resumes the saved
+architecture; first [train a fresh 20M checkpoint](transformer.md#training-the-20m-model)
+to use the larger model. Use `--device cpu` without CUDA.
 Avoid latency-sensitive UI analysis while training if response time matters.
 
 For an isolated short pipeline check, copy the active checkpoint first:
@@ -147,6 +170,7 @@ if you want to preserve an earlier check's copied checkpoint.
 | Search per turn | Depth 2, 20,000 work units, 3 seconds |
 | Exploration | 20% probability during the first 12 turns |
 | Training | 500 additional updates, batch 16, learning rate 0.0001 |
+| Training context | 4,096 tokens; `--max-tokens` accepts 16–4,096 |
 | Replay | At most 8,192 unique full-history positions |
 | Training weights | Equal total weight per self-play game represented in replay |
 | Arena | 8 distinct starts, 2 games/start with colors swapped, 80 turns/game |
