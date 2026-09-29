@@ -200,6 +200,68 @@ export function pseudoMoves(position) {
     .filter(move => !royal(pieceAt(position.board, move[1])));
 }
 
+// Keep the pinned library's direction order: tied search moves must retain
+// their order. Pawns, brawns and unmoved kings use its special-move handling.
+const SEARCH_MOVEMENT = Array.from({ length: 13 }, (_, type) => ({
+  steps: raw.pieceFuncs.movePos(type * 2), rays: raw.pieceFuncs.moveVecs(type * 2),
+}));
+
+function searchPseudoMoves(position) {
+  const { board } = position, color = position.action % 2;
+  const even = raw.boardFuncs.isEvenTimeline(board), moves = [];
+  for (let l = 0; l < board.length; l++) {
+    const timeline = board[l], t = timeline?.length - 1;
+    if (t % 2 !== color) continue;
+    const squares = timeline[t];
+    for (let r = 0; squares && r < squares.length; r++) {
+      for (let f = 0; squares[r] && f < squares[r].length; f++) {
+        const piece = squares[r][f], absolute = Math.abs(piece);
+        if (!absolute || absolute % 2 !== color) continue;
+        const from = [l, t, r, f], type = Math.ceil(absolute / 2);
+        if (type === 1 || type === 8 || piece === -11 || piece === -12) {
+          // Ordinary pawns need the adjacent timeline for every temporal
+          // move, including the first step of a double push. Brawns can also
+          // capture into their own past, so keep their full geometry.
+          const spatialOnly = type === 1 && !board[raw.pieceFuncs.timelineMove(l, color ? 1 : -1, even)];
+          for (const move of raw.pieceFuncs.moves(board, from, spatialOnly, position.promotions)) {
+            if (!royal(pieceAt(board, move[1]))) moves.push(move);
+          }
+          continue;
+        }
+        const { steps, rays } = SEARCH_MOVEMENT[type];
+        for (let index = 0; index < steps.length; index++) {
+          const vector = steps[index], dl = vector[0], dt = vector[1], dr = vector[2], df = vector[3];
+          const line = raw.pieceFuncs.timelineMove(l, dl, even), turn = t + dt * 2;
+          const rank = r + dr, file = f + df, row = board[line]?.[turn]?.[rank];
+          if (!row || file < 0 || file >= row.length) continue;
+          const target = row[file];
+          if ((target === 0 || Math.abs(target) % 2 !== color) && !royal(target)) {
+            moves.push([from, [line, turn, rank, file]]);
+          }
+        }
+        for (let index = 0; index < rays.length; index++) {
+          const vector = rays[index], dl = vector[0], dt = vector[1], dr = vector[2], df = vector[3];
+          let line = raw.pieceFuncs.timelineMove(l, dl, even), turn = t + dt * 2;
+          let rank = r + dr, file = f + df;
+          for (;;) {
+            const row = board[line]?.[turn]?.[rank];
+            if (!row || file < 0 || file >= row.length) break;
+            const target = row[file];
+            if (target !== 0) {
+              if (Math.abs(target) % 2 !== color && !royal(target)) moves.push([from, [line, turn, rank, file]]);
+              break;
+            }
+            moves.push([from, [line, turn, rank, file]]);
+            line = raw.pieceFuncs.timelineMove(line, dl, even);
+            turn += dt * 2; rank += dr; file += df;
+          }
+        }
+      }
+    }
+  }
+  return moves;
+}
+
 /** Reuse geometry while search histories and promotion lists stay immutable. */
 export function createSearchMoveGenerator() {
   const histories = new WeakMap();
@@ -208,7 +270,9 @@ export function createSearchMoveGenerator() {
     if (!entries) histories.set(position.board, entries = []);
     const color = position.action % 2, previous = entries[color];
     if (previous && previous.promotions === position.promotions) return previous.moves;
-    const moves = pseudoMoves(position);
+    // Probe geometry with scalar coordinates, allocating arrays only for
+    // actual destinations instead of every off-board direction and ray step.
+    const moves = searchPseudoMoves(position);
     entries[color] = { promotions: position.promotions, moves };
     return moves;
   };

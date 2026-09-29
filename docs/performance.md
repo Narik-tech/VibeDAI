@@ -430,6 +430,55 @@ node scripts/benchmark-classical.js --baseline artifacts/classical-allocation-ba
 node --test --test-concurrency=2
 ```
 
+### Avoiding allocations for impossible moves
+
+Classical search now walks the pinned library's nonpawn movement directions
+using numeric coordinates. It allocates move arrays only for reachable,
+unblocked destinations, preserving the library's direction and capture order.
+Pawns, brawns and unmoved kings retain the library's special-move handling.
+Ordinary pawns skip temporal geometry when their required adjacent timeline
+is absent; brawns still check captures into their own past.
+
+Five warmed, alternating comparisons on 2026-09-29 against `48d5875`, using
+Node 22.15.1 and fresh search caches, produced these median wall times:
+
+| Position | Depth / tactical horizon | Work nodes, both engines | Previous ms | Current ms |
+| --- | --- | ---: | ---: | ---: |
+| Standard | 4 / 2 | 17,676 | 204 | 204 |
+| Opening | 2 / 2 | 4,361 | 34 | 31 |
+| Two timelines | 2 / 1 | 23,579 | 291 | 265 |
+| Temporal | 2 / 1 | 9,393 | 121 | 103 |
+| Standard, longer search | 5 / 2 | 161,075 | 2,498 | 2,298 |
+
+The longer standard search took 8% less time. All fixed-depth runs completed
+with identical scores and work counts, legal principal variations, and
+unchanged input positions. Short-run timing is noisy; the shallow standard
+fixture showed essentially no change. These measurements do not establish
+a playing-strength rating.
+
+With a 2,400 ms budget, the optimized engine reached depth five in four of
+five runs, compared with two of five baseline runs. Both used tactical
+horizon two. The remaining runs completed depth four; time-limited depth
+depends on garbage collection and machine load.
+
+Differential tests compare complete ordered move arrays against the library
+for every piece type and both colors, including fairy pieces, negative
+unmoved flags, sparse and even timelines, blockers, royal exclusions,
+castling, en passant, promotions and seeded mixed multiverses.
+
+Reports in `artifacts/classical-speed-final-depth.json` and
+`artifacts/classical-speed-final-depth5.json` include per-run timings and
+source hashes; `artifacts/classical-speed-final-time.json` records the timed
+comparison. Reproduce with:
+
+```sh
+node scripts/snapshot-engine.js 48d5875318c1d56389c8feb3d51732ed5fd4900c artifacts/classical-speed-baseline-20260929
+node scripts/benchmark-classical.js --baseline artifacts/classical-speed-baseline-20260929/search.js --mode depth --depth-time-ms 15000 --repeat 5 --warmup 2 --json
+node scripts/benchmark-classical.js --baseline artifacts/classical-speed-baseline-20260929/search.js --case standard --mode depth --depth 5 --depth-time-ms 15000 --repeat 5 --warmup 2 --json
+node scripts/benchmark-classical.js --baseline artifacts/classical-speed-baseline-20260929/search.js --case standard --mode time --time-ms 2400 --repeat 5 --warmup 2 --json
+node --test --test-concurrency=2
+```
+
 ## Parallel CPU search
 
 Classical analysis supports a configurable root-search pool through the app's
