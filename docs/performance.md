@@ -65,6 +65,51 @@ false terminal certificates. The suite's defended-pawn case requires depth
 one with recapture analysis; the deeper depth-two experiment above is a
 separate diagnostic.
 
+## Checkmate detection
+
+Royal safety now tests piece-to-royal geometry directly instead of generating
+every opponent move. Each action traversal caches piece and royal locations
+on immutable snapshots. Unsafe partial turns are rejected before serializing
+their full history. If a spatial move is also unsafe when played alone from
+the turn's original position, the generator remembers that outcome and skips
+it in later combinations. This conservative form of constraint reuse was
+inspired by [cwmtt's checkmate solver](https://github.com/penteract/cwmtt/blob/master/Game/Chess/TimeTravel/FastCheckmate.lhs).
+
+Temporal arrivals and component-dependent attacks still receive full legality
+checks. Optional moves remain available, and an interrupted proof remains
+unknown. Both synchronous and asynchronous action generation share these
+optimizations, so Classical and Transformer terminal probes benefit.
+
+Run the dedicated benchmark, optionally against a saved earlier engine:
+
+```sh
+npm run benchmark:checkmate
+node scripts/snapshot-engine.js 5bf686f artifacts/checkmate-baseline-5bf686f
+node scripts/benchmark-checkmate.js --baseline artifacts/checkmate-baseline-5bf686f/rules.js --repeat 11
+```
+
+The benchmark validates legal witnesses with both implementations, checks
+input immutability, and includes actual mate, stalemate, multiple-board
+evasions, and an evasion that requires advancing an optional board first.
+`--json` includes individual timings; `--max-work` and `--time-ms` bound proofs.
+A run that reaches a cap reports `unknown` and exits with code 2.
+
+On Node 22.15.1, a local comparison on 2026-09-29 against `5bf686f` measured
+the following medians over 11 runs after warm-up, alternating implementations:
+
+| Position | Previous work ticks | Current work ticks | Previous ms | Current ms |
+| --- | ---: | ---: | ---: | ---: |
+| Temporal mate | 61 | 61 | 2.812 | 0.525 |
+| Deferred mate after Nd6 | 5,643 | 4,835 | 39.735 | 9.375 |
+| Optional spatial evasion | 31 | 27 | 0.329 | 0.101 |
+
+The deferred mate used 14% fewer work ticks and ran about 4.2 times faster.
+These are small local fixtures; timing varies with position, hardware, JIT
+warm-up, and load. Direct attack checks are compared with upstream move
+enumeration across all piece types, both colors, sparse histories, blockers,
+promotion sets, and mutable public positions. Exhaustive action comparisons
+also cover temporary checks and attacks that arise only from combinations.
+
 ## Parallel CPU search
 
 Classical analysis supports a configurable root-search pool through the app's

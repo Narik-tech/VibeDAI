@@ -41,6 +41,47 @@ test('safe pruning preserves every legal complete action on two and three active
   }
 });
 
+test('learning unsafe spatial outcomes saves work without losing multiboard evasions', () => {
+  const start = position([[checkedBoard()], [checkedBoard()], [checkedBoard()]]);
+  const before = positionKey(start);
+  const run = options => {
+    let ticks = 0;
+    const actions = [...generateActions(start, { ...options, tick() { ticks++; } })];
+    return { ticks, keys: actions.map(action => positionKey(action.position)).sort() };
+  };
+  const exhaustive = run({ pruneUnsafe: false, cacheMoves: false });
+  const unlearned = run({ cacheUnsafeMoves: false });
+  for (const cacheMoves of [true, false]) {
+    const learned = run({ cacheMoves });
+    assert.deepEqual(learned.keys, exhaustive.keys);
+    assert.deepEqual(learned.keys, unlearned.keys);
+    assert(learned.ticks < unlearned.ticks, `${learned.ticks} vs ${unlearned.ticks}`);
+  }
+  assert.equal(positionKey(start), before);
+});
+
+test('a spatial move unsafe with one companion remains available with a different companion', () => {
+  const empty = () => Array.from({ length: 5 }, () => Array(5).fill(0));
+  const left = empty(), right = empty();
+  left[0][0] = 12; left[0][2] = 8; left[2][2] = 7; left[4][4] = 11;
+  right[1][2] = 12; right[4][4] = 11;
+  // Advancing both boards lets the Black rook capture across timelines. The
+  // same king move is safe when its companion captures that rook instead.
+  const start = position([[left], null, [right]]);
+  const advance = parseMove(start, [[0, 0, 0, 0], [0, 0, 0, 1]]);
+  const king = parseMove(start, [[2, 0, 1, 2], [2, 0, 2, 2]]);
+  const capture = parseMove(start, [[0, 0, 0, 2], [0, 0, 2, 2]]);
+  assert.equal(canSubmit(applyMove(applyMove(start, advance), king)), false);
+  const saved = validateAction(start, [capture, king]);
+  const exhaustive = [...generateActions(start, { pruneUnsafe: false, cacheMoves: false })];
+  const learned = [...generateActions(start)];
+  const keys = actions => actions.map(action => positionKey(action.position)).sort();
+  assert(exhaustive.length > 0);
+  assert.deepEqual(keys(learned), keys(exhaustive));
+  assert(learned.some(action => positionKey(action.position) === positionKey(saved)));
+  for (const action of learned) validateAction(start, action.moves);
+});
+
 test('an active branch may be created before a different board resolves a phantom check', () => {
   const safe = clearBoard(); safe[1][2] = 4;
   const start = position([Array.from({ length: 5 }, () => structuredClone(safe)), [checkedBoard()]]);

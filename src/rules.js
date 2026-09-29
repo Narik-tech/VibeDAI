@@ -1,8 +1,11 @@
 import Chess from '5d-chess-js';
+import { createRoyalSafety } from './royal-safety.js';
 
 // Use the upstream geometry, history representation and notation. Its eager
 // action generator and timeout-as-mate API are deliberately not used here.
 export const raw = new Chess().raw;
+const royalSafety = createRoyalSafety(raw);
+const { attackedByNextPlayer } = royalSafety;
 const royal = piece => [11, 12, 19, 20].includes(Math.abs(piece));
 const pieceAt = (board, square) => board[square[0]]?.[square[1]]?.[square[2]]?.[square[3]];
 const equalMove = (a, b) => raw.validateFuncs.compareMove(a, b) === 0;
@@ -210,30 +213,6 @@ export function applyMove(position, move) {
   return { ...position, board };
 }
 
-function attackedByNextPlayer(position) {
-  const { board } = position, nextPlayer = (position.action + 1) % 2;
-  // Match upstream's unrestricted frontier source selection, including
-  // inactive timelines. Stop at the first royal capture instead of building
-  // the entire opponent move list; piece geometry stays upstream's authority.
-  for (let l = 0; l < board.length; l++) {
-    const timeline = board[l];
-    if (!timeline || (timeline.length - 1) % 2 !== nextPlayer) continue;
-    const t = timeline.length - 1, squares = timeline[t];
-    for (let r = 0; squares && r < squares.length; r++) {
-      for (let f = 0; squares[r] && f < squares[r].length; f++) {
-        const piece = Math.abs(squares[r][f]);
-        if (!piece || piece % 2 !== nextPlayer) continue;
-        const moves = raw.pieceFuncs.moves(board, [l, t, r, f], false, position.promotions);
-        for (const move of moves) {
-          const target = pieceAt(board, move[1]);
-          if (royal(target) && Math.abs(target) % 2 === position.action % 2) return true;
-        }
-      }
-    }
-  }
-  return false;
-}
-
 export function canSubmit(position) {
   return raw.boardFuncs.present(position.board, position.action).length === 0 && !attackedByNextPlayer(position);
 }
@@ -432,9 +411,35 @@ export async function* generateActionsAsync(position, options = {}) {
 
 // Both drivers share every legality, deduplication and pruning decision. The
 // traversal pauses only to request move ordering or expose a legal submission.
-function* generateActionSteps(position, { tick = () => {}, preferredAction = null, pruneUnsafe = true, tacticalOnly = false, cacheMoves = true, keyPosition = positionKey, skipOptionalSpatial = false, onSkipOptionalSpatial } = {}) {
+function* generateActionSteps(position, { tick = () => {}, preferredAction = null, pruneUnsafe = true, tacticalOnly = false, cacheMoves = true, cacheUnsafeMoves = true, keyPosition = positionKey, skipOptionalSpatial = false, onSkipOptionalSpatial } = {}) {
+  const { attackedByNextPlayer } = royalSafety.createCached();
   const visited = new Set();
   const path = [];
+  const unsafeSpatialMoves = new Set(), testedSpatialMoves = new Set(), moveKeys = new WeakMap();
+  const spatial = move => move[0][0] === move[1][0] && move[0][1] === move[1][1];
+  const moveKey = move => {
+    if (!moveKeys.has(move)) moveKeys.set(move, JSON.stringify(move));
+    return moveKeys.get(move);
+  };
+  const knownUnsafe = move => unsafeSpatialMoves.size > 0 && spatial(move) && unsafeSpatialMoves.has(moveKey(move));
+  function learnUnsafeMove() {
+    const move = path.at(-1);
+    if (!cacheUnsafeMoves || !move || !spatial(move)) return;
+    const key = moveKey(move);
+    if (testedSpatialMoves.has(key)) return;
+    testedSpatialMoves.add(key);
+    // Test the move against the original history, with all other components
+    // removed. If it already exposes a royal there, every combination that
+    // includes this spatial board outcome is unsafe. Later components only
+    // append opponent-color boards and cannot erase the existing attack.
+    // Temporal arrivals can merge or branch depending on earlier components,
+    // so their outcomes must never be rejected using this spatial-move cache.
+    if (path.length === 1) unsafeSpatialMoves.add(key);
+    else {
+      tick();
+      if (attackedByNextPlayer(applyMove(position, move))) unsafeSpatialMoves.add(key);
+    }
+  }
   let initialMoves, preferredKey;
   const availableMoves = (current, restrict = skipOptionalSpatial) => {
     const moves = cacheMoves
@@ -463,24 +468,25 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
       current = applyMove(current, move);
       tick();
     }
-    if (legal && (!tacticalOnly || tactical) && canSubmit(current)) {
+    if (legal && (!tacticalOnly || tactical) && raw.boardFuncs.present(current.board, current.action).length === 0 && !attackedByNextPlayer(current)) {
       preferredKey = keyPosition(current);
       yield { candidate: { moves, position: { ...current, action: current.action + 1 } } };
     }
   }
   function* visit(current, hasTacticalMove = false) {
     tick();
+    // Moves in this action originate and land on mover-color boards. An attack
+    // from an opponent-color latest board onto an opponent-color royal square
+    // therefore survives every remaining move: its source, target and entire
+    // ray are immutable. This is not the forced-pass check, which other
+    // component moves can still resolve.
+    // Check before serializing history: dead partial turns need no state key.
+    const unsafe = attackedByNextPlayer(current);
+    if (pruneUnsafe && unsafe) { learnUnsafeMove(); return; }
     const stateKey = keyPosition(current);
     const key = (tacticalOnly && hasTacticalMove ? 't:' : '') + stateKey;
     if (visited.has(key)) return;
     visited.add(key);
-    // Moves in this action originate and land on mover-color boards. An attack
-    // from an opponent-color latest board onto an opponent-color royal square
-    // therefore survives every remaining move: its source, target and entire
-    // ray are immutable. Reject that dead subtree immediately. This is NOT the
-    // phantom forced-pass check, which other component moves can still resolve.
-    const unsafe = attackedByNextPlayer(current);
-    if (pruneUnsafe && unsafe) return;
     if (stateKey !== preferredKey && (!tacticalOnly || hasTacticalMove) && !unsafe && raw.boardFuncs.present(current.board, current.action).length === 0) {
       yield { candidate: { moves: path.slice(), position: { ...current, action: current.action + 1 } } };
     }
@@ -505,6 +511,7 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
     while (ordered) {
       const batch = Object.hasOwn(ordered, 'more') ? ordered.moves : ordered;
       for (const move of batch) {
+        if (pruneUnsafe && knownUnsafe(move)) continue;
         tick();
         path.push(move);
         yield* visit(applyMove(current, move), tacticalOnly && (hasTacticalMove || isTacticalMove(current, move)));

@@ -85,6 +85,7 @@ For parallel Classical search, import `analyze` from `src/parallel-search.js` an
 ```sh
 npm test
 npm run benchmark
+npm run benchmark:checkmate
 npm run benchmark:parallel
 npm run strength -- --nodes 50000 --repeat 2 --strict
 npm run match -- --engine-a src/search.js --engine-b path/to/baseline/search.js --nodes 10000 --plies 40 --output artifacts/match.json
