@@ -59,22 +59,25 @@ def _rows(path, include_policy=False):
                 raise ValueError(f"{path}:{line_number}: {error}") from error
 
 
-def records(path, max_tokens, include_weight=False, include_policy=False, policy_rng=None):
+def records(path, max_tokens, include_weight=False, include_policy=False, policy_rng=None, encoder=None):
+    """Stream validated rows through an optional position -> encoding callback."""
     try:
         from .encoding import encode_position
         from .policy import encode_policy_records
     except ImportError:
         from encoding import encode_position
         from policy import encode_policy_records
+    if encoder is None:
+        encoder = lambda position: encode_position(position, max_tokens)
     for position, target, weight, line_number, policy in _rows(path, include_policy=True):
         try:
-            encoded = encode_position(position, max_tokens)
+            encoded = encoder(position)
             labels = encode_policy_records(position, policy) if include_policy else []
             # Uniform prefix sampling bounds the shuffle buffer to at most one
             # additional encoded position per value row, regardless of turn size.
             if labels and policy_rng is not None:
                 labels = [policy_rng.choice(labels)]
-            examples = [(encode_position(prefix, max_tokens), features, index) for prefix, features, index in labels]
+            examples = [(encoder(prefix), features, index) for prefix, features, index in labels]
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"{path}:{line_number}: {error}") from error
         # Evaluators retain their existing unweighted pair interface.
@@ -104,13 +107,13 @@ def weighted_mse(prediction, targets, weights):
     return ((prediction.float() - targets).square() * weights).mean()
 
 
-def stream_training(path, max_tokens, buffer_size, rng, include_weight=False, include_policy=False):
+def stream_training(path, max_tokens, buffer_size, rng, include_weight=False, include_policy=False, encoder=None):
     # Only encoded, bounded-token records enter the shuffle buffer. No complete
     # dataset or collection of full multiverse histories is retained in RAM.
     while True:
         buffer, count = [], 0
         for record in records(path, max_tokens, include_weight=include_weight, include_policy=include_policy,
-                              policy_rng=rng if include_policy else None):
+                              policy_rng=rng if include_policy else None, encoder=encoder):
             count += 1
             if len(buffer) < buffer_size:
                 buffer.append(record)
@@ -171,9 +174,12 @@ def save_checkpoint(path, model, optimizer, steps, examples, args, loss, validat
 def validation_loss(model, path, device, batch_size, max_batches):
     try:
         from .evaluate import evaluate_records
+        from .model import encode_for_model
     except ImportError:
         from evaluate import evaluate_records
-    metrics = evaluate_records(model, records(path, model.config.max_tokens), device, batch_size, max_batches)
+        from model import encode_for_model
+    rows = records(path, model.config.max_tokens, encoder=lambda position: encode_for_model(model, position))
+    metrics = evaluate_records(model, rows, device, batch_size, max_batches)
     metrics["mse"] = metrics.pop("normalizedMse")
     return {**metrics, "data": str(Path(path).resolve())}
 
@@ -210,6 +216,16 @@ def main():
     args = parser.parse_args()
     try:
         import torch
+        if args.resume:
+            resumed = torch.load(args.resume, map_location="cpu", weights_only=True)
+            if isinstance(resumed, dict) and resumed.get("architecture") == "5d-lc0-transfer-v1":
+                del resumed
+                try:
+                    from .lc0_train import train
+                except ImportError:
+                    from lc0_train import train
+                return train(args)
+            del resumed
         try:
             from .model import ModelConfig, TransformerValue, choose_device, collate, load_checkpoint
             from .policy import policy_loss

@@ -5,12 +5,17 @@ import { Worker } from 'node:worker_threads';
 import { randomUUID } from 'node:crypto';
 import { GameSession } from './session.js';
 import { TransformerRuntime, listEngines, forwardInference } from './transformer-runtime.js';
+import { LeelaRuntime } from './leela-runtime.js';
+import { isNeuralEngine } from './leela-config.js';
 import { TrainingManager } from './training-manager.js';
+import { HEURISTIC_SETTINGS, DEFAULT_HEURISTICS, normalizeHeuristics } from './heuristics.js';
+import { inspectEvaluation } from './evaluate.js';
 
 const PUBLIC = new URL('../public/', import.meta.url);
 const staticFiles = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
+  ['/heuristics.js', ['heuristics.js', 'text/javascript; charset=utf-8']],
   ['/styles.css', ['styles.css', 'text/css; charset=utf-8']],
   ['/training', ['training.html', 'text/html; charset=utf-8']],
   ['/training.html', ['training.html', 'text/html; charset=utf-8']],
@@ -43,7 +48,8 @@ async function readBody(req) {
   return value;
 }
 
-export function createApp({ transformerRuntime = new TransformerRuntime(), trainingManager = new TrainingManager() } = {}) {
+export function createApp({ transformerRuntime = new TransformerRuntime(), leelaRuntime = new LeelaRuntime(),
+  trainingManager = new TrainingManager() } = {}) {
   const game = new GameSession();
   const jobs = new Map();
   let shuttingDown = false;
@@ -81,7 +87,10 @@ export function createApp({ transformerRuntime = new TransformerRuntime(), train
         return res.end(content);
       }
       if (req.method === 'GET' && url.pathname === '/api/game') return send(res, 200, game.snapshot());
-      if (req.method === 'GET' && url.pathname === '/api/engines') return send(res, 200, listEngines(transformerRuntime));
+      if (req.method === 'GET' && url.pathname === '/api/heuristics') {
+        return send(res, 200, { settings: HEURISTIC_SETTINGS, defaults: DEFAULT_HEURISTICS });
+      }
+      if (req.method === 'GET' && url.pathname === '/api/engines') return send(res, 200, listEngines(transformerRuntime, leelaRuntime));
       if (req.method === 'GET' && url.pathname === '/api/training') return send(res, 200, await trainingManager.snapshot());
       const trainingGame = /^\/api\/training\/iterations\/([^/]+)\/games\/([^/]+)$/.exec(url.pathname);
       if (req.method === 'GET' && trainingGame) {
@@ -103,6 +112,14 @@ export function createApp({ transformerRuntime = new TransformerRuntime(), train
       if (req.method !== 'POST') return send(res, 404, { error: 'Not found.' });
       const body = await readBody(req);
       switch (url.pathname) {
+        case '/api/evaluate': {
+          game.assertRevision(body.revision);
+          const heuristics = normalizeHeuristics(body.heuristics);
+          return send(res, 200, {
+            revision: game.revision, heuristics,
+            evaluation: inspectEvaluation(game.position, heuristics),
+          });
+        }
         case '/api/training/fresh/start':
           if (Object.keys(body).some(key => key !== 'options')) throw new Error('Only training options may be supplied.');
           return send(res, 202, await trainingManager.startFresh(body.options));
@@ -140,22 +157,26 @@ export function createApp({ transformerRuntime = new TransformerRuntime(), train
           break;
         case '/api/analyze': {
           const engine = body.engine ?? 'classical';
-          if (!['classical', 'transformer'].includes(engine)) throw new Error('Unknown engine. Choose classical or transformer.');
+          if (!['classical', 'transformer', 'leela'].includes(engine)) throw new Error('Unknown engine. Choose classical, transformer, or leela.');
+          const neural = isNeuralEngine(engine);
+          const heuristics = neural ? undefined : normalizeHeuristics(body.heuristics);
+          const runtime = engine === 'leela' ? leelaRuntime : transformerRuntime;
           const timeMs = numericOption(body.timeMs, 3000, 0, 120000, 'Think time');
           if (timeMs > 0 && timeMs < 50) throw new Error('Think time must be 0 (infinite) or an integer between 50 and 120000.');
           const options = {
             engine,
             timeMs,
             unlimitedTime: timeMs === 0,
-            maxDepth: numericOption(body.maxDepth, 8, engine === 'transformer' ? 0 : 1, engine === 'transformer' ? 64 : 16, 'Depth'),
+            maxDepth: numericOption(body.maxDepth, 8, neural ? 0 : 1, neural ? 64 : 16, 'Depth'),
             maxNodes: numericOption(body.maxNodes, 2000000, 1, 1000000000, 'Node budget'),
             threads: numericOption(body.threads, 1, 1, 16, 'Search threads'),
             cacheMemoryMb: numericOption(body.cacheMemoryMb, 128, 0, 4096, 'Cache memory'),
             maxTableEntries: 1000000,
-            quiescenceDepth: numericOption(body.quiescenceDepth, 2, 0, 6, 'Quiescence depth'),
+            quiescenceDepth: numericOption(body.quiescenceDepth, heuristics?.quiescenceDepth ?? 2, 0, 8, 'Quiescence depth'),
+            ...(heuristics ? { heuristics } : {}),
           };
           const revision = game.revision;
-          const modelInfo = engine === 'transformer' ? await transformerRuntime.start() : null;
+          const modelInfo = neural ? await runtime.start() : null;
           if (shuttingDown) throw new Error('The local server is shutting down.');
           if (res.destroyed) return;
           game.assertRevision(revision);
@@ -187,7 +208,7 @@ export function createApp({ transformerRuntime = new TransformerRuntime(), train
           hardDeadline?.unref();
           worker.on('message', message => {
             if (job.status !== 'running') return;
-            if (message.type === 'evaluate' || message.type === 'policy') { void forwardInference(worker, transformerRuntime, message); return; }
+            if (message.type === 'evaluate' || message.type === 'policy') { void forwardInference(worker, runtime, message); return; }
             if (message.type === 'progress') job.progress = message.result;
             if (message.type === 'result') { job.result = message.result; job.status = 'done'; clearTimeout(hardDeadline); }
             if (message.type === 'error') { job.error = message.error; job.status = 'error'; clearTimeout(hardDeadline); }
@@ -226,6 +247,7 @@ export function createApp({ transformerRuntime = new TransformerRuntime(), train
       void job.worker.terminate();
     }
     transformerRuntime.close();
+    leelaRuntime.close();
     void trainingManager.close();
   };
   // `close` waits for active HTTP requests. Reject pending model startup first,

@@ -14,8 +14,10 @@ export async function snapshotEngine(ref, output) {
   // Resolve all inputs before writing; an invalid revision cannot leave a
   // half-populated comparison engine. Refuse to overwrite existing snapshots.
   const files = ['search.js', 'evaluate.js', 'rules.js', 'search-cache.js'];
-  // Older revisions keep royal safety inside rules.js; newer ones import it.
-  if (git(['ls-tree', '--name-only', revision, 'src/royal-safety.js']).toString().trim()) files.push('royal-safety.js');
+  // Keep revision-specific helper modules alongside their importing engine.
+  for (const name of ['royal-safety.js', 'heuristics.js']) {
+    if (git(['ls-tree', '--name-only', revision, `src/${name}`]).toString().trim()) files.push(name);
+  }
   const sources = files.map(name => git(['show', `${revision}:src/${name}`]));
   await mkdir(dirname(target), { recursive: true });
   await mkdir(target);

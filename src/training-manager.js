@@ -7,6 +7,7 @@ import { getFreshTrainingDefaults, validateFreshTrainingOptions } from '../scrip
 import { acquireRunLock, inspectRunLock, recoverRunLock, atomicWrite } from '../scripts/transformer-selfplay-store.js';
 import { findInterruptedIterations, recoverInterruptedIterations } from '../scripts/transformer-selfplay-recovery.js';
 import { DEFAULT_CHECKPOINT, DEFAULT_PYTHON } from './transformer-runtime.js';
+import { LEELA_ID, LEELA_NAME, resolveLeelaConfig } from './leela-config.js';
 import { raw, positionKey, validateAction } from './rules.js';
 
 const optionFlags = Object.freeze({ iterations: 'iterations', games: 'games', gameConcurrency: 'game-concurrency', maxPlies: 'plies', maxNodes: 'nodes',
@@ -29,14 +30,14 @@ const missing = error => error.code === 'ENOENT';
 const failure = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
 const clone = value => structuredClone(value);
 
-export function validateTrainingOptions(input = {}) {
+export function validateTrainingOptions(input = {}, initialOptions = safeDefaults) {
   if (!input || typeof input !== 'object' || Array.isArray(input) || ![Object.prototype, null].includes(Object.getPrototypeOf(input))) {
     throw failure('Training options must be a JSON object.');
   }
   const args = [];
   for (const [key, value] of Object.entries(input)) {
     if (key === 'model') {
-      if (!['current', '20m'].includes(value)) throw failure('model must be current or 20m.');
+      if (!['current', '20m', LEELA_ID].includes(value)) throw failure('model must be current, 20m or leela.');
       continue;
     }
     if (!Object.hasOwn(optionFlags, key)) throw failure(`Unknown training option: ${key}.`);
@@ -45,7 +46,7 @@ export function validateTrainingOptions(input = {}) {
     }
     args.push(`--${optionFlags[key]}`, String(value));
   }
-  const parsed = parseArguments(args, safeDefaults);
+  const parsed = parseArguments(args, { ...initialOptions, ...(input.model === LEELA_ID ? { batchSize: 4 } : {}) });
   return { ...Object.fromEntries(Object.keys(optionFlags).map(key => [key, parsed[key]])), model: input.model ?? 'current' };
 }
 
@@ -98,11 +99,17 @@ function assertPosition(position) {
 /** Owns UI-launched work; recovers abandoned runs only after verifying their owner exited. */
 export class TrainingManager {
   constructor({ runDir = runnerDefaults.runDir, checkpoint = runnerDefaults.checkpoint, python = runnerDefaults.python,
-    workerFactory = data => new Worker(new URL('./training-worker.js', import.meta.url), { workerData: data }), availability } = {}) {
+    workerFactory = data => new Worker(new URL('./training-worker.js', import.meta.url), { workerData: data }), availability, leelaConfig } = {}) {
     this.options = { ...runnerDefaults, runDir: path.resolve(runDir), checkpoint: path.resolve(checkpoint), python: path.resolve(python) };
     try { this.options = parseArguments([], this.options); }
     catch (error) {
       this.configurationError = `Invalid training configuration: ${error.message} Check TRANSFORMER_DEVICE, TRANSFORMER_CHECKPOINT and TRANSFORMER_PYTHON before starting.`;
+    }
+    this.leelaOptions = { ...safeDefaults, ...resolveLeelaConfig(), ...leelaConfig, batchSize: 4,
+      model: LEELA_ID, sharedRunDir: this.options.runDir };
+    try { this.leelaOptions = parseArguments([], this.leelaOptions); }
+    catch (error) {
+      this.leelaConfigurationError = `Invalid Leela training configuration: ${error.message} Check LEELA_CHECKPOINT, LEELA_PYTHON and LEELA_DEVICE before starting.`;
     }
     this.workerFactory = workerFactory;
     this.freshRoot = path.join(this.options.runDir, 'fresh20m');
@@ -144,6 +151,12 @@ export class TrainingManager {
       // Namespaces share a global UI lock. Serialize recovery so two snapshot
       // requests cannot race each other while recovering different models.
       await previous?.catch(() => {});
+      // A selected model shares the UI run lock. Do not recover that lock
+      // while the original checkpoint still has a live owner elsewhere.
+      if (options.sharedRunDir && options.runDir !== this.options.runDir) {
+        const sharedLocks = await this.locks();
+        if (sharedLocks.some(lock => lock.live || !lock.recoverable)) return this.lockFailure(sharedLocks);
+      }
       const locks = await this.locks(options);
       if (locks.some(lock => lock.live || !lock.recoverable)) return this.lockFailure(locks);
       if (!locks.length && !(await findInterruptedIterations(options)).length) return null;
@@ -155,7 +168,7 @@ export class TrainingManager {
         const latest = recovered.at(-1);
         if (latest && this.state.state === 'idle') {
           const state = latest.status === 'complete' ? 'completed' : latest.status;
-          Object.assign(this.state, { state, phase: state, iteration: latest.iteration,
+          Object.assign(this.state, { state, phase: state, iteration: latest.iteration, model: options.model ?? 'current',
             startedAt: latest.startedAt, finishedAt: latest.finishedAt, error: latest.error ?? null });
         }
         return null;
@@ -172,26 +185,36 @@ export class TrainingManager {
     }
   }
 
-  async availability({ ignoreOwned = false, mode = 'selfplay', checkpoint = this.options.checkpoint,
-    runDir = this.options.runDir, sharedRunDir } = {}) {
+  async availability({ ignoreOwned = false, mode = 'selfplay', model = 'current', checkpoint = this.options.checkpoint,
+    runDir = this.options.runDir, sharedRunDir, python = this.options.python, suite = this.options.suite,
+    arenaSuite = this.options.arenaSuite, seedData = this.options.seedData, device = this.options.device } = {}) {
     if (this.settling) await this.finished;
     if (this.closed) return { available: false, reason: 'The local server is shutting down.' };
     if (!ignoreOwned && (this.worker || this.starting)) return { available: false, reason: 'A training run is already active.' };
-    if (this.configurationError) return { available: false, reason: this.configurationError };
-    const lock = await this.reconcile();
+    const configurationError = model === LEELA_ID ? this.leelaConfigurationError : this.configurationError;
+    if (configurationError) return { available: false, reason: configurationError };
+    const selectedOptions = { ...this.options, model, runDir, checkpoint, sharedRunDir, python, suite, arenaSuite, seedData, device };
+    const lock = await this.reconcile(model === LEELA_ID ? selectedOptions : this.options);
     if (lock) return lock;
-    if (mode !== 'fresh20m' && runDir !== this.options.runDir) {
-      const selectedLock = await this.reconcile({ ...this.options, runDir, checkpoint, sharedRunDir });
+    if (model !== LEELA_ID && mode !== 'fresh20m' && runDir !== this.options.runDir) {
+      const selectedLock = await this.reconcile(selectedOptions);
       if (selectedLock) return selectedLock;
     }
-    if (this.checkAvailability) return this.checkAvailability({ mode, checkpoint });
+    if (this.checkAvailability) return this.checkAvailability({ mode, ...selectedOptions });
     for (const [name, file, reason] of [
-      ...(mode === 'fresh20m' ? [] : [['checkpoint', checkpoint, 'No trained checkpoint. Choose Fresh 20M to train a new model.']]),
-      ['Python', this.options.python, 'Python environment missing. Run npm run transformer:setup.'],
-      ['training suite', this.options.suite, 'The self-play starting-position suite is missing.'],
-      ...(mode === 'fresh20m' ? [] : [['arena suite', this.options.arenaSuite, 'The evaluation starting-position suite is missing.']]),
+      ...(mode === 'fresh20m' ? [] : [['checkpoint', checkpoint, model === LEELA_ID
+        ? 'Leela checkpoint missing. Train the imported LCZero model first, or set LEELA_CHECKPOINT to its trained checkpoint.'
+        : 'No trained checkpoint. Choose Fresh 20M to train a new model.']]),
+      ['Python', python, 'Python environment missing. Run npm run transformer:setup.'],
+      ['training suite', suite, 'The self-play starting-position suite is missing.'],
+      ...(mode === 'fresh20m' ? [] : [['arena suite', arenaSuite, 'The evaluation starting-position suite is missing.']]),
+      ...(model === LEELA_ID ? [['Leela curriculum', seedData, 'The Leela curriculum is missing. Run npm run lc0:data before self-play training.']] : []),
     ]) {
-      try { if (!(await stat(file)).isFile()) return { available: false, reason: `The ${name} must be a regular file.` }; }
+      try {
+        const info = await stat(file);
+        if (!info.isFile()) return { available: false, reason: `The ${name} must be a regular file.` };
+        if (model === LEELA_ID && name === 'checkpoint' && !info.size) return { available: false, reason: 'The Leela checkpoint is empty. Restore a trained LCZero transfer checkpoint.' };
+      }
       catch (error) { if (missing(error)) return { available: false, reason }; throw error; }
     }
     return { available: true };
@@ -208,18 +231,23 @@ export class TrainingManager {
     const training20mAvailability = model20m.available
       ? await this.availability({ checkpoint: model20m.checkpoint, runDir: path.join(path.dirname(model20m.checkpoint), 'selfplay'), sharedRunDir: this.options.runDir })
       : { available: false, reason: 'Complete a Fresh 20M run first.' };
+    const leelaModel = await this.leelaModel();
+    const leelaAvailability = await this.availability(this.leelaOptions);
+    const leelaDefaults = { ...Object.fromEntries(Object.keys(optionFlags).map(key => [key, this.leelaOptions[key]])), model: LEELA_ID };
     let status = this.status();
-    if (!this.worker && !this.starting && availability.external) {
-      const latest = iterations[0];
+    const external = availability.external ? availability : leelaAvailability.external ? leelaAvailability : null;
+    if (!this.worker && !this.starting && external) {
+      const externalModel = availability.external ? 'current' : LEELA_ID;
+      const latest = iterations.find(iteration => iteration.model === externalModel);
       status = { ...status, state: 'external', phase: 'external', iteration: latest?.iteration ?? null,
-        startedAt: availability.startedAt ?? null, error: availability.reason };
+        model: externalModel, startedAt: external.startedAt ?? null, error: external.reason };
     }
     return { defaults: { ...TRAINING_DEFAULTS }, freshDefaults: getFreshTrainingDefaults(), status, availability,
-      freshAvailability, training20mAvailability, freshRuns, model20m, iterations };
+      freshAvailability, training20mAvailability, freshRuns, model20m, leelaModel, leelaAvailability, leelaDefaults, iterations };
   }
 
   async start(input = {}) {
-    return this.startRun('selfplay', validateTrainingOptions(input));
+    return this.startRun('selfplay', validateTrainingOptions(input, input?.model === LEELA_ID ? this.leelaOptions : safeDefaults));
   }
 
   async startFresh(input = {}) {
@@ -246,9 +274,10 @@ export class TrainingManager {
         options.runDir = path.join(path.dirname(selected.checkpoint), 'selfplay');
         options.runId = selected.runId;
         options.sharedRunDir = this.options.runDir;
+      } else if (editable.model === LEELA_ID) {
+        options = { ...this.leelaOptions, ...editable };
       }
-      const available = await this.availability({ ignoreOwned: true, mode, checkpoint: options.checkpoint,
-        runDir: options.runDir, sharedRunDir: options.sharedRunDir });
+      const available = await this.availability({ ...options, ignoreOwned: true, mode });
       if (this.closed) throw failure('The local server is shutting down.', 503);
       if (this.pendingStop) {
         Object.assign(this.state, { state: 'interrupted', phase: 'interrupted', finishedAt: new Date().toISOString() });
@@ -323,6 +352,13 @@ export class TrainingManager {
 
   async close() { this.closed = true; this.stop(); await this.finished; }
 
+  async leelaModel() {
+    let available = false;
+    try { const info = await stat(this.leelaOptions.checkpoint); available = info.isFile() && info.size > 0; }
+    catch (error) { if (!missing(error)) throw error; }
+    return { id: LEELA_ID, name: LEELA_NAME, available, checkpoint: this.leelaOptions.checkpoint };
+  }
+
   model20m(runs) {
     const latest = runs.find(run => run.status === 'complete' && run.checkpointAvailable && run.parameters === 20000257 && run.trainedSteps > 0);
     return latest ? { available: true, checkpoint: latest.checkpoint, parameters: latest.parameters, trainedSteps: latest.trainedSteps, runId: latest.id }
@@ -364,9 +400,9 @@ export class TrainingManager {
   async folder(id) {
     if (typeof id !== 'string') throw failure('Invalid training iteration ID.');
     const parts = id.split('__');
-    const qualified = parts.length === 2 && FRESH_ID.test(parts[0]) && ITERATION_ID.test(parts[1]);
+    const qualified = parts.length === 2 && (parts[0] === LEELA_ID || FRESH_ID.test(parts[0])) && ITERATION_ID.test(parts[1]);
     if (!qualified && !(parts.length === 1 && ITERATION_ID.test(id))) throw failure('Invalid training iteration ID.');
-    const root = qualified ? await this.selfplayRoot(parts[0])
+    const root = qualified ? parts[0] === LEELA_ID ? await this.leelaRoot() : await this.selfplayRoot(parts[0])
       : await realpath(this.options.runDir).catch(error => { if (missing(error)) throw failure('Training iteration not found.', 404); throw error; });
     const target = path.join(root, qualified ? parts[1] : id);
     let info;
@@ -391,8 +427,17 @@ export class TrainingManager {
     return parent;
   }
 
+  async leelaRoot() {
+    let info, root;
+    try { info = await lstat(this.leelaOptions.runDir); root = await realpath(this.leelaOptions.runDir); }
+    catch (error) { if (missing(error)) throw failure('Training iteration not found.', 404); throw error; }
+    if (!info.isDirectory() || info.isSymbolicLink()) throw failure('Unsafe training namespace path.');
+    return root;
+  }
+
   async selfplayNamespaces() {
-    const namespaces = [{ prefix: '', model: 'current', options: this.options }];
+    const namespaces = [{ prefix: '', model: 'current', options: this.options },
+      { prefix: `${LEELA_ID}__`, model: LEELA_ID, options: this.leelaOptions }];
     let entries;
     try { entries = await readdir(this.freshRoot, { withFileTypes: true }); }
     catch (error) { if (missing(error)) return namespaces; throw error; }
@@ -401,7 +446,7 @@ export class TrainingManager {
       try { runDir = await this.selfplayRoot(entry.name); }
       catch (error) { if (error.statusCode === 404 || error.statusCode === 400 || missing(error)) continue; throw error; }
       namespaces.push({ prefix: `${entry.name}__`, model: '20m', options: { ...this.options,
-        runId: entry.name, runDir, checkpoint: path.join(path.dirname(runDir), 'model.pt'), sharedRunDir: this.options.runDir } });
+        model: '20m', runId: entry.name, runDir, checkpoint: path.join(path.dirname(runDir), 'model.pt'), sharedRunDir: this.options.runDir } });
     }
     return namespaces;
   }

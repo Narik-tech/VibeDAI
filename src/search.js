@@ -1,5 +1,6 @@
 import { createPositionKeyCache, generateActions, inCheck } from './rules.js';
 import { evaluate, pieceValue } from './evaluate.js';
+import { normalizeHeuristics } from './heuristics.js';
 import { SearchCache } from './search-cache.js';
 
 export const MATE_SCORE = 100_000;
@@ -16,15 +17,16 @@ function finiteOption(value, fallback, min, max) {
   return Number.isFinite(Number(value)) ? Math.max(min, Math.min(max, Number(value))) : fallback;
 }
 
-function moveFeatures(position, move) {
+function moveFeatures(position, move, heuristics) {
   const [from, to] = move;
   const mover = position.board[from[0]]?.[from[1]]?.[from[2]]?.[from[3]] || 0;
   const captured = position.board[to[0]]?.[to[1]]?.[to[2]]?.[to[3]] || 0;
-  const promotion = to.length > 4 ? pieceValue(to[4]) - pieceValue(mover) : 0;
+  const promotion = to.length > 4 ? pieceValue(to[4], heuristics) - pieceValue(mover, heuristics) : 0;
   // The third coordinate is the captured pawn in an en passant move; castling
   // contains a fourth coordinate and is not a capture.
-  const captureValue = pieceValue(captured) || (move.length === 3 ? 100 : 0);
-  return { mover, captureValue, promotion, temporal: from[0] !== to[0] || from[1] !== to[1] };
+  const captureValue = pieceValue(captured, heuristics) || (move.length === 3 ? heuristics.pawnValue : 0);
+  return { mover, captureValue, promotion, isCapture: !!captured || move.length === 3, isPromotion: to.length > 4,
+    temporal: from[0] !== to[0] || from[1] !== to[1] };
 }
 
 function historyKey(position, move) {
@@ -46,10 +48,14 @@ function historyKey(position, move) {
  */
 export function createSearchSession(position, options = {}) {
   const started = performance.now();
+  const configuredHeuristics = normalizeHeuristics(options.heuristics);
+  const qDepth = options.quiescenceDepth === undefined ? configuredHeuristics.quiescenceDepth
+    : Math.floor(finiteOption(options.quiescenceDepth, 2, 0, 8));
+  const heuristics = qDepth === configuredHeuristics.quiescenceDepth ? configuredHeuristics
+    : normalizeHeuristics({ ...configuredHeuristics, quiescenceDepth: qDepth });
   const timeMs = finiteOption(options.timeMs, 3000, 0, 3_600_000);
   const maxDepth = Math.floor(finiteOption(options.maxDepth, 8, 1, 64));
   const maxNodes = Math.floor(finiteOption(options.maxNodes, 2_000_000, 0, 1_000_000_000));
-  const qDepth = Math.floor(finiteOption(options.quiescenceDepth, 2, 0, 8));
   const maxTableEntries = Math.floor(finiteOption(options.maxTableEntries, 100_000, 0, 1_000_000));
   const cacheMemoryMb = finiteOption(options.cacheMemoryMb, 128, 0, 4096);
   const deadline = options.unlimitedTime === true ? Infinity : started + timeMs;
@@ -81,7 +87,7 @@ export function createSearchSession(position, options = {}) {
     }
   }
   function staticScore(pos) {
-    if (!evalCache.has(pos)) evalCache.set(pos, Math.max(-MATE_THRESHOLD + 1, Math.min(MATE_THRESHOLD - 1, evaluate(pos) * colorSign(pos))));
+    if (!evalCache.has(pos)) evalCache.set(pos, Math.max(-MATE_THRESHOLD + 1, Math.min(MATE_THRESHOLD - 1, evaluate(pos, heuristics) * colorSign(pos))));
     return evalCache.get(pos);
   }
   function checked(pos) {
@@ -95,7 +101,7 @@ export function createSearchSession(position, options = {}) {
     if (!moveCache.has(move)) {
       const from = move[0], to = move[1];
       const centralGain = Math.abs(from[2] - 3.5) + Math.abs(from[3] - 3.5) - Math.abs(to[2] - 3.5) - Math.abs(to[3] - 3.5);
-      moveCache.set(move, { ...moveFeatures(pos, move), key: moveKey(move), history: historyKey(pos, move), centralGain });
+      moveCache.set(move, { ...moveFeatures(pos, move, heuristics), key: moveKey(move), history: historyKey(pos, move), centralGain });
     }
     return moveCache.get(move);
   }
@@ -105,11 +111,11 @@ export function createSearchSession(position, options = {}) {
     return moves.map((move, index) => {
       const f = orderingFeatures(pos, move);
       let priority = (favorites.has(f.key) ? 10_000_000 : 0) + f.promotion * 100;
-      if (f.captureValue) priority += 1_000_000 + f.captureValue * 100 - pieceValue(f.mover);
-      else priority += (killerMoves.has(f.key) ? 100_000 : 0) + (history.get(f.history) || 0) + f.centralGain * 10;
+      if (f.isCapture) priority += 1_000_000 + f.captureValue * 100 - pieceValue(f.mover, heuristics);
+      else priority += (killerMoves.has(f.key) ? heuristics.killerBonus : 0) + (history.get(f.history) || 0) + f.centralGain * heuristics.quietCentralization;
       // Unforced early branching expands the reply tree enormously. Explore
       // ordinary development before speculative travel unless it wins material.
-      if (f.temporal) priority -= spatialFirst ? 2_000_000 : 100;
+      if (f.temporal) priority -= spatialFirst ? heuristics.temporalMovePenalty : 100;
       return { move, priority, index };
     }).sort((a, b) => b.priority - a.priority || a.index - b.index).map(item => item.move);
   }
@@ -123,13 +129,13 @@ export function createSearchSession(position, options = {}) {
   }
   function rememberCutoff(pos, action, ply, remaining) {
     cutoffs++;
-    if (action.some(move => { const f = moveFeatures(pos, move); return f.captureValue || f.promotion; })) return;
+    if (action.some(move => { const f = moveFeatures(pos, move, heuristics); return f.isCapture || f.isPromotion; })) return;
     const list = killers.get(ply) || [];
     const key = actionKey(action);
     killers.set(ply, [action, ...list.filter(a => actionKey(a) !== key)].slice(0, 2));
     for (const move of action) {
       const key = historyKey(pos, move);
-      history.set(key, Math.min(50_000, (history.get(key) || 0) + remaining * remaining * 20));
+      history.set(key, Math.min(50_000, (history.get(key) || 0) + remaining * remaining * heuristics.historyBonus));
     }
   }
   function store(key, entry) {
@@ -278,7 +284,7 @@ export function createSearchSession(position, options = {}) {
       searchingDepth, rootActionsSearched, selectiveDepth,
       nps: elapsedMs ? Math.round(nodes * 1000 / elapsedMs) : 0, pv, status, completed,
       stoppedReason: interruption, tableEntries: tt.size, cacheMemoryBytes: tt.memoryBytes,
-      searchPolicy: 'present-spatial', policyLeaves,
+      searchPolicy: 'present-spatial', policyLeaves, heuristics,
       effectiveQuiescenceDepth: completed ? completedQDepth : activeQDepth,
       scoreType: score === null ? 'unavailable' : Math.abs(score) > MATE_THRESHOLD ? 'mate' : 'cp',
       mateIn: score !== null && Math.abs(score) > MATE_THRESHOLD ? Math.sign(score * rootSign) * (MATE_SCORE - Math.abs(score)) : null,
@@ -312,7 +318,7 @@ export function createSearchSession(position, options = {}) {
         searchingDepth = currentDepth;
         activeQDepth = iteration.horizon;
         rootPartial = null;
-        const window = currentDepth > 1 && Math.abs(score ?? 0) < MATE_THRESHOLD ? 60 : INF;
+        const window = currentDepth > 1 && heuristics.aspirationWindow > 0 && Math.abs(score ?? 0) < MATE_THRESHOLD ? heuristics.aspirationWindow : INF;
         const lower = window === INF ? -INF : score - window;
         const upper = window === INF ? INF : score + window;
         let result = yield { remaining: currentDepth, horizon: activeQDepth, alpha: lower, beta: upper, preferred: bestAction };

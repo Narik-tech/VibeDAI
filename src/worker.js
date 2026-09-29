@@ -1,11 +1,13 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { analyze } from './parallel-search.js';
 import { formatAction, validateAction } from './rules.js';
+import { isNeuralEngine } from './leela-config.js';
 
 let contextTruncated = false, frontierTruncated = false;
+const neural = isNeuralEngine(workerData.options.engine);
 let requestId = 0;
 const pending = new Map();
-if (workerData.options.engine === 'transformer') {
+if (neural) {
   parentPort.on('message', message => {
     if (!['evaluations', 'policyScores'].includes(message.type)) return;
     const request = pending.get(message.id);
@@ -49,7 +51,7 @@ function annotate(result) {
   return {
     ...result,
     engine: workerData.options.engine || 'classical',
-    ...(workerData.options.engine === 'transformer' ? { model: workerData.model, contextTruncated, frontierTruncated } : {}),
+    ...(neural ? { model: workerData.model, contextTruncated, frontierTruncated } : {}),
     notation: result.bestAction === null || result.bestAction === undefined
       ? '' : formatAction(workerData.position, result.bestAction),
     pvNotation,
@@ -58,7 +60,7 @@ function annotate(result) {
 
 try {
   const cancelled = new Int32Array(workerData.cancelBuffer);
-  const engine = workerData.options.engine === 'transformer' ? (await import('./transformer-search.js')).analyze : analyze;
+  const engine = neural ? (await import('./transformer-search.js')).analyze : analyze;
   const result = await engine(workerData.position, {
     ...workerData.options,
     shouldStop: () => Atomics.load(cancelled, 0) !== 0,

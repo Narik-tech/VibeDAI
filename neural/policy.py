@@ -80,12 +80,12 @@ def collate_moves(features, device):
 def policy_loss(model, examples, device, weights=None):
     import torch
     try:
-        from .model import collate
+        from .model import collate_for_model
     except ImportError:
-        from model import collate
+        from model import collate_for_model
     if not examples:
         return next(model.parameters()).sum() * 0
-    batch = collate([item[0] for item in examples], device)
+    batch = collate_for_model(model, [item[0] for item in examples], device)
     features, mask = collate_moves([item[1] for item in examples], device)
     logits = model.score_moves(model.encode(*batch), features, mask)
     targets = torch.tensor([item[2] for item in examples], dtype=torch.long, device=device)

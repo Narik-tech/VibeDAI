@@ -4,7 +4,9 @@ A local analysis and play workbench, command-line engine, and JavaScript library
 
 The classical engine searches **complete submitted turns**, including turns that require moves on several timelines. Ordinary moves are considered only on boards currently required to advance the present; optional boards contribute only cross-board moves. It uses iterative deepening, principal variation alpha-beta search, full-turn move ordering, transposition caching in both normal and tactical search, capture/promotion quiescence, and a multiverse evaluation. The shared rules layer supports historical travel, branching, inactive timelines, castling, en passant, promotions, and the variant pieces supported by the pinned rules dependency.
 
-The UI offers **Classical search** and a separate, experimental **Transformer** engine with a locally trainable model. Neither engine has an established Elo or a claim to be the world's strongest 5D engine. Search budgets, depth, principal variation, and incomplete results are visible so behavior can be measured and improved.
+The UI offers **Classical search**, an experimental **Transformer**, and **Leela in a 5D Trenchcoat**, which uses the LCZero transfer model. The neural engines have separate checkpoints and training choices. These engines have no established Elo. Search budgets, depth, principal variation, and incomplete results are visible so behavior can be measured and improved.
+
+The **Position heuristics** panel below the boards explains the displayed position's static evaluation, with signed centipawn contributions for individual features and timeline frontiers. Sliders and number inputs adjust component weights, positional terms, piece values, and search ordering. Changes refresh the breakdown and apply to subsequent classical analyses and automatic replies, including parallel searches. Settings persist in this browser; **Reset defaults** restores the shipped profile. Changing a setting invalidates the previous recommendation. The static total evaluates the displayed position (including a partial turn); the Engine score comes from searching continuations, so the two can differ. Neural engines use their own models and do not use these controls. Legal move rules and the present-spatial search policy remain fixed.
 
 ## Run
 
@@ -41,6 +43,23 @@ You can also open **Training** in the app header, or visit **http://127.0.0.1:51
 Select a piece on a playable board, then a highlighted destination on any board. A time-travel move can create a new timeline. Continue until the turn can be submitted, then choose **Submit turn**. **Analyze** recommends an entire remaining turn; **Play best** applies it and submits. The opponent selector enables automatic engine replies. Undo removes one pending move, or a whole submitted turn when no moves are pending.
 
 Import/export uses **5DPGN** and **5DFEN**, not ordinary chess FEN. An import preserves the history needed for time-travel moves. Export records submitted turns; submit or undo pending moves before saving a complete game. Undo history starts at the imported position.
+
+## Train from an LCZero baseline
+
+The [LCZero-to-5D training guide](docs/lc0-transfer.md) describes the new transfer
+pipeline for the supplied T3 512×15×16h model. It imports the spatial transformer,
+trains timeline-aware value and legal-candidate policy adapters, and connects the
+result to the existing Transformer engine and self-play promotion loop. Use
+`node scripts/lc0.js --help` for inspection, curriculum generation, training,
+evaluation, and runtime verification. The short validation run confirms the
+pipeline works; it does not establish playing strength.
+
+Choose **Leela in a 5D Trenchcoat** under **Analysis engine** to analyze with the
+trained LCZero model. Set **Engine plays** to White or Black to use it as an
+opponent. In **Training**, choose the same name to resume its self-play training.
+Both use `artifacts/lc0/best.pt` by default; `LEELA_CHECKPOINT` selects another
+trained transfer checkpoint. Leela's training history is stored separately in
+`artifacts/lc0/selfplay`.
 
 ## Command line
 

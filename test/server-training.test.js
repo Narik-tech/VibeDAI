@@ -43,6 +43,8 @@ async function fixture(t) {
   const workers = [], invocations = [];
   const manager = new TrainingManager({
     runDir, checkpoint: path.join(directory, 'model.pt'), python: path.join(directory, 'python'),
+    leelaConfig: { checkpoint: path.join(directory, 'leela.pt'), runDir: path.join(directory, 'leela-selfplay'),
+      seedData: path.join(directory, 'curriculum.jsonl'), python: path.join(directory, 'python'), device: 'cpu' },
     availability: async () => ({ available: true }),
     workerFactory: invocation => {
       const worker = new EventEmitter();
@@ -146,6 +148,39 @@ test('training HTTP validation rejects untrusted options and foreign origins bef
   });
   assert.equal(denied.status, 403);
   assert.equal(workers.length, 0);
+});
+
+test('Leela training HTTP flow selects its checkpoint and namespaces saved game review', async t => {
+  const { manager, request, invocations, runDir } = await fixture(t);
+  await writeFile(manager.leelaOptions.checkpoint, 'trained LCZero transfer checkpoint');
+  await mkdir(manager.leelaOptions.runDir);
+  const legacy = await writeGame(runDir);
+  const leela = await writeGame(manager.leelaOptions.runDir);
+  const snapshot = (await request('/api/training')).data;
+  assert.equal(snapshot.leelaAvailability.available, true);
+  assert.equal(snapshot.leelaModel.name, 'Leela in a 5D Trenchcoat');
+  assert.equal(snapshot.leelaModel.available, true);
+  assert.equal(snapshot.leelaDefaults.model, 'leela');
+  assert.equal(snapshot.leelaDefaults.batchSize, 4);
+  assert.deepEqual(new Set(snapshot.iterations.map(item => item.id)), new Set([legacy.id, `leela__${leela.id}`]));
+  const detail = await request(`/api/training/iterations/leela__${leela.id}`);
+  assert.equal(detail.status, 200);
+  assert.equal(detail.data.games.length, 1);
+  const game = await request(`/api/training/iterations/leela__${leela.id}/games/selfplay-001?ply=1`);
+  assert.equal(game.status, 200);
+  assert.equal(positionKey(game.data.position), leela.game.finalKey);
+  const started = await request('/api/training/start', { options: { model: 'leela', steps: 3 } });
+  assert.equal(started.status, 202, started.data.error);
+  assert.equal(started.data.model, 'leela');
+  assert.equal(invocations[0].mode, 'selfplay');
+  assert.equal(invocations[0].options.checkpoint, manager.leelaOptions.checkpoint);
+  assert.equal(invocations[0].options.runDir, manager.leelaOptions.runDir);
+  assert.equal(invocations[0].options.seedData, manager.leelaOptions.seedData);
+  assert.equal(invocations[0].options.steps, 3);
+  assert.equal(invocations[0].options.batchSize, 4);
+  assert.equal((await request('/api/training/start', { options: { model: 'current' } })).status, 409);
+  assert.equal((await request('/api/training/stop', {})).status, 200);
+  assert.equal((await request('/api/training')).data.status.state, 'interrupted');
 });
 
 test('fresh 20M HTTP flow validates settings, starts data generation and shares the stop control', async t => {

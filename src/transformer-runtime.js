@@ -195,10 +195,11 @@ export class TransformerRuntime {
   close() { this.closed = true; this.stopProcess(); }
 }
 
-export function listEngines(runtime) {
+export function listEngines(runtime, leelaRuntime) {
   return { engines: [
     { id: 'classical', name: 'Classical search', available: true, status: 'ready', description: 'CPU alpha-beta search with handcrafted evaluation.' },
     runtime.describe(),
+    ...(leelaRuntime ? [leelaRuntime.describe()] : []),
   ] };
 }
 

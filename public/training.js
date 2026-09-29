@@ -1,6 +1,7 @@
 const $ = id => document.getElementById(id);
 const storageKey = 'vibe-d-ai.training-settings.v1';
-const modeStorageKeys = {current:storageKey,selfplay20m:'vibe-d-ai.training-20m-settings.v1',fresh20m:'vibe-d-ai.fresh-20m-settings.v1'};
+const leelaName = 'Leela in a 5D Trenchcoat';
+const modeStorageKeys = {current:storageKey,selfplay20m:'vibe-d-ai.training-20m-settings.v1',fresh20m:'vibe-d-ai.fresh-20m-settings.v1',leela:'vibe-d-ai.training-leela-settings.v1'};
 const fields = [
   { key:'iterations', label:'Iterations', min:0, max:1000000, help:'0 runs continuously', group:'Run length' },
   { key:'device', label:'Device', choices:[['auto','Automatic'],['cuda','CUDA / GPU'],['cpu','CPU']], group:'Run length' },
@@ -59,10 +60,15 @@ function dateLabel(value) { const date = new Date(value); return Number.isFinite
 function resultLabel(game) { return game?.valid === false ? 'Invalid' : results[game?.result] || human(game?.result) || 'Pending'; }
 function resultClass(game) { return game?.valid === false ? 'invalid' : game?.result === 'UNFINISHED' ? 'unfinished' : ''; }
 function activeRun() { return ['running','stopping','external'].includes(snapshot?.status?.state); }
-function activeFields() { return trainingMode === 'fresh20m' ? freshFields : fields; }
-function modeDefaults() { return trainingMode === 'fresh20m' ? snapshot?.freshDefaults : trainingMode === 'selfplay20m' ? {...defaults,batchSize:1,maxTokens:512} : defaults; }
+function activeFields() {
+  if (trainingMode === 'fresh20m') return freshFields;
+  if (trainingMode === 'leela') return fields.map(field => field.key === 'maxTokens' ? {...field,label:'Board summary tokens',help:'Summary context; the checkpoint also caps spatial boards'} : field.key === 'batchSize' ? {...field,help:'Start with 4 for the LCZero transfer model'} : field);
+  return fields;
+}
+function modeDefaults() { return trainingMode === 'fresh20m' ? snapshot?.freshDefaults : trainingMode === 'leela' ? snapshot?.leelaDefaults : trainingMode === 'selfplay20m' ? {...defaults,batchSize:1,maxTokens:512} : defaults; }
 function modeAvailability() {
   if (trainingMode === 'fresh20m') return snapshot?.freshAvailability;
+  if (trainingMode === 'leela') return snapshot?.leelaAvailability;
   if (trainingMode === 'selfplay20m') return snapshot?.training20mAvailability || (snapshot?.model20m?.available ? snapshot?.freshAvailability : {available:false,reason:'Complete a fresh 20M run before starting self-play with it.'});
   return snapshot?.availability;
 }
@@ -161,10 +167,13 @@ function selectMode(mode) {
   renderMode(); renderMonitor(); updateControls();
 }
 function renderMode() {
-  const fresh = trainingMode === 'fresh20m', current = trainingMode === 'current';
+  const fresh = trainingMode === 'fresh20m', current = trainingMode === 'current', leela = trainingMode === 'leela';
   $('model-summary').hidden = current;
-  $('mode-description').textContent = fresh ? 'Generate labeled positions, then train a new model from scratch.' : current ? 'Continue self-play with the configured current checkpoint.' : 'Continue self-play with the latest completed 20M model.';
-  $('parameter-note').textContent = fresh ? 'Each fresh run starts with new weights and saves its own checkpoint. Completed 20M models are available for self-play.' : 'Each cycle generates games, trains a candidate, then evaluates both colors. Passing the arena gate promotes the candidate for this model.';
+  $('model-summary').replaceChildren(...(leela
+    ? [element('strong','',leelaName),element('span','','LCZero spatial features · timeline attention · 5D value + policy heads'),element('span','',snapshot?.leelaModel?.available ? 'Resumes the saved LCZero transfer checkpoint' : 'LCZero transfer checkpoint required')]
+    : [element('strong','','20,000,257 parameters'),element('span','','6 layers · width 512 · 8 heads · feed-forward 2,048'),element('span','','Value + policy heads')]));
+  $('mode-description').textContent = fresh ? 'Generate labeled positions, then train a new model from scratch.' : leela ? `Continue training ${leelaName} through self-play with its saved 5D checkpoint.` : current ? 'Continue self-play with the configured current checkpoint.' : 'Continue self-play with the latest completed 20M model.';
+  $('parameter-note').textContent = fresh ? 'Each fresh run starts with new weights and saves its own checkpoint. Completed 20M models are available for self-play.' : leela ? 'Each cycle resumes the LCZero transfer model, trains a candidate, and evaluates both colors. Passing the arena gate updates its checkpoint. Leela keeps its own replay buffer and iteration history.' : 'Each cycle generates games, trains a candidate, then evaluates both colors. Passing the arena gate promotes the candidate for this model.';
 }
 function updateControls() {
   const state = snapshot?.status?.state;
@@ -177,12 +186,13 @@ function updateControls() {
   $('start-training').textContent = mutation && state !== 'running' && state !== 'stopping' ? 'Starting…' : trainingMode === 'fresh20m' ? '▷  Start fresh 20M' : '▷  Start self-play';
   $('reset-parameters').disabled = !ready || mutation || activeRun();
   $('reuse-parameters').disabled = !iterationData?.report?.options || mutation || activeRun();
+  $('select-leela-training').disabled = !defaults || mutation || activeRun();
   $('refresh-training').disabled = refreshing;
   if (!online) $('run-hint').textContent = 'Waiting for the local server. Use Refresh to reconnect.';
   else if (state === 'external') $('run-hint').textContent = 'A training process started outside this page is active. Stop it in its original terminal before starting a new run.';
   else if (state === 'stopping') $('run-hint').textContent = 'Stopping owned processes and retaining completed results…';
   else if (state === 'running') $('run-hint').textContent = 'Training is running locally. You can review saved games while it works.';
-  else if (!availability?.available) $('run-hint').textContent = availability?.reason || 'Training is not available. Check the local transformer Python environment.';
+  else if (!availability?.available) $('run-hint').textContent = availability?.reason || (trainingMode === 'leela' ? `${leelaName} requires a saved LCZero transfer checkpoint and the local Python environment.` : 'Training is not available. Check the local transformer Python environment.');
   else $('run-hint').textContent = 'Ready to train. Settings are saved in this browser.';
 }
 
@@ -191,6 +201,7 @@ function renderMonitor() {
   const state = status.state || 'idle';
   const phase = status.phase || '';
   const fresh = status.mode ? status.mode === 'fresh20m' : trainingMode === 'fresh20m';
+  const leela = status.mode && state !== 'idle' ? status.model === 'leela' || status.options?.model === 'leela' : trainingMode === 'leela';
   const events = Array.isArray(status.events) ? status.events : [];
   const trainingProgress = [...events].reverse().find(event => event && typeof event === 'object' && (event.step !== undefined || event.trainedSteps !== undefined));
   const dataProgress = [...events].reverse().find(event => event?.event === 'data-progress');
@@ -199,7 +210,7 @@ function renderMonitor() {
   $('run-state').textContent = state.toUpperCase();
   $('run-state').classList.toggle('searching', state === 'running');
   $('run-dot').style.background = state === 'failed' ? '#e39e91' : activeRun() ? 'var(--accent)' : '#657c8e';
-  $('run-title').textContent = status.mode && state !== 'idle' ? `${fresh ? '20M model' : 'Self-play'} · ${label.toLowerCase()}` : label;
+  $('run-title').textContent = status.mode && state !== 'idle' ? `${fresh ? '20M model' : leela ? leelaName : 'Self-play'} · ${label.toLowerCase()}` : label;
   const progressText = fresh ? /data|generat/.test(phase) && dataProgress ? ` · ${number(dataProgress.samples)}${dataProgress.total ? ` / ${number(dataProgress.total)}` : ''} positions` : step !== undefined ? ` · update ${number(step)}${typeof trainingProgress.loss === 'number' ? ` · loss ${trainingProgress.loss.toFixed(4)}` : ''}` : '' : '';
   const description = {idle:trainingMode === 'fresh20m' ? 'Ready to generate labeled data and train a fresh 20M model.' : 'Choose your parameters and start a self-play training cycle.',running:`${human(phase) || 'Starting local training'}${progressText}${status.startedAt ? ` · started ${dateLabel(status.startedAt)}` : ''}`,stopping:'Stopping local training and keeping saved results.',completed:fresh ? 'The new checkpoint is saved below. Select Self-play · 20M model to continue training.' : 'The cycle results and recorded games are ready to review.',interrupted:fresh ? 'Saved data and partial checkpoints were retained. A new fresh run starts from scratch.' : 'Completed results were retained. Start another run to continue training.',failed:'Review the error and training log before starting another run.',external:'A separate local process owns the training run. Its retained games appear below.'}[state];
   $('run-detail').textContent = description || human(phase);
@@ -248,6 +259,18 @@ function renderFreshRuns() {
     return item;
   }) : [element('p','library-empty','No fresh runs yet. Start a fresh 20M model from the run configuration.')]));
 }
+function renderLeelaModel() {
+  const model = snapshot?.leelaModel;
+  const availability = snapshot?.leelaAvailability;
+  $('leela-state').textContent = availability?.available ? 'READY FOR SELF-PLAY' : model?.available ? 'CHECK ENVIRONMENT' : 'SETUP REQUIRED';
+  $('leela-detail').textContent = availability?.available
+    ? 'Resume the saved LCZero transfer model with self-play. Promoted candidates become available in Analysis under the same name.'
+    : availability?.reason || 'See docs/lc0-transfer.md to import the LCZero baseline and train a 5D checkpoint.';
+  $('leela-checkpoint').textContent = model?.checkpoint || '';
+  $('leela-checkpoint').hidden = !model?.checkpoint;
+  const iterations = (snapshot?.iterations || []).filter(item => item.model === 'leela');
+  $('leela-history').textContent = `${number(iterations.length)} retained Leela iteration${iterations.length === 1 ? '' : 's'}${iterations.length ? ' · available in Iteration results below' : ' · training starts when you select Start self-play'}.`;
+}
 function renderIterationChoices() {
   const iterations = snapshot?.iterations || [];
   const select = $('iteration-select');
@@ -256,7 +279,7 @@ function renderIterationChoices() {
   const signature = JSON.stringify(iterations.map(item => [item.id,item.iteration,item.status,item.promoted,item.model,item.modelRunId]));
   if (select.dataset.signature !== signature) {
     select.replaceChildren(...(iterations.length ? iterations.map(item => {
-      const modelLabel = item.model === '20m' ? `20M${item.modelRunId ? ` · ${String(item.modelRunId).replace(/^fresh-/, '').slice(0,8)}` : ''}` : item.model === 'current' ? 'Current' : '';
+      const modelLabel = item.model === 'leela' ? leelaName : item.model === '20m' ? `20M${item.modelRunId ? ` · ${String(item.modelRunId).replace(/^fresh-/, '').slice(0,8)}` : ''}` : item.model === 'current' ? 'Current' : '';
       const option = element('option','',`${modelLabel ? `${modelLabel} · ` : ''}Iteration ${item.iteration} · ${item.promoted ? 'promoted' : human(item.status) || 'in progress'}`);
       option.value = item.id; return option;
     }) : [element('option','','No retained iterations')]));
@@ -280,11 +303,13 @@ async function refreshTraining({manual = false} = {}) {
     const previousState = snapshot?.status?.state;
     snapshot = await api('/api/training');
     online = true;
-    if (!defaults) { defaults = snapshot.defaults || {}; createParameters(modeDefaults()); renderMode(); }
+    if (!defaults) { defaults = snapshot.defaults || {}; createParameters(modeDefaults()); }
+    renderMode();
     $('training-connection').classList.add('online');
     $('training-connection').replaceChildren(element('span','status-dot'),document.createTextNode('Local training'));
     renderMonitor();
     renderFreshRuns();
+    renderLeelaModel();
     const changed = renderIterationChoices();
     if (selectedIteration && (changed || manual || activeRun() || ['running','stopping','external'].includes(previousState) || ['running','evaluated'].includes(iterationData?.report?.status))) await loadIteration(selectedIteration, !changed);
   } catch (error) {
@@ -320,7 +345,8 @@ function renderIteration() {
   const samples = selfplay?.samples ?? (selfplayGames.length ? selfplayGames.reduce((total,game) => total + (game.samples || 0), 0) : undefined);
   $('iteration-empty').hidden = true;
   $('iteration-results').hidden = false;
-  $('iteration-description').textContent = `${human(report.status) || 'In progress'}${report.startedAt ? ` · ${dateLabel(report.startedAt)}` : ''}${report.seed !== undefined ? ` · seed ${report.seed}` : ''}`;
+  const model = report.options?.model || (snapshot?.iterations || []).find(item => item.id === selectedIteration)?.model;
+  $('iteration-description').textContent = `${model === 'leela' ? `${leelaName} · ` : model === '20m' ? '20M model · ' : ''}${human(report.status) || 'In progress'}${report.startedAt ? ` · ${dateLabel(report.startedAt)}` : ''}${report.seed !== undefined ? ` · seed ${report.seed}` : ''}`;
   $('iteration-metrics').replaceChildren(
     metric('Self-play games',number(gameCount),`${number(finishedCount)} finished · ${number(unfinishedCount)} unfinished`),
     metric('New samples',number(samples),selfplay ? `${number(selfplay.outcomeSamples)} outcome · ${number(selfplay.bootstrapSamples)} search` : 'From completed search targets'),
@@ -567,8 +593,8 @@ $('training-form').addEventListener('submit',async event => {
   saveParameters(); mutation = true; updateControls();
   try {
     const fresh = trainingMode === 'fresh20m';
-    await api(fresh ? '/api/training/fresh/start' : '/api/training/start',{options:fresh ? options : {...options,model:trainingMode === 'selfplay20m' ? '20m' : 'current'}});
-    toast(fresh ? 'Fresh 20M run started. Generating training data.' : 'Self-play training started.');
+    await api(fresh ? '/api/training/fresh/start' : '/api/training/start',{options:fresh ? options : {...options,model:trainingMode === 'leela' ? 'leela' : trainingMode === 'selfplay20m' ? '20m' : 'current'}});
+    toast(fresh ? 'Fresh 20M run started. Generating training data.' : trainingMode === 'leela' ? `${leelaName} self-play started.` : 'Self-play training started.');
     await refreshTraining({manual:true});
   }
   catch (error) { $('run-error').textContent = error.message; $('run-error').hidden = false; toast(error.message,true); }
@@ -584,8 +610,9 @@ $('stop-training').addEventListener('click',async () => {
 $('parameter-fields').addEventListener('input',saveParameters);
 $('parameter-fields').addEventListener('change',saveParameters);
 $('training-mode').addEventListener('change',() => selectMode($('training-mode').value));
+$('select-leela-training').addEventListener('click',() => { selectMode('leela'); $('training-mode').focus(); });
 $('reset-parameters').addEventListener('click',() => { applyParameters(modeDefaults()); saveParameters(); toast('Restored default training parameters.'); });
-$('reuse-parameters').addEventListener('click',() => { selectMode(iterationData?.report?.options?.model === '20m' ? 'selfplay20m' : 'current'); applyParameters(iterationData?.report?.options); saveParameters(); toast('Iteration parameters copied to the next run.'); $('param-iterations')?.focus(); });
+$('reuse-parameters').addEventListener('click',() => { const model = iterationData?.report?.options?.model; selectMode(model === 'leela' ? 'leela' : model === '20m' ? 'selfplay20m' : 'current'); applyParameters(iterationData?.report?.options); saveParameters(); toast('Iteration parameters copied to the next run.'); $('param-iterations')?.focus(); });
 $('refresh-training').addEventListener('click',() => void refreshTraining({manual:true}));
 $('iteration-select').addEventListener('change',() => { selectedIteration = $('iteration-select').value; void loadIteration(selectedIteration); });
 for (const id of ['game-kind','game-outcome']) $(id).addEventListener('change',renderGameList);

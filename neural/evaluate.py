@@ -16,9 +16,9 @@ import time
 def evaluate_records(model, records, device, batch_size=16, max_batches=None):
     import torch
     try:
-        from .model import collate
+        from .model import collate_for_model
     except ImportError:
-        from model import collate
+        from model import collate_for_model
     if not 1 <= batch_size <= 128 or (max_batches is not None and max_batches < 1):
         raise ValueError("batch-size must be 1–128 and max-batches must be positive")
     was_training = model.training
@@ -29,7 +29,7 @@ def evaluate_records(model, records, device, batch_size=16, max_batches=None):
     def measure(items):
         nonlocal squared_error, absolute_cp_error, samples, truncated, frontier_truncated
         with torch.inference_mode(), torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            prediction = model(*collate([record[0] for record in items], device)).float()
+            prediction = model(*collate_for_model(model, [record[0] for record in items], device)).float()
             target = torch.tensor([record[1] for record in items], dtype=torch.float32, device=device)
             if not torch.isfinite(prediction).all():
                 raise ValueError("model returned nonfinite validation predictions")
@@ -74,10 +74,10 @@ def main():
     try:
         import torch
         try:
-            from .model import choose_device, load_checkpoint, metadata
+            from .model import choose_device, encode_for_model, load_checkpoint, metadata
             from .train import records
         except ImportError:
-            from model import choose_device, load_checkpoint, metadata
+            from model import choose_device, encode_for_model, load_checkpoint, metadata
             from train import records
         if not 1 <= args.threads <= 32 or not 1 <= args.batch_size <= 128:
             raise ValueError("threads must be 1–32 and batch-size must be 1–128")
@@ -94,7 +94,8 @@ def main():
         for path in args.checkpoints:
             model, checkpoint = load_checkpoint(path, device)
             start = time.perf_counter()
-            metrics = evaluate_records(model, records(args.data, model.config.max_tokens), device, args.batch_size)
+            rows = records(args.data, model.config.max_tokens, encoder=lambda position: encode_for_model(model, position))
+            metrics = evaluate_records(model, rows, device, args.batch_size)
             report["checkpoints"].append({"model": metadata(model, checkpoint, path), **metrics,
                                           "seconds": round(time.perf_counter() - start, 3)})
             del model, checkpoint

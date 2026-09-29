@@ -35,6 +35,8 @@ async function fixture(t, overrides = {}) {
   const workers = [], calls = [];
   const manager = new TrainingManager({
     runDir, checkpoint: path.join(directory, 'model.pt'), python: path.join(directory, 'python'),
+    leelaConfig: { checkpoint: path.join(directory, 'leela.pt'), runDir: path.join(directory, 'leela-selfplay'),
+      seedData: path.join(directory, 'curriculum.jsonl'), python: path.join(directory, 'leela-python'), device: 'cpu' },
     availability: async () => ({ available: true }),
     workerFactory: args => {
       calls.push(args);
@@ -121,6 +123,17 @@ test('training options reject malformed numbers, invalid ranges and inconsistent
     { promotionScore: 0.5 }, { promotionScore: 1.01 }, { arenaPairs: 1, minPairs: 2 }, { device: 'shell' },
   ]) assert.throws(() => validateTrainingOptions(options), undefined, JSON.stringify(options));
   for (const value of [null, [], 'options', 12]) assert.throws(() => validateTrainingOptions(value));
+});
+
+test('Leela training options use the smaller batch and retain editable self-play bounds', () => {
+  const defaults = validateTrainingOptions({ model: 'leela' });
+  assert.equal(defaults.model, 'leela');
+  assert.equal(defaults.batchSize, 4);
+  assert.equal(defaults.maxDepth, 2);
+  assert.equal(defaults.gameConcurrency, 1);
+  assert.equal(validateTrainingOptions({ model: 'leela', batchSize: 2, maxTokens: 128 }).batchSize, 2);
+  assert.equal(TRAINING_DEFAULTS.model, 'current');
+  assert.equal(TRAINING_DEFAULTS.batchSize, 16);
 });
 
 test('training options reject arbitrary paths, executable settings and unknown or prototype fields', () => {
@@ -594,4 +607,90 @@ test('fresh training availability does not require an arena suite', async t => {
   assert.equal((await manager.availability({ mode: 'fresh20m' })).available, true);
   await writeFile(manager.options.checkpoint, 'saved checkpoint');
   assert.match((await manager.availability()).reason, /evaluation starting-position suite/);
+});
+
+test('Leela training resumes its imported checkpoint with independent data and saved run marker', async t => {
+  const { manager, calls, runDir } = await fixture(t, { availability: undefined });
+  const leela = manager.leelaOptions;
+  await writeFile(leela.checkpoint, 'trained LCZero transfer checkpoint');
+  await writeFile(leela.python, 'fixture Python');
+  await writeFile(leela.seedData, 'curriculum');
+  const legacy = JSON.stringify({ version: 1, runId: 'old-transformer', nextIteration: 3, checkpoint: manager.options.checkpoint });
+  await writeFile(path.join(runDir, 'run.json'), legacy);
+  const snapshot = await manager.snapshot();
+  assert.equal(snapshot.availability.available, false, 'The old Transformer checkpoint is absent.');
+  assert.equal(snapshot.leelaAvailability.available, true);
+  assert.deepEqual(snapshot.leelaModel, { id: 'leela', name: 'Leela in a 5D Trenchcoat', available: true, checkpoint: leela.checkpoint });
+  assert.equal(snapshot.leelaDefaults.batchSize, 4);
+  assert.equal(snapshot.leelaDefaults.device, 'cpu');
+  assert.equal(snapshot.leelaDefaults.model, 'leela');
+  assert.equal(Object.hasOwn(snapshot.leelaDefaults, 'checkpoint'), false);
+  const status = await manager.start({ model: 'leela', steps: 7 });
+  assert.equal(status.mode, 'selfplay');
+  assert.equal(status.model, 'leela');
+  assert.equal(calls[0].mode, 'selfplay', 'Leela must never use the fresh random model runner.');
+  for (const key of ['checkpoint', 'python', 'suite', 'seedData', 'runDir']) assert.equal(calls[0].options[key], leela[key], key);
+  assert.equal(calls[0].options.steps, 7);
+  assert.equal(calls[0].options.sharedRunDir, runDir);
+  assert.equal(calls[0].options.batchSize, 4);
+  assert.match(leela.suite, /lc0-training\.json$/);
+  await assert.rejects(runSelfPlay(calls[0].options, { shouldStop: () => true, onEvent() {} }), { name: 'AbortError' });
+  assert.equal(JSON.parse(await readFile(path.join(leela.runDir, 'run.json'), 'utf8')).checkpoint, leela.checkpoint);
+  assert.equal(await readFile(path.join(runDir, 'run.json'), 'utf8'), legacy);
+});
+
+test('Leela readiness reports its own missing checkpoint, Python and curriculum', async t => {
+  const { manager, workers } = await fixture(t, { availability: undefined });
+  const leela = manager.leelaOptions;
+  let snapshot = await manager.snapshot();
+  assert.equal(snapshot.leelaModel.available, false);
+  assert.match(snapshot.leelaAvailability.reason, /Leela checkpoint missing/);
+  await assert.rejects(manager.start({ model: 'leela' }), /Leela checkpoint missing/);
+  await writeFile(leela.checkpoint, 'LCZero transfer');
+  snapshot = await manager.snapshot();
+  assert.equal(snapshot.leelaModel.available, true);
+  assert.match(snapshot.leelaAvailability.reason, /Python environment missing/);
+  await writeFile(leela.python, 'fixture Python');
+  assert.match((await manager.snapshot()).leelaAvailability.reason, /Leela curriculum is missing/);
+  await writeFile(leela.seedData, 'curriculum');
+  assert.equal((await manager.snapshot()).leelaAvailability.available, true);
+  assert.equal(workers.length, 0);
+});
+
+test('Leela review namespaces distinguish equal iteration numbers and replay legal saved games', async t => {
+  const { manager, runDir } = await fixture(t);
+  const current = await persistedIteration(runDir);
+  await mkdir(manager.leelaOptions.runDir);
+  const leela = await persistedIteration(manager.leelaOptions.runDir);
+  const qualified = `leela__${leela.id}`;
+  const snapshot = await manager.snapshot();
+  assert.deepEqual(new Set(snapshot.iterations.map(item => item.id)), new Set([current.id, qualified]));
+  assert.equal(snapshot.iterations.find(item => item.id === qualified).model, 'leela');
+  assert.equal((await manager.getIteration(qualified)).games.length, 3);
+  const game = await manager.getGame(qualified, 'selfplay-001', 2);
+  assert.equal(positionKey(game.position), leela.records[0].finalKey);
+  for (const invalid of [`leela__../${leela.id}`, `leela__${leela.id}__extra`, `leela/../${leela.id}`]) {
+    await assert.rejects(manager.getIteration(invalid), /Invalid training iteration ID/);
+  }
+});
+
+test('Leela checkpoint locks block training and recover abandoned Leela runs only after their owner exits', async t => {
+  const { manager, workers } = await fixture(t);
+  await mkdir(manager.leelaOptions.runDir);
+  const { folder } = await abandonedIteration(manager.leelaOptions.runDir);
+  const checkpointLock = `${manager.leelaOptions.checkpoint}.selfplay-lock`;
+  await mkdir(checkpointLock);
+  const file = path.join(checkpointLock, '.selfplay.lock');
+  await writeFile(file, JSON.stringify({ pid: process.pid, token: 'external-leela' }));
+  const locked = await manager.snapshot();
+  assert.equal(locked.leelaAvailability.available, false);
+  assert.equal(locked.leelaAvailability.external, true);
+  assert.equal(locked.status.model, 'leela');
+  assert.equal(JSON.parse(await readFile(path.join(folder, 'report.json'), 'utf8')).status, 'running');
+  await assert.rejects(manager.start({ model: 'leela' }), error => error.statusCode === 409);
+  assert.equal(workers.length, 0);
+  await writeFile(file, JSON.stringify({ pid: await exitedPid(), token: 'exited-leela' }));
+  const recovered = await manager.snapshot();
+  assert.equal(recovered.leelaAvailability.available, true);
+  assert.equal(recovered.iterations.find(item => item.id === 'leela__iteration-00000228').status, 'interrupted');
 });

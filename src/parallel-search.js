@@ -92,6 +92,9 @@ export async function analyze(position, options = {}) {
     shouldStop: cancelled, claimNode: kind => claimNode(shared, maxNodes, kind),
     onProgress: options.onProgress ? result => options.onProgress(aggregate(result)) : undefined,
   });
+  // Freeze and validate once in the coordinator, then clone the exact effective
+  // settings into every worker, including any legacy quiescence-depth override.
+  workerOptions.heuristics = session.snapshot().heuristics;
   function check() {
     if (callbackError) throw callbackError;
     if (cancelled()) throw session.interrupt('cancelled');

@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 import { Worker } from 'node:worker_threads';
 import { GameSession } from './session.js';
 import { TransformerRuntime, forwardInference } from './transformer-runtime.js';
+import { LeelaRuntime } from './leela-runtime.js';
+import { isNeuralEngine } from './leela-config.js';
 
 const HELP = `Vibe-D AI — full-turn analysis for 5D Chess
 
@@ -10,9 +12,9 @@ Usage: node src/cli.js [options]
   --file PATH       Load a 5DPGN game or 5DFEN position
   --pgn TEXT        Load notation directly (quote it in your shell)
   --variant NAME    Starting variant, default: standard
-  --engine NAME     classical (default) or transformer (requires trained model)
+  --engine NAME     classical (default), transformer, or leela (Leela in a 5D Trenchcoat)
   --time SECONDS    Think time, default: 5 (maximum 3600)
-  --depth NUMBER    Maximum complete-turn plies, default: 8; transformer 0 is dynamic
+  --depth NUMBER    Maximum complete-turn plies, default: 8; neural engines use 0 for dynamic
   --nodes NUMBER    Search + generation work budget, default: 2000000
   --threads NUMBER  Classical search CPU threads, default: 1 (maximum 16)
   --qdepth NUMBER   Quiescence turn depth, default: 2
@@ -59,16 +61,16 @@ async function main() {
   const options = {
     engine: args.engine || 'classical',
     timeMs: Math.round(seconds * 1000),
-    maxDepth: integer(args.depth, 8, args.engine === 'transformer' ? 0 : 1, 64, '--depth'),
+    maxDepth: integer(args.depth, 8, isNeuralEngine(args.engine) ? 0 : 1, 64, '--depth'),
     maxNodes: integer(args.nodes, 2000000, 1, 1000000000, '--nodes'),
     threads: integer(args.threads, 1, 1, 16, '--threads'),
     quiescenceDepth: integer(args.qdepth, 2, 0, 8, '--qdepth'),
   };
-  if (!['classical', 'transformer'].includes(options.engine)) throw new Error('--engine must be classical or transformer.');
+  if (!['classical', 'transformer', 'leela'].includes(options.engine)) throw new Error('--engine must be classical, transformer, or leela.');
   const pgn = args.file ? await readFile(args.file, 'utf8') : args.pgn;
   const game = new GameSession({ variant: args.variant, pgn });
   const cancelled = new Int32Array(new SharedArrayBuffer(4));
-  const runtime = new TransformerRuntime();
+  const runtime = options.engine === 'leela' ? new LeelaRuntime() : new TransformerRuntime();
   let worker, result;
   const interrupt = () => {
     Atomics.store(cancelled, 0, 1);
@@ -76,7 +78,7 @@ async function main() {
   };
   process.on('SIGINT', interrupt);
   try {
-    const modelInfo = options.engine === 'transformer' ? await runtime.start() : null;
+    const modelInfo = isNeuralEngine(options.engine) ? await runtime.start() : null;
     worker = new Worker(new URL('./worker.js', import.meta.url), {
       workerData: { position: game.position, options, model: modelInfo?.model, cancelBuffer: cancelled.buffer },
     });

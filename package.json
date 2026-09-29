@@ -25,7 +25,13 @@
     "transformer:selfplay": "node scripts/transformer-selfplay.js",
     "transformer:selfplay:continuous": "node scripts/transformer-selfplay.js --iterations 0",
     "transformer:test": "node scripts/transformer.js test",
-    "transformer:smoke": "node scripts/transformer-smoke.js"
+    "transformer:smoke": "node scripts/transformer-smoke.js",
+    "lc0:inspect": "node scripts/lc0.js inspect",
+    "lc0:data": "node scripts/lc0.js data",
+    "lc0:train": "node scripts/lc0.js train",
+    "lc0:evaluate": "node scripts/lc0.js evaluate",
+    "lc0:test": "node scripts/lc0.js test",
+    "lc0:smoke": "node scripts/lc0-smoke.js"
   },
   "dependencies": { "5d-chess-js": "1.2.1" }
 }

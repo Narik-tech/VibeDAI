@@ -10,45 +10,60 @@ let pollTimer = null;
 let toastTimer = null;
 let autoTimer = null;
 let autoRevision = null;
+let analysisGeneration = 0;
+let heuristicsPanel = null;
 let initialPosition = true;
 let rankingJob = null, selectedRankingDepth = null, visibleRankings = [];
 let recommendationSignature = '', variationSignature = '', continuationAnimation;
 const rankingTabs = new Map(), rankingRows = new Map();
 let boardSize = Number($('board-size').value);
 const searchSettingsKey = 'vibe-d-ai.search-settings.v1';
+const leelaName = 'Leela in a 5D Trenchcoat';
 const resourceSettingIds = ['time-budget', 'search-depth', 'node-budget', 'cache-memory', 'search-threads'];
 const searchSettingIds = ['engine-select', ...resourceSettingIds];
 let refreshingEngines = false;
 let engines = {
   classical: {id:'classical', available:true},
   transformer: {id:'transformer', available:false, status:'checking'},
+  leela: {id:'leela', name:leelaName, available:false, status:'checking'},
 };
 function selectedEngine() { return $('engine-select').value; }
+function neuralEngine(id = selectedEngine()) { return id === 'transformer' || id === 'leela'; }
 function engineAvailable() { return engines[selectedEngine()]?.available === true; }
+function currentHeuristicsSignature() { return selectedEngine() === 'classical' ? heuristicsPanel?.signature() || '' : ''; }
+function searchMatchesPosition(current = search) {
+  return Boolean(current && current.revision === game?.revision && current.engine === selectedEngine()
+    && (current.heuristicsSignature || '') === currentHeuristicsSignature());
+}
 function engineIdleStatus() {
   const info = engines[selectedEngine()];
   return info?.status === 'checking' ? 'CHECKING' : info?.status === 'error' ? 'ERROR' : engineAvailable() ? 'READY' : 'SETUP';
 }
 
 function renderEngine() {
-  const neural = selectedEngine() === 'transformer';
+  const neural = neuralEngine(), leela = selectedEngine() === 'leela';
   for (const option of $('search-depth').options) option.hidden = option.disabled = !neural && (Number(option.value) === 0 || Number(option.value) > 16);
   if (!neural && Number($('search-depth').value) === 0) $('search-depth').value = '4';
   if (!neural && Number($('search-depth').value) > 16) $('search-depth').value = '16';
   const info = engines[selectedEngine()] || {};
+  const name = leela ? leelaName : 'Transformer';
   const device = typeof info.device === 'string' ? ` · ${info.device}` : '';
   $('engine-readiness').textContent = neural
-    ? info.status === 'error' ? info.error || 'Transformer could not load; check setup'
-      : info.available ? info.status === 'unloaded' ? 'Checkpoint ready · loads on first analysis' : `Transformer ready${device}`
-        : info.status === 'checking' ? 'Checking transformer availability…' : info.status === 'starting' ? 'Transformer starting…' : info.error || 'Transformer setup required'
+    ? info.status === 'error' ? info.error || `${name} could not load; check setup`
+      : info.available ? info.status === 'unloaded' ? 'Checkpoint ready · loads on first analysis' : `${name} ready${device}`
+        : info.status === 'checking' ? `Checking ${name} availability…` : info.status === 'starting' ? `${name} starting…` : info.error || `${name} setup required`
     : 'Classical search ready · CPU';
   $('engine-readiness').classList.toggle('unavailable', neural && !info.available);
   $('engine-description').textContent = neural
-    ? 'Experimental learned evaluation with bounded historical context and candidate turns. Playing strength is unmeasured; legal moves use the full rules.'
+    ? leela ? `${leelaName} transfers LCZero chess features into a model with timeline attention and 5D move and value heads. Playing strength is unmeasured; legal moves use the full rules.` : 'Experimental learned evaluation with bounded historical context and candidate turns. Playing strength is unmeasured; legal moves use the full rules.'
     : 'Full-turn search with a handcrafted position evaluation.';
-  $('transformer-setup').hidden = !neural || (info.available && info.status !== 'error') || info.status === 'checking';
+  $('transformer-setup').hidden = !neural || leela || (info.available && info.status !== 'error') || info.status === 'checking';
+  $('leela-setup').hidden = !leela || (info.available && info.status !== 'error') || info.status === 'checking';
+  $('engine-checkpoint').hidden = !neural || !info.checkpoint;
+  $('engine-checkpoint').textContent = neural && info.checkpoint ? `Checkpoint: ${info.checkpoint}` : '';
+  $('opponent-engine').textContent = `Engine plays uses ${leela ? leelaName : neural ? 'Transformer' : 'Classical search'}.`;
   $('cache-memory-help').textContent = neural
-    ? 'The transformer uses its own bounded model memory. Search cache (RAM) applies to Classical search only.'
+    ? 'Neural engines use their own bounded model memory. Search cache (RAM) applies to Classical search only.'
     : 'Cache budget estimates RAM for saved search results; total RAM is higher. This CPU engine does not use GPU VRAM.';
   $('search-threads-help').textContent = neural
     ? 'Search threads apply to Classical search only.'
@@ -63,9 +78,9 @@ async function refreshEngines() {
   renderEngine();
   try {
     const data = await api('/api/engines');
-    for (const info of data.engines || []) if (info.id === 'classical' || info.id === 'transformer') engines[info.id] = info;
+    for (const info of data.engines || []) if (Object.hasOwn(engines, info.id)) engines[info.id] = info;
   } catch (error) {
-    engines.transformer = {id:'transformer', available:false, status:'error', error:`Availability check failed: ${error.message}`};
+    for (const id of ['transformer', 'leela']) engines[id] = {...engines[id], available:false, status:'error', error:`Availability check failed: ${error.message}`};
   } finally {
     refreshingEngines = false;
     renderEngine();
@@ -134,15 +149,16 @@ function updateControls() {
   $('submit-button').disabled = !hasGame || busy || !game.canSubmit;
   $('undo-button').disabled = !hasGame || busy || (!(game.pending?.length) && !(game.history?.length));
   $('new-button').disabled = busy || !hasGame;
-  $('analyze-button').disabled = !hasGame || busy || (!running && !engineAvailable());
+  $('analyze-button').disabled = !hasGame || busy || (!running && (!engineAvailable() || (selectedEngine() === 'classical' && heuristicsPanel && !heuristicsPanel.ready())));
   $('analyze-label').textContent = running ? 'Stop analysis' : 'Analyze position';
   $('analyze-button').classList.toggle('running', running);
-  $('play-button').disabled = busy || !search?.result?.bestAction || search?.revision !== game?.revision || search?.engine !== selectedEngine() || running;
+  $('play-button').disabled = busy || !search?.result?.bestAction || !searchMatchesPosition() || running;
   $('import-pgn').disabled = busy;
   $('variant').disabled = busy;
   $('ai-side').disabled = busy;
   $('engine-select').disabled = busy;
-  for (const id of resourceSettingIds) $(id).disabled = busy || running || (['cache-memory', 'search-threads'].includes(id) && selectedEngine() === 'transformer');
+  for (const id of resourceSettingIds) $(id).disabled = busy || running || (['cache-memory', 'search-threads'].includes(id) && neuralEngine());
+  heuristicsPanel?.setContext({revision: game?.revision, engine: selectedEngine(), busy});
 }
 function receiveGame(next) {
   game = next;
@@ -308,6 +324,7 @@ async function selectSquare(coord) {
   renderBoards();
 }
 async function invalidateSearch() {
+  analysisGeneration++;
   clearTimeout(pollTimer); clearTimeout(autoTimer);
   const current = search;
   search = null;
@@ -413,9 +430,9 @@ function renderResourceStats(result) {
   const cacheMb = result?.limits?.cacheMemoryMb ?? Number($('cache-memory').value);
   const usedMb = Number.isFinite(result?.cacheMemoryBytes) ? (result.cacheMemoryBytes / 1048576).toFixed(1) : null;
   $('stat-node-budget').textContent = `Max nodes: ${compactNumber(maxNodes)}`;
-  if ((search?.engine || selectedEngine()) === 'transformer') {
-    $('stat-cache').textContent = result?.model?.device ? `Model: ${result.model.device}` : 'Model: transformer';
-    $('stat-cache').title = 'Transformer inference device. GPU memory is bounded by the model configuration.';
+  if (neuralEngine(search?.engine || selectedEngine())) {
+    $('stat-cache').textContent = result?.model?.device ? `Model: ${result.model.device}` : (search?.engine || selectedEngine()) === 'leela' ? 'Model: LCZero transfer' : 'Model: transformer';
+    $('stat-cache').title = 'Neural inference device. GPU memory is bounded by the model configuration.';
     return;
   }
   $('stat-cache').textContent = cacheMb === 0 ? 'Cache: off' : `Cache: ${usedMb === null ? '—' : `≈${usedMb}`} / ${cacheMb} MiB`;
@@ -440,7 +457,7 @@ function renderAnalysis() {
   $('stat-depth').title = result ? rankedDepth
     ? `Deepest true evaluation: ${result.depth ?? 0} turns. Current best line: ${result.pvDepth ?? result.pv?.length ?? 0} turns. Deepest generated or probed turn: ${result.selectiveDepth ?? result.depth ?? 0}.`
     : `Completed full-turn depth: ${result.depth ?? 0}. Deepest visited turn: ${result.selectiveDepth ?? result.depth ?? 0}. Capture extension depth: ${result.effectiveQuiescenceDepth ?? 0}.`
-    : selectedEngine() === 'transformer' ? 'Deepest true evaluation in complete turns' : 'Deepest fully completed full-turn search';
+    : neuralEngine() ? 'Deepest true evaluation in complete turns' : 'Deepest fully completed full-turn search';
   if (result?.depthMode === 'dynamic') $('stat-depth').title += ` Dynamic mode; current depth ceiling: ${result.currentMaxDepth ?? 1} turns.`;
   $('stat-nodes').textContent = compactNumber(result?.nodes);
   $('stat-nodes').title = result ? `${(result.nodes ?? 0).toLocaleString()} search and generation work nodes` : 'Search and generation work nodes';
@@ -451,19 +468,21 @@ function renderAnalysis() {
   if (rankedDepth && !running && !result.completed && result.stoppedReason !== 'nodes') {
     note = result.bestAction ? 'A legal fallback is available; no root turn has a true evaluation yet. Allow more think time to compare continuations.' : 'No recommendation is available within the search limits.';
   }
-  if (search?.engine === 'transformer' && result) {
+  if (neuralEngine(search?.engine) && result) {
+    const name = search.engine === 'leela' ? leelaName : 'Transformer';
     const candidateLimit = result.candidateLimit ?? result.limits?.candidateLimit;
     const innerCandidateLimit = result.innerCandidateLimit ?? result.limits?.innerCandidateLimit;
     const alphaBeta = result.searchPolicy === 'transformer-bounded-alpha-beta';
     const legacyBeamWidth = alphaBeta || rankedDepth ? null : result.beamWidth ?? result.limits?.beamWidth;
     const tokenLimit = result.model?.config?.max_tokens;
+    const boardLimit = result.model?.config?.max_boards;
     let candidateScope = 'candidate turns are capped';
     if (Number.isFinite(candidateLimit)) {
       candidateScope = Number.isFinite(innerCandidateLimit)
         ? candidateLimit === innerCandidateLimit ? `up to ${candidateLimit} candidate turns per position` : `up to ${candidateLimit} root / ${innerCandidateLimit} reply candidate turns`
         : `up to ${candidateLimit} root candidate turns`;
     }
-    const details = [`${adaptiveDepth ? 'Transformer adaptive depth search' : rankedDepth ? 'Transformer ranked depth search' : alphaBeta ? 'Transformer alpha-beta search' : 'Selective transformer search'}; ${candidateScope}${Number.isFinite(legacyBeamWidth) ? `; best ${legacyBeamWidth} deepened` : ''}.`];
+    const details = [`${name}: ${adaptiveDepth ? 'adaptive depth search' : rankedDepth ? 'ranked depth search' : alphaBeta ? 'alpha-beta search' : 'selective search'}; ${candidateScope}${Number.isFinite(legacyBeamWidth) ? `; best ${legacyBeamWidth} deepened` : ''}.`];
     if (rankedDepth) {
       if (result.depthMode === 'dynamic') details.push(adaptiveDepth
         ? `Dynamic depth; current ceiling: ${result.currentMaxDepth ?? 1} turns. Leading alternatives and their strongest replies are checked before deepening.`
@@ -479,6 +498,7 @@ function renderAnalysis() {
       if (depths.length) details.push(`Searched moves by depth: ${depths.map(item => `${item.depth}: ${item.searchedMoves === null ? 'no candidates' : item.searchedMoves}`).join(' · ')}.`);
     }
     if (Number.isFinite(tokenLimit)) details.push(`Model context: ${tokenLimit} tokens.`);
+    if (Number.isFinite(boardLimit)) details.push(`Spatial context: up to ${boardLimit} boards.`);
     if (result.contextTruncated) details.push('Historical context was truncated for the model. Full history still determines legality.');
     if (result.frontierTruncated) details.push('The position exceeds model context; some current-board features were omitted.');
     note = [note, ...details].filter(Boolean).join(' ');
@@ -514,19 +534,26 @@ function renderAnalysis() {
 }
 async function startAnalysis(autoPlay = false) {
   if (busy || !game || search?.status === 'running' || !engineAvailable()) return;
+  if (selectedEngine() === 'classical' && heuristicsPanel && !heuristicsPanel.ready()) return;
   if (!$('node-budget').reportValidity()) { if (autoPlay) autoRevision = null; return; }
   const options = {
     engine: selectedEngine(),
     timeMs: Number($('time-budget').value), maxDepth: Number($('search-depth').value),
-    maxNodes: Number($('node-budget').value), cacheMemoryMb: selectedEngine() === 'transformer' ? 0 : Number($('cache-memory').value),
-    threads: selectedEngine() === 'transformer' ? 1 : Number($('search-threads').value),
+    maxNodes: Number($('node-budget').value), cacheMemoryMb: neuralEngine() ? 0 : Number($('cache-memory').value),
+    threads: neuralEngine() ? 1 : Number($('search-threads').value),
+    ...(selectedEngine() === 'classical' && heuristicsPanel ? {heuristics: heuristicsPanel.configuration()} : {}),
   };
   saveSearchSettings();
   const revision = game.revision;
+  const generation = ++analysisGeneration, heuristicsSignature = currentHeuristicsSignature();
   setBusy(true);
   try {
     const data = await api('/api/analyze', options);
-    search = {id:data.jobId,revision,engine:options.engine,status:'running',result:null,progress:null,autoPlay};
+    if (generation !== analysisGeneration || revision !== game?.revision || options.engine !== selectedEngine() || heuristicsSignature !== currentHeuristicsSignature()) {
+      try { await api(`/api/analysis/${encodeURIComponent(data.jobId)}/stop`,{}); } catch { /* Discarded jobs cannot update this position. */ }
+      return;
+    }
+    search = {id:data.jobId,revision,engine:options.engine,heuristicsSignature,status:'running',result:null,progress:null,autoPlay};
     renderAnalysis();
     pollTimer = setTimeout(pollAnalysis,100);
   } catch (error) { toast(error.message,true); }
@@ -539,18 +566,18 @@ async function pollAnalysis() {
   const pollStarted = performance.now();
   try {
     const data = await api(`/api/analysis/${encodeURIComponent(current.id)}`);
-    if (search !== current) return;
+    if (search !== current || !searchMatchesPosition(current)) return;
     current.status = data.status;
     if (data.progress) current.progress = data.progress;
     if (data.result) current.result = data.result;
     renderAnalysis();
     if (data.status === 'error') { toast(data.error || 'The engine could not complete this analysis.',true); }
-    else if (data.status === 'done' && current.autoPlay && current.engine === selectedEngine() && current.revision === game.revision && current.result?.bestAction && $('ai-side').value === sideLabel().toLowerCase()) await playBest();
+    else if (data.status === 'done' && current.autoPlay && searchMatchesPosition(current) && current.result?.bestAction && $('ai-side').value === sideLabel().toLowerCase()) await playBest();
   } catch (error) {
     if (search === current) { current.status = 'error'; renderAnalysis(); toast(error.message,true); }
   } finally {
     current.polling = false;
-    if (search === current && current.status === 'running') pollTimer = setTimeout(pollAnalysis, Math.max(0, 100 - (performance.now() - pollStarted)));
+    if (search === current && searchMatchesPosition(current) && current.status === 'running') pollTimer = setTimeout(pollAnalysis, Math.max(0, 100 - (performance.now() - pollStarted)));
   }
 }
 async function stopAnalysis() {
@@ -561,7 +588,7 @@ async function stopAnalysis() {
   catch (error) { toast(error.message,true); }
 }
 async function playBest() {
-  if (busy || !search?.result?.bestAction || search.revision !== game?.revision || search.engine !== selectedEngine()) return;
+  if (busy || search?.status === 'running' || !search?.result?.bestAction || !searchMatchesPosition()) return;
   setBusy(true);
   try {
     const next = await api('/api/play',{jobId:search.id,revision:game.revision});
@@ -571,7 +598,7 @@ async function playBest() {
 }
 function scheduleOpponent() {
   clearTimeout(autoTimer);
-  if (!game || busy || !engineAvailable() || search?.status === 'running' || game.pending?.length || $('ai-side').value !== sideLabel().toLowerCase() || autoRevision === game.revision) return;
+  if (!game || busy || !engineAvailable() || (selectedEngine() === 'classical' && heuristicsPanel && !heuristicsPanel.ready()) || search?.status === 'running' || game.pending?.length || $('ai-side').value !== sideLabel().toLowerCase() || autoRevision === game.revision) return;
   autoRevision = game.revision;
   autoTimer = setTimeout(() => startAnalysis(true),250);
 }
@@ -635,9 +662,21 @@ document.addEventListener('keydown',(event) => {
 window.addEventListener('resize',positionPresentLine);
 for (const dialog of document.querySelectorAll('dialog')) dialog.addEventListener('click',(event) => { if (event.target === dialog) { const rect = dialog.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close(); } });
 if (window.innerWidth < 570) { boardSize = 34; $('board-size').value = '34'; }
+const {createHeuristicsPanel} = await import('/heuristics.js');
+heuristicsPanel = createHeuristicsPanel({
+  api,
+  boardLabel: board => `${timelineLabel(board.timeline)}L · ${timeLabel(board.turn)} ${board.turn % 2 ? 'Black' : 'White'}`,
+  onChange: () => {
+    // Keep a late poll or queued automatic turn from applying an old profile.
+    autoRevision = game?.revision ?? null;
+    void invalidateSearch();
+  },
+  onReady: () => { updateControls(); scheduleOpponent(); },
+});
 restoreSearchSettings();
 renderEngine();
 renderResourceStats();
+void heuristicsPanel.load();
 refreshEngines();
 try { receiveGame(await api('/api/game')); }
 catch (error) {

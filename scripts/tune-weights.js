@@ -57,6 +57,10 @@ try {
     const directory = resolve(output, profile.id);
     await mkdir(directory);
     for (const file of ['search.js', 'rules.js', 'search-cache.js']) await copyFile(resolve(baselineDir, file), resolve(directory, file));
+    for (const file of ['royal-safety.js', 'heuristics.js']) {
+      try { await copyFile(resolve(baselineDir, file), resolve(directory, file)); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
     let source = evaluator;
     for (const [from, to] of profile.replace || []) {
       if (source.split(from).length !== 2) throw new Error(`Profile ${profile.id} is incompatible with this evaluator: ${from}`);

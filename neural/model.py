@@ -112,6 +112,18 @@ def collate(encoded, device):
     return tuple(tensor.to(device) for tensor in (categories, coordinates, global_features, padding))
 
 
+def encode_for_model(model, position):
+    """Use the model's position representation while preserving legacy inputs."""
+    encoder = getattr(model, "encode_position", None)
+    return encoder(position) if encoder is not None else encode_position(position, model.config.max_tokens)
+
+
+def collate_for_model(model, encoded, device):
+    """Batch a model-specific representation, or the original token encoding."""
+    collator = getattr(model, "collate", None)
+    return collator(encoded, device) if collator is not None else collate(encoded, device)
+
+
 def choose_device(requested="auto"):
     if requested not in ("auto", "cpu", "cuda"):
         raise ValueError("device must be auto, cpu, or cuda")
@@ -131,6 +143,12 @@ def load_checkpoint(path, device, max_tokens=MAX_TOKENS):
     if not path.is_file():
         raise FileNotFoundError(f"Transformer checkpoint not found: {path}. Generate training data and run neural/train.py; see docs/transformer.md.")
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    if isinstance(checkpoint, dict) and checkpoint.get("architecture") == "5d-lc0-transfer-v1":
+        try:
+            from .lc0_model import load_transfer_checkpoint
+        except ImportError:
+            from lc0_model import load_transfer_checkpoint
+        return load_transfer_checkpoint(checkpoint, device, max_tokens=max_tokens), checkpoint
     if not isinstance(checkpoint, dict) or checkpoint.get("architecture") != ARCHITECTURE:
         raise ValueError("checkpoint architecture is incompatible with this engine")
     if checkpoint.get("encodingVersion") != ENCODING_VERSION:
@@ -153,13 +171,17 @@ def load_checkpoint(path, device, max_tokens=MAX_TOKENS):
 
 
 def metadata(model, checkpoint, path):
-    return {"architecture": ARCHITECTURE, "config": asdict(model.config),
+    result = {"architecture": checkpoint.get("architecture", ARCHITECTURE), "config": asdict(model.config),
             "parameters": sum(parameter.numel() for parameter in model.parameters()),
             "trainedSteps": checkpoint["trainedSteps"], "checkpoint": str(Path(path).resolve()),
             "policyAvailable": model.policy_trained_steps > 0,
             "policyTrainedSteps": model.policy_trained_steps,
             "policyVersion": POLICY_VERSION if model.config.policy_head else None,
             "label": checkpoint.get("label", "Locally trained experimental value model")}
+    baseline = getattr(model, "baseline_metadata", checkpoint.get("baseline"))
+    if baseline is not None:
+        result["baseline"] = baseline
+    return result
 
 
 def predict(model, positions, device, batch_size=16):
@@ -167,8 +189,8 @@ def predict(model, positions, device, batch_size=16):
     values, contexts = [], []
     with torch.inference_mode():
         for start in range(0, len(positions), batch_size):
-            encoded = [encode_position(position, model.config.max_tokens) for position in positions[start:start + batch_size]]
-            batch = collate(encoded, device)
+            encoded = [encode_for_model(model, position) for position in positions[start:start + batch_size]]
+            batch = collate_for_model(model, encoded, device)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
                 prediction = model(*batch)
             if not torch.isfinite(prediction).all():
@@ -183,15 +205,18 @@ def predict(model, positions, device, batch_size=16):
 def predict_policy(model, position, moves, device):
     # Validate the protocol even for a legacy model, but never return random
     # policy logits from an absent or merely initialized head.
-    features = encode_moves(position, moves)
+    # Transfer models also encode a rules-supplied SUBMIT candidate (null).
+    # Candidate generation and legal turn submission remain owned by search.
+    move_encoder = getattr(model, "encode_moves", encode_moves)
+    features = move_encoder(position, moves)
     if not model.config.policy_head or model.policy_trained_steps < 1:
         return None
     model.eval()
-    encoded = encode_position(position, model.config.max_tokens)
+    encoded = encode_for_model(model, position)
     with torch.inference_mode():
         inputs, mask = collate_moves([features], device)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            context = model.encode(*collate([encoded], device))
+            context = model.encode(*collate_for_model(model, [encoded], device))
             scores = model.score_moves(context, inputs, mask)[0]
         if not torch.isfinite(scores).all():
             raise RuntimeError("model returned nonfinite policy scores")

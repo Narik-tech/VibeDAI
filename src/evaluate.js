@@ -1,8 +1,22 @@
 import { raw } from './rules.js';
+import { HEURISTIC_SETTINGS, normalizeHeuristics } from './heuristics.js';
 
 // Centipawn values are deliberately conservative, hand-tuned starting values.
 // A queen's extra dimensional freedom is worth substantially more than in 2D.
 export const PIECE_VALUES = Object.freeze([0, 100, 355, 340, 550, 1150, 0, 900, 140, 370, 0, 450, 350]);
+const VALUE_KEYS = [null, 'pawnValue', 'bishopValue', 'knightValue', 'rookValue', 'queenValue', null,
+  'princessValue', 'brawnValue', 'commonKingValue', null, 'unicornValue', 'dragonValue'];
+const FEATURE_COMPONENTS = Object.freeze({
+  ...Object.fromEntries(VALUE_KEYS.filter(Boolean).map(key => [key, 'material'])),
+  ...Object.fromEntries(['pawnAdvanceWeight', 'pawnCenterWeight', 'doubledPawnWeight', 'isolatedPawnWeight',
+    'passedPawnWeight', 'knightCenterWeight', 'bishopCenterWeight', 'pieceCenterWeight', 'royalCenterWeight',
+    'mobilityWeight', 'developmentWeight', 'rookFileWeight'].map(key => [key, 'activity'])),
+  ...Object.fromEntries(['shelterWeight', 'nearbyEnemyWeight', 'flankSafetyWeight', 'corridorWeight',
+    'worstKingWeight'].map(key => [key, 'kingSafety'])),
+  temporalPressureWeight: 'temporal', reserveWeight: 'timelines', overextensionWeight: 'timelines',
+  weakBoardWeight: 'timelines', travelOpportunityWeight: 'travel',
+});
+const FEATURE_SETTINGS = HEURISTIC_SETTINGS.filter(entry => FEATURE_COMPONENTS[entry.key]);
 const ROYAL_TYPES = new Set([6, 10]);
 const KNIGHT_STEPS = [[1, 2], [2, 1], [-1, 2], [-2, 1], [1, -2], [2, -1], [-1, -2], [-2, -1]];
 const AXES = [[1, 0], [-1, 0], [0, 1], [0, -1]];
@@ -22,8 +36,9 @@ const MOVEMENT = Array.from({ length: PIECE_VALUES.length }, (_, type) => {
   return { steps, rays };
 });
 
-export function pieceValue(piece) {
-  return PIECE_VALUES[Math.ceil(Math.abs(piece || 0) / 2)] || 0;
+export function pieceValue(piece, heuristics) {
+  const values = normalizeHeuristics(heuristics);
+  return values[VALUE_KEYS[Math.ceil(Math.abs(piece || 0) / 2)]] || 0;
 }
 
 function owner(piece) { return Math.abs(piece) % 2; }
@@ -33,7 +48,7 @@ function timelineCoordinate(index, even) {
   return even && value > 0 ? value - 1 : value;
 }
 
-function timelineResources(board) {
+function timelineResources(board, heuristics) {
   // The rules allocate beyond each side's outermost index, even when a custom
   // position has holes. Index zero is shared; even/odd branches belong to W/B.
   const spent = [0, 0];
@@ -42,9 +57,9 @@ function timelineResources(board) {
   const excess = spent.map((used, color) => Math.max(0, used - spent[1 - color] - 1));
   // The first unreciprocated branch spends our reserve and gives the opponent
   // another: a 180cp hurdle. Further inactive branches carry an extra burden.
-  const score = 90 * (Math.min(4, available[0]) - Math.min(4, available[1]))
-    + 45 * (Math.min(3, excess[1]) - Math.min(3, excess[0]));
-  return { available, score };
+  const reserve = 90 * (Math.min(4, available[0]) - Math.min(4, available[1])) * heuristics.reserveWeight;
+  const overextension = 45 * (Math.min(3, excess[1]) - Math.min(3, excess[0])) * heuristics.overextensionWeight;
+  return { available, reserve, overextension, score: reserve + overextension };
 }
 
 function temporalAttack(board, attacker, king, even) {
@@ -171,24 +186,28 @@ function spatialActivity(board, r, f, type, color) {
 
 // Evaluate only the frontier of each timeline, never add up historical copies.
 // Inactive timelines retain some value because they can reactivate later.
-export function evaluateDetailed(position) {
+function evaluatePosition(position, heuristics, inspect = false) {
+  const settings = normalizeHeuristics(heuristics);
   const { board } = position;
   const active = new Set(raw.boardFuncs.active(board));
   const even = raw.boardFuncs.isEvenTimeline(board);
-  const resources = timelineResources(board);
+  const resources = timelineResources(board, settings);
   const totals = { material: 0, activity: 0, kingSafety: 0, temporal: 0, timelines: 0, travel: 0 };
   const royals = [], entryPawns = [], attackers = [], frontier = [];
   let totalWeight = 0;
   const worstKing = [0, 0];
+  const featureValues = inspect ? Object.fromEntries(FEATURE_SETTINGS.map(entry => [entry.key, 0])) : null;
+  const boards = inspect ? [] : null;
   for (let l = 0; l < board.length; l++) {
     const timeline = board[l];
     if (!timeline?.length) continue;
     const t = timeline.length - 1, squares = timeline[t];
     if (!squares) continue;
-    const weight = active.has(l) ? 1 : 0.2;
+    const weight = active.has(l) ? 1 : settings.inactiveWeight;
     const line = timelineCoordinate(l, even);
     totalWeight += weight;
     let material = 0, activity = 0, kingSafety = 0;
+    const record = inspect ? (key, value) => { featureValues[key] += weight * value; } : null;
     const pawns = [[], []], pieces = [], kings = [];
     let phase = 0;
     for (let r = 0; r < squares.length; r++) {
@@ -198,14 +217,16 @@ export function evaluateDetailed(position) {
         const type = Math.ceil(Math.abs(piece) / 2), color = owner(piece), sign = signFor(color);
         const entry = { l, line, t, r, f, piece, type, color, weight };
         pieces.push(entry);
-        material += sign * pieceValue(piece);
-        if ([2, 3, 4, 5, 7].includes(type)) phase += pieceValue(piece);
+        const value = settings[VALUE_KEYS[type]] || 0;
+        material += sign * value;
+        if (record && VALUE_KEYS[type]) record(VALUE_KEYS[type], sign * value);
+        if ([2, 3, 4, 5, 7].includes(type)) phase += value;
         if (type === 1 || type === 8) pawns[color].push(entry);
         if (ROYAL_TYPES.has(type)) { kings.push(entry); royals.push(entry); }
         attackers.push(entry);
       }
     }
-    const middleGame = Math.min(1, phase / 6000);
+    const middleGame = Math.min(1, phase / settings.phaseDivisor);
     const enemyTypes = [0, 1].map(color => [...new Set(pieces.filter(p => p.color !== color).map(p => p.type))]);
     const zoneRisk = [0, 0];
     // Keep the first king zone of each half-turn color as well as recent history:
@@ -225,7 +246,7 @@ export function evaluateDetailed(position) {
       const pastKings = past === t ? kings : [];
       if (past !== t) for (let r = 0; r < snapshot.length; r++) for (let f = 0; f < snapshot[r].length; f++) {
         const piece = snapshot[r][f];
-        if (ROYAL_TYPES.has(Math.ceil(Math.abs(piece) / 2))) pastKings.push({ l, line, t: past, r, f, color: owner(piece), weight: weight * 0.65 });
+        if (ROYAL_TYPES.has(Math.ceil(Math.abs(piece) / 2))) pastKings.push({ l, line, t: past, r, f, color: owner(piece), weight: weight * settings.historicalPressureWeight });
       }
       const risk = [0, 0];
       for (const target of kingZone(snapshot, pastKings)) {
@@ -238,7 +259,7 @@ export function evaluateDetailed(position) {
       }
       // Shelter matters most with armies still on the board. Use the worst
       // snapshot rather than multiplying a weakness by its historical copies.
-      for (const color of [0, 1]) zoneRisk[color] = Math.max(zoneRisk[color], risk[color] * middleGame);
+      for (const color of [0, 1]) zoneRisk[color] = Math.max(zoneRisk[color], risk[color] * middleGame * settings.corridorWeight);
     }
     for (const entry of pieces) {
       const { r, f, type, color, piece } = entry, sign = signFor(color);
@@ -246,19 +267,41 @@ export function evaluateDetailed(position) {
       const center = (squares.length - 1) / 2;
       const centrality = Math.max(0, 4 - (Math.abs(r - center) + Math.abs(f - (squares[r].length - 1) / 2)) / 2);
       if (type === 1 || type === 8) {
-        activity += sign * (rank * 7 + Math.max(0, rank - 3) ** 2 * 7 + centrality * 3);
+        const advance = (rank * 7 + Math.max(0, rank - 3) ** 2 * 7) * settings.pawnAdvanceWeight;
+        const centerScore = centrality * 3 * settings.pawnCenterWeight;
+        activity += sign * (advance + centerScore);
+        if (record) { record('pawnAdvanceWeight', sign * advance); record('pawnCenterWeight', sign * centerScore); }
         const sameFile = pawns[color].filter(p => p.f === f).length;
-        if (sameFile > 1) activity -= sign * 9;
-        if (!pawns[color].some(p => Math.abs(p.f - f) === 1)) activity -= sign * 9;
+        if (sameFile > 1) {
+          activity -= sign * 9 * settings.doubledPawnWeight;
+          if (record) record('doubledPawnWeight', -sign * 9 * settings.doubledPawnWeight);
+        }
+        if (!pawns[color].some(p => Math.abs(p.f - f) === 1)) {
+          activity -= sign * 9 * settings.isolatedPawnWeight;
+          if (record) record('isolatedPawnWeight', -sign * 9 * settings.isolatedPawnWeight);
+        }
         if (!pawns[1 - color].some(p => Math.abs(p.f - f) <= 1 && (color === 0 ? p.r > r : p.r < r))) {
-          activity += sign * (8 + rank * rank * 2);
+          const passed = sign * (8 + rank * rank * 2) * settings.passedPawnWeight;
+          activity += passed;
+          if (record) record('passedPawnWeight', passed);
         }
       } else if (!ROYAL_TYPES.has(type)) {
         const mobility = spatialActivity(squares, r, f, type, color);
         const centralWeight = type === 3 ? 11 : type === 2 ? 6 : 3;
-        activity += sign * (mobility * (type === 5 ? 2 : 4) + centrality * centralWeight);
-        if (piece < 0 && [2, 3].includes(type)) activity -= sign * 12 * middleGame;
-        if (type === 4 && !pawns[color].some(p => p.f === f)) activity += sign * 14;
+        const centralKey = type === 3 ? 'knightCenterWeight' : type === 2 ? 'bishopCenterWeight' : 'pieceCenterWeight';
+        const mobilityScore = mobility * (type === 5 ? 2 : 4) * settings.mobilityWeight;
+        const centerScore = centrality * centralWeight * settings[centralKey];
+        activity += sign * (mobilityScore + centerScore);
+        if (record) { record('mobilityWeight', sign * mobilityScore); record(centralKey, sign * centerScore); }
+        if (piece < 0 && [2, 3].includes(type)) {
+          const development = sign * 12 * middleGame * settings.developmentWeight;
+          activity -= development;
+          if (record) record('developmentWeight', -development);
+        }
+        if (type === 4 && !pawns[color].some(p => p.f === f)) {
+          activity += sign * 14 * settings.rookFileWeight;
+          if (record) record('rookFileWeight', sign * 14 * settings.rookFileWeight);
+        }
       } else {
         let shield = 0, nearbyEnemies = 0;
         const forward = color === 0 ? 1 : -1;
@@ -269,17 +312,31 @@ export function evaluateDetailed(position) {
         for (const enemy of pieces) {
           if (enemy.color !== color && enemy.type !== 1 && Math.max(Math.abs(enemy.r - r), Math.abs(enemy.f - f)) <= 3) nearbyEnemies++;
         }
-        const risk = Math.max(0, (3 - shield) * 12 * middleGame + nearbyEnemies * 8 - (rank === 0 && (f <= 2 || f >= squares[r].length - 2) ? 15 : 0));
+        const shelter = (3 - shield) * 12 * middleGame * settings.shelterWeight;
+        const nearby = nearbyEnemies * 8 * settings.nearbyEnemyWeight;
+        const flank = (rank === 0 && (f <= 2 || f >= squares[r].length - 2) ? 15 : 0) * settings.flankSafetyWeight;
+        const risk = Math.max(0, shelter + nearby - flank);
         kingSafety -= sign * risk;
-        activity += sign * centrality * 10 * (1 - middleGame);
+        const royalCenter = sign * centrality * 10 * (1 - middleGame) * settings.royalCenterWeight;
+        activity += royalCenter;
+        if (record) {
+          record('shelterWeight', -sign * shelter);
+          record('nearbyEnemyWeight', -sign * nearby);
+          // Credit only the actual reduction: danger is floored at zero.
+          record('flankSafetyWeight', sign * Math.min(flank, shelter + nearby));
+          record('royalCenterWeight', royalCenter);
+        }
         if (active.has(l)) worstKing[color] = Math.max(worstKing[color], risk + zoneRisk[color]);
       }
     }
     kingSafety += zoneRisk[1] - zoneRisk[0];
+    if (record) record('corridorWeight', zoneRisk[1] - zoneRisk[0]);
     totals.material += weight * material;
     totals.activity += weight * activity;
     totals.kingSafety += weight * kingSafety;
     frontier.push({ l, t, weight, material });
+    if (inspect) boards.push({ timeline: l, coordinate: line, turn: t, active: active.has(l), weight, material: weight * material,
+      activity: weight * activity, kingSafety: weight * kingSafety, phase: middleGame });
     // Sample historical royal squares for potential time attacks. Historical
     // copies contribute pressure only, never additional material.
     for (let past = t - 2, sampled = 0; past >= 0 && sampled < 6; past -= 2, sampled++) {
@@ -287,15 +344,21 @@ export function evaluateDetailed(position) {
       if (!snapshot) continue;
       for (let r = 0; r < snapshot.length; r++) for (let f = 0; f < snapshot[r].length; f++) {
         const piece = snapshot[r][f], type = Math.ceil(Math.abs(piece || 0) / 2);
-        if (ROYAL_TYPES.has(type)) royals.push({ l, line, t: past, r, f, color: owner(piece), weight: weight * 0.65 });
+        if (ROYAL_TYPES.has(type)) royals.push({ l, line, t: past, r, f, color: owner(piece), weight: weight * settings.historicalPressureWeight });
       }
     }
   }
-  if (!totalWeight) return { ...totals, total: 0 };
+  if (!totalWeight) return finishEvaluation(totals, settings, featureValues, boards);
   for (const key of ['material', 'activity', 'kingSafety']) totals[key] /= totalWeight;
+  if (inspect) {
+    for (const key of Object.keys(featureValues)) featureValues[key] /= totalWeight;
+    for (const entry of boards) for (const key of ['material', 'activity', 'kingSafety']) entry[key] /= totalWeight;
+  }
   // One weak king can lose an otherwise healthy multiverse; averaging alone
   // would hide that weakness as more timelines are created.
-  totals.kingSafety += (worstKing[1] - worstKing[0]) * 0.45;
+  const worstKingScore = (worstKing[1] - worstKing[0]) * 0.45 * settings.worstKingWeight;
+  totals.kingSafety += worstKingScore;
+  if (inspect) featureValues.worstKingWeight = worstKingScore;
 
   // Reward unobstructed temporal attacks, including those by royal and fairy
   // pieces. This remains potential pressure, not a complete-turn check test.
@@ -304,7 +367,7 @@ export function evaluateDetailed(position) {
     let best = 0;
     for (const king of royals) {
       if (king.color === attacker.color || (king.l === attacker.l && king.t === attacker.t)) continue;
-      if (temporalAttack(board, attacker, king, even)) best = Math.max(best, 20 * Math.min(attacker.weight, king.weight));
+      if (temporalAttack(board, attacker, king, even)) best = Math.max(best, 20 * Math.min(attacker.weight, king.weight) * settings.temporalPressureWeight);
     }
     pressure[attacker.color] += best;
     if (!resources.available[attacker.color] || ROYAL_TYPES.has(attacker.type)) continue;
@@ -316,25 +379,55 @@ export function evaluateDetailed(position) {
       if (target.color === attacker.color || !temporalAttack(board, source, target, even)) continue;
       // Reserve is a scarce option. Count the best entry once, rather than
       // multiplying it by attackers, parallel boards, or historical copies.
-      const value = 140 * (ready ? 1 : 0.5) * Math.min(1, pieceValue(attacker.piece) / 340)
-        * Math.min(attacker.weight, target.weight);
+      const value = 140 * (ready ? 1 : 0.5) * Math.min(1, pieceValue(attacker.piece, settings) / 340)
+        * Math.min(attacker.weight, target.weight) * settings.travelOpportunityWeight;
       travel[attacker.color] = Math.max(travel[attacker.color], value);
     }
   }
   totals.temporal = Math.max(-100, Math.min(100, pressure[0] - pressure[1]));
   totals.travel = travel[0] - travel[1];
   totals.timelines = resources.score;
+  if (inspect) {
+    featureValues.temporalPressureWeight = totals.temporal;
+    featureValues.travelOpportunityWeight = totals.travel;
+    featureValues.reserveWeight = resources.reserve;
+    featureValues.overextensionWeight = resources.overextension;
+  }
   // Additional boards require defending additional kings. Penalize a frontier
   // material weakness that averaging would otherwise conceal.
   const activeFrontier = frontier.filter(b => active.has(b.l));
   if (activeFrontier.length > 1) {
     const low = Math.min(...activeFrontier.map(b => b.material));
     const high = Math.max(...activeFrontier.map(b => b.material));
-    totals.timelines += (Math.min(0, low) + Math.max(0, high)) * 0.12;
+    const weakBoard = (Math.min(0, low) + Math.max(0, high)) * 0.12 * settings.weakBoardWeight;
+    totals.timelines += weakBoard;
+    if (inspect) featureValues.weakBoardWeight = weakBoard;
   }
-  const total = Math.round(Object.values(totals).reduce((a, b) => a + b, 0));
-  return { ...Object.fromEntries(Object.entries(totals).map(([k, v]) => [k, Math.round(v)])), total };
+  return finishEvaluation(totals, settings, featureValues, boards);
 }
 
+function finishEvaluation(totals, settings, featureValues, boards) {
+  for (const key of Object.keys(totals)) totals[key] *= settings[`${key}Weight`];
+  const total = Math.round(Object.values(totals).reduce((a, b) => a + b, 0));
+  const result = { ...Object.fromEntries(Object.entries(totals).map(([k, v]) => [k, Math.round(v)])), total };
+  if (featureValues) {
+    result.features = FEATURE_SETTINGS.map(({ key, label, description }) => ({ key, label, description,
+      component: FEATURE_COMPONENTS[key], value: featureValues[key] * settings[`${FEATURE_COMPONENTS[key]}Weight`] }));
+    result.boards = boards.map(entry => ({ ...entry, ...Object.fromEntries(['material', 'activity', 'kingSafety']
+      .map(key => [key, entry[key] * settings[`${key}Weight`]])) }));
+  }
+  return result;
+}
+
+/** Rounded component scores; their individual rounding can differ from total. */
+export function evaluateDetailed(position, heuristics) { return evaluatePosition(position, heuristics); }
+
+/** Actual signed feature contributions after board and component weighting.
+ * Features retain precision and sum to total before its final cp rounding.
+ * Board contributions cover the averaged components; weakest-royal and
+ * multiverse terms are global and are listed separately in features.
+ */
+export function inspectEvaluation(position, heuristics) { return evaluatePosition(position, heuristics, true); }
+
 /** Positive values favor White. Mate scores are assigned by search only. */
-export function evaluate(position) { return evaluateDetailed(position).total; }
+export function evaluate(position, heuristics) { return evaluateDetailed(position, heuristics).total; }
