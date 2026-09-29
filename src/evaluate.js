@@ -83,10 +83,10 @@ function timelineResources(board, heuristics) {
   return { available, reserve, overextension, score: reserve + overextension };
 }
 
-function temporalAttack(board, attacker, king, even) {
+function temporalAttack(board, attacker, king, even, sourceTime = attacker.t) {
   // Half-turn boards of different colors cannot be connected by a move.
-  if ((attacker.t - king.t) % 2) return false;
-  const dl = king.line - attacker.line, dt = (king.t - attacker.t) / 2;
+  if ((sourceTime - king.t) % 2) return false;
+  const dl = king.line - attacker.line, dt = (king.t - sourceTime) / 2;
   const dr = king.r - attacker.r, df = king.f - attacker.f;
   if (attacker.type === 1 || attacker.type === 8) {
     const forward = attacker.color === 0 ? 1 : -1;
@@ -110,7 +110,7 @@ function temporalAttack(board, attacker, king, even) {
   if (!movement.rays[rayKey(sl, st, sr, sf)]) return false;
   for (let offset = 1; offset < distance; offset++) {
     const line = raw.pieceFuncs.timelineMove(attacker.l, sl * offset, even);
-    const square = board[line]?.[attacker.t + st * offset * 2]?.[attacker.r + sr * offset]?.[attacker.f + sf * offset];
+    const square = board[line]?.[sourceTime + st * offset * 2]?.[attacker.r + sr * offset]?.[attacker.f + sf * offset];
     // Rays stop at occupied squares and at gaps in the multiverse. Leapers,
     // checked above, do not require intermediate boards or squares to exist.
     if (square !== 0) return false;
@@ -241,7 +241,9 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
   const even = raw.boardFuncs.isEvenTimeline(board);
   const resources = timelineResources(board, settings);
   const totals = { material: 0, activity: 0, kingSafety: 0, temporal: 0, timelines: 0, travel: 0 };
-  const royals = [], entryPawns = [], attackers = [], frontier = [];
+  // Temporal attacks can only reach the opposite color on the same half-turn
+  // parity. Group targets once, preserving their order within each group.
+  const royals = [[], [], [], []], entryPawns = [[], [], [], []], attackers = [], frontier = [];
   let totalWeight = 0;
   const worstKing = [0, 0];
   const featureValues = inspect ? Object.fromEntries(FEATURE_SETTINGS.map(entry => [entry.key, 0])) : null;
@@ -277,7 +279,7 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
           if (color === 1 || pawnRanks[color][f] === undefined) pawnRanks[color][f] = r;
         }
         enemyCorridors[1 - color] |= MOVEMENT[type].corridors[1 - color];
-        if (ROYAL_TYPES.has(type)) { kings.push(entry); royals.push(entry); }
+        if (ROYAL_TYPES.has(type)) { kings.push(entry); royals[color * 2 + t % 2].push(entry); }
         attackers.push(entry);
       }
     }
@@ -301,7 +303,7 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
       // These snapshots were just scanned for king zones. Reuse their royals
       // for temporal pressure instead of scanning the same boards again below.
       if (past < t && past >= t - 12 && (t - past) % 2 === 0) {
-        for (const king of targets.kings) royals.push({ l, line, t: past, r: king.r, f: king.f,
+        for (const king of targets.kings) royals[king.color * 2 + past % 2].push({ l, line, t: past, r: king.r, f: king.f,
           color: king.color, weight: weight * settings.historicalPressureWeight });
       }
       const risk = [0, 0];
@@ -310,7 +312,7 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
         if (past < t && target.pawn && target.defenders === 0 && resources.available[1 - target.color] > 0) {
           // Being historical is what makes this an entry opportunity; unlike
           // royal pressure, it should not itself discount the target's value.
-          entryPawns.push({ l, line, t: past, r: target.r, f: target.f, color: target.color, weight });
+          entryPawns[target.color * 2 + past % 2].push({ l, line, t: past, r: target.r, f: target.f, color: target.color, weight });
         }
       }
       // Shelter matters most with armies still on the board. Use the worst
@@ -415,8 +417,11 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
   const pressure = [0, 0], travel = [0, 0];
   for (const attacker of attackers) {
     let best = 0;
-    for (const king of royals) {
-      if (king.color === attacker.color || (king.l === attacker.l && king.t === attacker.t)) continue;
+    const enemyGroup = (1 - attacker.color) * 2;
+    const maxPressure = 20 * attacker.weight * settings.temporalPressureWeight;
+    for (const king of royals[enemyGroup + attacker.t % 2]) {
+      if (best >= maxPressure) break;
+      if (king.l === attacker.l && king.t === attacker.t) continue;
       if (temporalAttack(board, attacker, king, even)) best = Math.max(best, 20 * Math.min(attacker.weight, king.weight) * settings.temporalPressureWeight);
     }
     pressure[attacker.color] += best;
@@ -424,9 +429,14 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
     // On the other player's half-turn, the current arrangement can prepare a
     // route on our next board. Discount that projection: the reply may stop it.
     const ready = attacker.t % 2 === attacker.color;
-    const source = ready ? attacker : { ...attacker, t: attacker.t + 1 };
-    for (const target of entryPawns) {
-      if (target.color === attacker.color || !temporalAttack(board, source, target, even)) continue;
+    const sourceTime = ready ? attacker.t : attacker.t + 1;
+    const maxTravel = 140 * (ready ? 1 : 0.5) * Math.min(1, pieceValues[attacker.type] / 340)
+      * attacker.weight * settings.travelOpportunityWeight;
+    for (const target of entryPawns[enemyGroup + sourceTime % 2]) {
+      // Target weights never exceed one. Once this attacker's maximum cannot
+      // improve the best route, further ray tests cannot affect the score.
+      if (travel[attacker.color] >= maxTravel) break;
+      if (!temporalAttack(board, attacker, target, even, sourceTime)) continue;
       // Reserve is a scarce option. Count the best entry once, rather than
       // multiplying it by attackers, parallel boards, or historical copies.
       const value = 140 * (ready ? 1 : 0.5) * Math.min(1, pieceValues[attacker.type] / 340)

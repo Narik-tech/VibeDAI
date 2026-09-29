@@ -1,4 +1,4 @@
-import { createPositionKeyCache, createSearchRoyalSafety, generateActions } from './rules.js';
+import { createPositionKeyCache, createSearchMoveGenerator, createSearchRoyalSafety, generateActions } from './rules.js';
 import { createEvaluator, pieceValuesFor } from './evaluate.js';
 import { normalizeHeuristics } from './heuristics.js';
 import { SearchCache } from './search-cache.js';
@@ -32,7 +32,6 @@ function moveFeatures(position, move, pieceValues) {
   return { moverValue, captureValue, promotion, isCapture,
     temporal: from[0] !== to[0] || from[1] !== to[1],
     key: null, history: null,
-    move, priority: 0,
     centralGain: Math.abs(from[2] - 3.5) + Math.abs(from[3] - 3.5) - Math.abs(to[2] - 3.5) - Math.abs(to[3] - 3.5) };
 }
 
@@ -44,6 +43,13 @@ function tacticalMove(position, move) {
 function historyKey(position, move) {
   const [from, to] = move;
   const piece = Math.abs(position.board[from[0]]?.[from[1]]?.[from[2]]?.[from[3]] || 0);
+  // Ordinary quiet moves fit in five base-16 fields on every supported board
+  // (up to 16 x 16). Numeric keys avoid allocating the same history string at
+  // every ply. Temporal moves and promotions retain their full string keys.
+  if (from[0] === to[0] && from[1] === to[1] && !to[4]
+      && from[2] < 16 && from[3] < 16 && to[2] < 16 && to[3] < 16) {
+    return ((((piece * 16 + from[2]) * 16 + from[3]) * 16 + to[2]) * 16 + to[3]);
+  }
   // Share learned quiet-move ordering across turns and spatial timelines.
   // Absolute half-turn numbers made the old history disappear every ply.
   // Temporal moves keep their timeline endpoints and relative time distance.
@@ -67,6 +73,7 @@ export function createSearchSession(position, options = {}) {
     : normalizeHeuristics({ ...configuredHeuristics, quiescenceDepth: qDepth });
   const pieceValues = pieceValuesFor(heuristics);
   const evaluate = createEvaluator(heuristics), royalSafety = createSearchRoyalSafety();
+  const generateMoves = createSearchMoveGenerator();
   const timeMs = finiteOption(options.timeMs, 3000, 0, 3_600_000);
   const maxDepth = Math.floor(finiteOption(options.maxDepth, 8, 1, 64));
   const maxNodes = Math.floor(finiteOption(options.maxNodes, 2_000_000, 0, 1_000_000_000));
@@ -156,7 +163,7 @@ export function createSearchSession(position, options = {}) {
     // including its many alternative component sequences.
     let favorites, killerMoves;
     const iterator = generateActions(pos, {
-      tick: () => tick(), tacticalOnly, preferredAction: preferred, keyPosition, royalSafety, skipOptionalSpatial: restricted,
+      tick: () => tick(), tacticalOnly, preferredAction: preferred, keyPosition, generateMoves, royalSafety, skipOptionalSpatial: restricted,
       onSkipOptionalSpatial: () => policyPruned.add(iterator),
       orderMoves: (current, moves) => orderMoves(current, moves,
         favorites ??= new Set((preferred || []).map(moveKey)),

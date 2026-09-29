@@ -37,3 +37,28 @@ test('suspended multiboard ordering preserves fractional priorities across sibli
     [[[2, 1, 7, 6], [2, 1, 5, 5]], [[1, 1, 7, 6], [1, 1, 5, 5]]],
   ]);
 });
+
+test('compact quiet history preserves the baseline search on 16 by 16 boards', () => {
+  const squares = Array.from({ length: 16 }, () => Array(16).fill(0));
+  squares[0][0] = 12; squares[15][15] = 11;
+  squares[1][14] = 4; squares[14][1] = 3;
+  squares[1][5] = 2; squares[14][10] = 1;
+  const position = { board: [[squares]], action: 0, promotions: [10, 9, 8, 7, 6, 5, 4, 3] };
+  const original = structuredClone(position);
+  const result = analyze(position, { ...limits, maxDepth: 3, quiescenceDepth: 0,
+    heuristics: { quietCentralization: 10.125, historyBonus: 20.375, killerBonus: 100000.125 } });
+  // Recorded with string history keys. High ranks/files, captures and quiet
+  // replies must keep distinct histories even with fractional bonuses.
+  assert.equal(result.depth, 3);
+  assert.equal(result.stoppedReason, 'depth');
+  assert.equal(result.score, 482);
+  assert.equal(result.nodes, 1915);
+  assert.deepEqual(result.pv, [
+    [[[0, 0, 1, 14], [0, 0, 14, 1]]],
+    [[[0, 1, 14, 10], [0, 1, 13, 10]]],
+    [[[0, 2, 14, 1], [0, 2, 8, 7]]],
+  ]);
+  let current = position;
+  for (const action of result.pv) current = validateAction(current, action);
+  assert.deepEqual(position, original);
+});

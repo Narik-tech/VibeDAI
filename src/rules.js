@@ -200,6 +200,20 @@ export function pseudoMoves(position) {
     .filter(move => !royal(pieceAt(position.board, move[1])));
 }
 
+/** Reuse geometry while search histories and promotion lists stay immutable. */
+export function createSearchMoveGenerator() {
+  const histories = new WeakMap();
+  return position => {
+    let entries = histories.get(position.board);
+    if (!entries) histories.set(position.board, entries = []);
+    const color = position.action % 2, previous = entries[color];
+    if (previous && previous.promotions === position.promotions) return previous.moves;
+    const moves = pseudoMoves(position);
+    entries[color] = { promotions: position.promotions, moves };
+    return moves;
+  };
+}
+
 export function isTacticalMove(position, move) {
   return Boolean(pieceAt(position.board, move[1])) || move.length === 3 || move[1].length > 4;
 }
@@ -267,8 +281,25 @@ export function submitPosition(position) {
 
 /** Forced-pass check, for classifying an exhausted turn tree as mate/stalemate. */
 function checkAfterPass(position, attackedByNextPlayer) {
-  const board = position.board.map(timeline => timeline?.slice() ?? timeline);
-  raw.mateFuncs.blankAction(board, position.action);
+  const present = presentTimelines(position);
+  if (!present.length) return attackedByNextPlayer(position);
+  const board = position.board.slice();
+  for (const line of present) {
+    const timeline = board[line], turn = timeline.length - 1;
+    if (turn % 2 !== position.action % 2) continue;
+    board[line] = timeline.slice();
+    let passed = timeline[turn];
+    // A forced pass only reads the repeated board. Sharing it avoids copying
+    // every square and lets the search reuse its cached royal/piece scan.
+    // Match turnFuncs.copy's normalization for sparse or empty custom boards.
+    if (!passed?.length) passed = null;
+    else for (let rank = 0; rank < passed.length; rank++) if (!passed[rank]) {
+      passed = passed.filter(Boolean);
+      if (!passed.length) passed = null;
+      break;
+    }
+    board[line].push(passed);
+  }
   return attackedByNextPlayer({ ...position, board });
 }
 
@@ -479,7 +510,7 @@ export async function* generateActionsAsync(position, options = {}) {
 
 // Both drivers share every legality, deduplication and pruning decision. The
 // traversal pauses only to request move ordering or expose a legal submission.
-function* generateActionSteps(position, { tick = () => {}, preferredAction = null, pruneUnsafe = true, tacticalOnly = false, cacheMoves = true, cacheUnsafeMoves = true, keyPosition = positionKey, skipOptionalSpatial = false, onSkipOptionalSpatial, royalSafety: searchRoyalSafety } = {}) {
+function* generateActionSteps(position, { tick = () => {}, preferredAction = null, pruneUnsafe = true, tacticalOnly = false, cacheMoves = true, cacheUnsafeMoves = true, keyPosition = positionKey, generateMoves = pseudoMoves, skipOptionalSpatial = false, onSkipOptionalSpatial, royalSafety: searchRoyalSafety } = {}) {
   const { attackedByNextPlayer } = searchRoyalSafety ?? royalSafety.createCached();
   const visited = new Set();
   const path = [];
@@ -512,7 +543,7 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
   const availableMoves = (current, restrict = skipOptionalSpatial, present) => {
     if (restrict) present ??= presentTimelines(current);
     if (!cacheMoves) {
-      const moves = pseudoMoves(current);
+      const moves = generateMoves(current);
       if (!restrict) return moves;
       const allowed = moves.filter(move => !spatial(move) || present.includes(move[0][0]));
       if (allowed.length !== moves.length) onSkipOptionalSpatial?.();
@@ -523,7 +554,7 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
     // A consumed board often has hundreds of moves and contributes none to
     // the rest of the action. Optional boards keep only their temporal moves.
     if (!sourceMoves) {
-      const initialMoves = pseudoMoves(position);
+      const initialMoves = generateMoves(position);
       sourceMoves = [];
       if (position.board.length === 1) {
         if (initialMoves.length) sourceMoves.push({ line: 0, turn: initialMoves[0][0][1], moves: initialMoves });

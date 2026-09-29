@@ -50,23 +50,29 @@ export class SearchCache {
 
     let remainingBytes = this.memoryBytes - (old?.bytes || 0);
     let remainingEntries = this.size - (old ? 1 : 0);
-    const fits = () => remainingBytes + bytes <= this.maxBytes && remainingEntries < this.maxEntries;
-    const evictions = [];
-    if (!fits()) {
+    // Most writes fit without evicting anything. Keep that path free of an
+    // eviction list and predicate closure; both otherwise allocate per node.
+    if (remainingBytes + bytes > this.maxBytes || remainingEntries >= this.maxEntries) {
+      const evictions = [];
       for (const [oldKey, value] of this.entries) {
         if (oldKey === key) continue;
         evictions.push(oldKey);
         remainingBytes -= value.bytes;
         remainingEntries--;
-        if (fits()) break;
+        if (remainingBytes + bytes <= this.maxBytes && remainingEntries < this.maxEntries) break;
         // A very large history must not stall search by flushing an entire
         // table. Skip that entry and leave the existing cache intact instead.
         if (evictions.length === MAX_EVICTIONS) return false;
       }
+      if (remainingBytes + bytes > this.maxBytes || remainingEntries >= this.maxEntries) return false;
+      for (const oldKey of evictions) this.entries.delete(oldKey);
     }
-    if (!fits()) return false;
-    for (const oldKey of evictions) this.entries.delete(oldKey);
-    this.entries.set(key, { entry, bytes });
+    if (old) {
+      old.entry = entry;
+      old.bytes = bytes;
+    } else {
+      this.entries.set(key, { entry, bytes });
+    }
     this.memoryBytes = remainingBytes + bytes;
     return true;
   }

@@ -228,6 +228,61 @@ node scripts/benchmark-classical.js --baseline artifacts/session-cache-baseline/
 node scripts/benchmark-classical.js --baseline artifacts/session-cache-baseline/search.js --case standard --depth 5 --repeat 3 --warmup 2 --time-ms 3000 --depth-time-ms 20000 --json
 ```
 
+### Reusing move geometry across search passes
+
+Classical search now reuses pseudo-legal move geometry when another search
+window visits the same immutable history, side, and promotion list. Each
+traversal still checks complete-turn legality, applies the optional-board
+policy, and refreshes learned move-ordering bonuses. Weak references let
+discarded histories leave the cache. A new search always creates fresh caches.
+
+Forced-pass check detection shares read-only board snapshots and copies only
+the timeline containers it extends. Quiet spatial history uses exact numeric
+keys for supported board sizes, avoiding repeated strings. Cache writes avoid
+temporary eviction arrays when space is available. Evaluation groups temporal
+targets by color and half-turn parity, avoids projected attacker copies, and
+stops ray tests once they cannot improve a contribution. Evaluation weights,
+search horizons, and pruning policy are unchanged.
+
+On 2026-09-29, Node 22.15.1, five warmed runs per engine compared these changes
+with commit `178e474f2b4c55ce9c501b8b9be00b1e6f6a866b`. Execution order
+alternated. All fixed-depth runs completed with identical scores and work
+counts; the harness validated every PV and input immutability.
+
+| Position | Depth / tactical horizon | Work nodes, both engines | Previous median ms | Current median ms |
+| --- | --- | ---: | ---: | ---: |
+| Standard | 4 / 2 | 17,676 | 408 | 284 |
+| Opening | 2 / 2 | 4,361 | 64 | 63 |
+| Two timelines | 2 / 1 | 23,579 | 471 | 369 |
+| Temporal | 2 / 1 | 9,393 | 207 | 165 |
+| Standard, deeper comparison | 5 / 2 | 161,075 | 3,328 | 2,998 |
+
+Total elapsed time across the first four fixtures fell 21.0%. The separate
+depth-five comparison fell 10.6% in total time. Its individual times ranged
+from 3,123–3,658 ms before and 2,902–3,111 ms after. The opening fixture's
+timing ranges overlap, so its small median difference is inconclusive.
+At two seconds, median work increased by 3.6–22.5% across the four fixtures,
+but both engines still completed the same depths. A separate five-run standard
+comparison at the default three-second budget also completed depth four for
+both engines, with overlapping throughput. Higher throughput helps
+reach deeper iterations sooner; it does not guarantee another full depth at
+every time limit.
+
+Validation passed all 549 tests and all 12 tactical cases at both 20,000 and
+50,000 work nodes, repeated twice. A separate comparison preserved the full
+evaluation breakdown on 800 position/profile combinations. New regressions
+cover repeated geometry traversal, frozen and sparse forced-pass histories,
+16-by-16 ordering, temporal evaluation maxima, and bounded cache eviction.
+
+Reproduce the timing comparison with a baseline snapshot below the repository:
+
+```sh
+node scripts/snapshot-engine.js 178e474f2b4c55ce9c501b8b9be00b1e6f6a866b artifacts/classical-before-reuse
+node scripts/benchmark-classical.js --baseline artifacts/classical-before-reuse/search.js --time-ms 2000 --depth-time-ms 10000 --repeat 5 --warmup 2 --json
+node scripts/benchmark-classical.js --baseline artifacts/classical-before-reuse/search.js --case standard --mode depth --depth 5 --depth-time-ms 15000 --repeat 5 --warmup 2 --json
+node scripts/benchmark-classical.js --baseline artifacts/classical-before-reuse/search.js --case standard --mode time --time-ms 3000 --repeat 5 --warmup 2 --json
+```
+
 ## Checkmate detection
 
 Royal safety now tests piece-to-royal geometry directly instead of generating

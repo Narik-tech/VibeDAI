@@ -77,6 +77,32 @@ test('oversized histories and costly bulk evictions leave the cache intact', () 
   assert.equal(cache.memoryBytes, priorBytes);
 });
 
+test('bounded eviction accepts the last allowed entry and rejects a larger batch atomically', () => {
+  const measure = new SearchCache(1000, 1000000);
+  measure.store('000', entry());
+  const entryBytes = measure.memoryBytes;
+  for (const needed of [64, 65]) {
+    const cache = new SearchCache(1000, 70 * entryBytes);
+    for (let i = 0; i < 70; i++) cache.store(String(i).padStart(3, '0'), entry());
+    // Vary only the retained UTF-16 history, so the new entry needs precisely
+    // the requested number of equally sized entries to be evicted.
+    const key = 'x'.repeat(3 + (needed - 1) * entryBytes / 2);
+    const value = entry();
+    assert.equal(cache.store(key, value), needed === 64);
+    assert.equal(cache.memoryBytes, 70 * entryBytes);
+    if (needed === 64) {
+      assert.equal(cache.size, 7);
+      assert.equal(cache.get('063'), undefined);
+      assert(cache.get('064'));
+      assert.equal(cache.get(key), value);
+    } else {
+      assert.equal(cache.size, 70);
+      for (let i = 0; i < 70; i++) assert(cache.get(String(i).padStart(3, '0')));
+      assert.equal(cache.get(key), undefined);
+    }
+  }
+});
+
 test('zero byte or entry budgets disable retained cache data', () => {
   for (const cache of [new SearchCache(0, 1000), new SearchCache(1000, 0)]) {
     assert.equal(cache.store('a', entry()), false);

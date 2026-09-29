@@ -130,6 +130,8 @@ Classical search also reuses piece scans, king zones, and pawn-defender counts f
 
 Tactical passes also reuse proven legal-turn existence, check status, and static evaluations across horizons while keeping searched scores separate. Empty full-turn trees are cached with mate-distance normalization. Move generation scans backward from timeline frontiers, calculates the present once per partial state, and copies only timeline containers changed by a move.
 
+Repeated search passes also reuse move geometry from immutable histories. Forced-pass checks share board snapshots, and temporal evaluation skips targets that cannot affect the score. A local five-run comparison reduced total fixed-depth time by 21%, with unchanged scores and work counts; standard depth five fell from a median 3.33 to 3.00 seconds. See [the measurements and reproduction commands](docs/performance.md#reusing-move-geometry-across-search-passes).
+
 The locked-king puzzle in `examples/locked-king.5dpgn` is a performance regression: depth three with two capture-extension plies must complete within 20,000 search/generation work nodes. The original search stalled at depth one because it explored already-lost partial turns and lengthy sequences of checks at the tactical horizon. Search now rejects irreversible royal attacks early, reuses unchanged move geometry within a turn, and directly generates tactical actions during quiescence. The app reports live work counts and the depth currently being searched separately from completed depth.
 
 For longer diagnostics, set `BENCH_TIME_MS`, `SELFPLAY_TIME_MS`, or `SELFPLAY_PLIES` in your shell. Increase think time before increasing depth: requested depth is only a ceiling, and the full-turn branching factor can grow rapidly.

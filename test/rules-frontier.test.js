@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyMove, createPosition, parseMove, presentTimelines, pseudoMoves, raw } from '../src/rules.js';
+import { applyMove, createPosition, createSearchMoveGenerator, generateActions, parseMove, presentTimelines, pseudoMoves, raw } from '../src/rules.js';
 
 const squares = () => [[12, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 11]];
 const position = board => ({ board, action: 0, promotions: [10, 9, 8, 7, 6, 5, 4, 3] });
@@ -87,4 +87,44 @@ test('move application shares untouched timelines and detaches both sides of a t
   assert.equal(arrival.board[1], start.board[1]);
   assert.equal(start.board[0].length, 1);
   assert.equal(start.board[2].length, 1);
+});
+
+test('search move reuse preserves action order, preferred replay and work budgets', () => {
+  const checked = squares(); checked[3][0] = 7;
+  const first = squares(); first[1][1] = 4;
+  const starts = [
+    createPosition(),
+    position([[checked], null, [structuredClone(checked)]]),
+    position([[first], null, [squares(), squares(), squares()]]),
+  ];
+  for (const start of starts) {
+    const preferredAction = [...generateActions(start)].at(-1).moves;
+    const generateMoves = createSearchMoveGenerator();
+    for (const tacticalOnly of [false, true]) for (const skipOptionalSpatial of [false, true]) {
+      const options = { preferredAction, tacticalOnly, skipOptionalSpatial };
+      let plainTicks = 0;
+      const plain = [...generateActions(start, { ...options, tick: () => plainTicks++ })];
+      for (let repeat = 0; repeat < 2; repeat++) {
+        let cachedTicks = 0;
+        const cached = [...generateActions(start, { ...options, generateMoves, tick: () => cachedTicks++ })];
+        assert.deepEqual(cached, plain);
+        assert.equal(cachedTicks, plainTicks);
+      }
+    }
+  }
+});
+
+test('search move reuse distinguishes side, promotion choices and fresh search snapshots', () => {
+  const start = createPosition({ pgn: '[Board "Custom"]\n[Promotions "Q,R,B,N"]\n[7k/1P6/8/8/8/8/8/K7:0:1:w]' });
+  const generateMoves = createSearchMoveGenerator();
+  const original = generateMoves(start);
+  assert.equal(generateMoves({ ...start, action: start.action + 2 }), original);
+  for (const promotions of [start.promotions, [4, 3], [], undefined]) for (const action of [0, 1]) {
+    const current = { ...start, promotions, action };
+    assert.deepEqual(generateMoves(current), pseudoMoves(current));
+  }
+  const before = pseudoMoves(start);
+  start.board[0][0][6][1] = 0;
+  assert.notDeepEqual(pseudoMoves(start), before);
+  assert.deepEqual(createSearchMoveGenerator()(start), pseudoMoves(start));
 });

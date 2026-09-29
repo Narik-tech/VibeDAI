@@ -175,3 +175,39 @@ test('public check and a fresh search observe caller edits after a cached search
   assert.equal(inCheck(position), false);
   assert.equal(createSearchRoyalSafety().inCheck(position), false);
 });
+
+test('shared forced-pass boards match upstream across sparse histories and preserve frozen parents', () => {
+  let seed = 0x8da5;
+  const random = n => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return Math.floor(seed / 0x1_0000_0000 * n); };
+  const freeze = value => {
+    if (Array.isArray(value)) { for (const item of value) freeze(item); Object.freeze(value); }
+  };
+  const boards = [[], [[]], [[null]], [[[]]], [[null, null]], [[empty(), null, null]]];
+  for (let sample = 0; sample < 100; sample++) {
+    const board = Array(1 + random(8));
+    for (let line = 0; line < board.length; line++) {
+      if (random(4) === 0) continue;
+      const timeline = board[line] = Array(random(12));
+      for (let turn = 0; turn < timeline.length; turn++) {
+        if (random(4) === 0) continue;
+        if (random(5) === 0) { timeline[turn] = null; continue; }
+        const squares = timeline[turn] = empty();
+        for (let count = 0; count < 5; count++) squares[random(5)][random(5)] = 1 + random(24);
+        squares[random(5)][random(5)] = random(2) ? 12 : 11;
+        // Upstream compacts missing ranks when creating the forced-pass board.
+        if (random(4) === 0) squares[random(5)] = null;
+      }
+    }
+    boards.push(board);
+  }
+  for (const board of boards) for (const action of [0, 1, 4, 5]) {
+    const position = { board, action, promotions }, before = positionKey(position);
+    const passed = board.map(timeline => timeline?.slice() ?? timeline);
+    raw.mateFuncs.blankAction(passed, action);
+    const expected = attackedByNextPlayer({ ...position, board: passed });
+    freeze(board);
+    assert.equal(inCheck(position), expected);
+    assert.equal(createSearchRoyalSafety().inCheck(position), expected);
+    assert.equal(positionKey(position), before);
+  }
+});
