@@ -50,10 +50,10 @@ tactical suite checks its expected mates against unrestricted legal replies.
 - Mate-distance bounds avoid searching scores that cannot improve an already
   found mate. Iterative search uses a 60-centipawn aspiration window starting
   at depth two, with a full-window retry whenever the estimate falls outside.
-- Aspiration retries now reuse the previous root bound. Cached move features
-  have a consistent object layout and are reused during stable sorting;
-  string keys are built only when a preferred, killer, or history lookup needs
-  them. Learned priorities are refreshed on every ordering pass.
+- Aspiration retries reuse the previous root bound. Move ordering computes
+  scalar priorities without retaining a feature object for every generated
+  move. String keys are built only when a preferred, killer, or history lookup
+  needs them. Learned priorities are refreshed on every ordering pass.
 - Move generation indexes moves by source timeline, so consuming a board skips
   its remaining moves together. Exact position keys reuse unchanged timeline
   encodings. Ordinary spatial moves copy only the ranks they change; temporal
@@ -283,6 +283,60 @@ node scripts/benchmark-classical.js --baseline artifacts/classical-before-reuse/
 node scripts/benchmark-classical.js --baseline artifacts/classical-before-reuse/search.js --case standard --mode time --time-ms 3000 --repeat 5 --warmup 2 --json
 ```
 
+### Deduplicating appended history within a turn
+
+Partial turns generated from one position share all of its existing history.
+Duplicate detection now encodes only newly appended boards and their timeline
+indices, reusing the search's board encodings. This avoids allocating and
+hashing the common history for every component move. The keys are exact and
+local to that traversal; transposition-table keys still include the complete
+history, side, and promotions. Move order, legal actions, and work counts stay
+the same.
+
+On 2026-09-29 with Node 22.15.1, five warmed, alternating runs against the
+working tree saved immediately before this change produced these medians:
+
+| Position | Depth / tactical horizon | Work nodes, both engines | Previous ms | Current ms |
+| --- | --- | ---: | ---: | ---: |
+| Standard | 4 / 2 | 17,676 | 321 | 302 |
+| Opening | 2 / 2 | 4,361 | 67 | 40 |
+| Two timelines | 2 / 1 | 23,579 | 461 | 381 |
+| Temporal | 2 / 1 | 9,393 | 179 | 138 |
+| Standard, deeper comparison | 5 / 2 | 161,075 | 2,867 | 2,759 |
+
+All completed scores matched. Total elapsed time across the first four
+fixtures fell 15.7%. Standard depth five improved 3.8% at the median, with
+overlapping timing ranges (2,549–3,064 ms before, 2,486–2,932 ms after).
+Timing varies by position and system load.
+
+At one second, median work throughput increased 10.4–19.8% across these four
+positions; both engines completed the same depths. At three seconds, both
+completed standard depth five in every run. A 400 ms comparison on two
+timelines completed depth two in five of five optimized runs versus four of
+five baseline runs. Faster traversal can finish another depth near a time
+boundary, but the gain depends on the position and budget.
+
+All 556 tests passed. The twelve tactical cases passed at both 20,000 and
+50,000 work nodes, repeated twice, with no invalid principal variations.
+New regressions compare full-history and appended-history traversal, including
+commuting moves, temporal branch ordering, sparse history, preferred empty
+turns, duplicate promotions, and unchanged work accounting.
+
+The local baseline is `artifacts/classical-search-start/src`, including the
+search and evaluation changes already present at the start of this task.
+Reports in `artifacts/classical-search-optimized-depth.json` and
+`artifacts/classical-search-optimized-depth5.json` record source hashes,
+individual timings, PV legality, input immutability, and work accounting.
+The corresponding `-time.json`, `-time3s.json`, `-time400ms.json`, and
+`-strength.json` reports retain the timed and tactical comparisons.
+
+```sh
+node scripts/benchmark-classical.js --baseline artifacts/classical-search-start/src/search.js --mode depth --repeat 5 --warmup 2 --depth-time-ms 15000 --json
+node scripts/benchmark-classical.js --baseline artifacts/classical-search-start/src/search.js --case standard --mode depth --depth 5 --repeat 5 --warmup 2 --depth-time-ms 15000 --json
+node scripts/benchmark-classical.js --baseline artifacts/classical-search-start/src/search.js --mode time --time-ms 1000 --repeat 5 --warmup 2 --json
+node scripts/strength.js --nodes 20000,50000 --repeat 2 --strict --json
+```
+
 ## Checkmate detection
 
 Royal safety now tests piece-to-royal geometry directly instead of generating
@@ -327,6 +381,54 @@ warm-up, and load. Direct attack checks are compared with upstream move
 enumeration across all piece types, both colors, sparse histories, blockers,
 promotion sets, and mutable public positions. Exhaustive action comparisons
 also cover temporary checks and attacks that arise only from combinations.
+
+### Reducing ordering allocations and impossible attack checks
+
+Move ordering now keeps a numeric priority array for each visit instead of a
+weak-cache entry and feature object per generated move. The first move and
+stable ordering of the remainder are unchanged, including fractional heuristic
+weights and priorities captured before a sibling updates the history table.
+
+Royal-safety checks return before scanning historical targets when no opponent
+has a latest board to move from. Evaluation also skips ordinary pawn temporal
+attacks when the required adjacent timeline is absent. Brawns retain their
+additional attack directions. These changes preserve the search tree, scores,
+and work accounting.
+
+On 2026-09-29, five warmed, alternating comparisons against `7954421` on
+Node 22.15.1 produced these median wall times. Each engine started with fresh
+search caches. All fixed-depth runs completed with matching scores and work
+counts, and every returned PV passed legality and input-immutability checks.
+
+| Position | Depth / tactical horizon | Work nodes, both engines | Previous ms | Current ms |
+| --- | --- | ---: | ---: | ---: |
+| Standard | 4 / 2 | 17,676 | 275 | 237 |
+| Opening | 2 / 2 | 4,361 | 46 | 49 |
+| Two timelines | 2 / 1 | 23,579 | 429 | 386 |
+| Temporal | 2 / 1 | 9,393 | 177 | 159 |
+| Standard, longer search | 5 / 2 | 161,075 | 3,840 | 2,623 |
+
+Standard depth five took 32% less median time. With an equal 3,300 ms budget,
+the new engine completed depth five in all five runs; the baseline completed
+depth five once and depth four four times. Both used tactical horizon two.
+These are local measurements: the short opening fixture was slightly slower,
+and hardware, garbage collection, and load affect the depth reached at a time
+limit. The changes do not establish a playing-strength rating.
+
+All 551 tests passed, including exact ordering traces, tactical search,
+parallel search, sparse and even timelines, and upstream royal-safety checks.
+The reports in `artifacts/classical-optimized-depth.json`,
+`artifacts/classical-optimized-depth5.json`, and
+`artifacts/classical-optimized-time.json` retain per-run results and source
+hashes. Reproduce with:
+
+```sh
+node scripts/snapshot-engine.js 795442102120b86d60ede66f534c015a4fce4f4d artifacts/classical-allocation-baseline
+node scripts/benchmark-classical.js --baseline artifacts/classical-allocation-baseline/search.js --mode depth --depth-time-ms 15000 --repeat 5 --json
+node scripts/benchmark-classical.js --baseline artifacts/classical-allocation-baseline/search.js --case standard --mode depth --depth 5 --depth-time-ms 15000 --repeat 5 --json
+node scripts/benchmark-classical.js --baseline artifacts/classical-allocation-baseline/search.js --case standard --mode time --time-ms 3300 --repeat 5 --json
+node --test --test-concurrency=2
+```
 
 ## Parallel CPU search
 

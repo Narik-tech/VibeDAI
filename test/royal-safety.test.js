@@ -98,6 +98,23 @@ test('historical blockers and missing boards stop rays while knight jumps cross 
   assert.equal(attackedByNextPlayer(position), false);
 });
 
+test('historical attackers require a latest source while earlier timelines remain targets', () => {
+  const board = [[empty(), empty(), empty()]], position = { board, action: 0, promotions };
+  board[0][1][2][2] = 7;
+  board[0][1][2][4] = 12;
+  compare(position, 'historical rook cannot move from a consumed board');
+  assert.equal(attackedByNextPlayer(position), false);
+  board[0].push(null);
+  compare(position, 'missing latest board provides no source');
+  assert.equal(attackedByNextPlayer(position), false);
+
+  board[0][1][2][2] = 0;
+  board[2] = [empty(), empty()];
+  board[2][1][2][4] = 7;
+  compare(position, 'a later source can capture a royal on an earlier timeline');
+  assert.equal(attackedByNextPlayer(position), true);
+});
+
 test('seeded sparse histories match full move enumeration and detect mutations between calls', () => {
   let seed = 0x19cafe;
   const random = n => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return Math.floor(seed / 0x1_0000_0000 * n); };

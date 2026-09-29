@@ -332,7 +332,16 @@ export function positionKey(position) {
  */
 export function createPositionKeyCache() {
   const boards = new WeakMap(), timelineKeys = new WeakMap(), histories = new WeakMap();
-  return position => {
+  function boardKey(board) {
+    if (!board) return 'null';
+    let serialized = boards.get(board);
+    if (serialized === undefined) {
+      serialized = JSON.stringify(board);
+      boards.set(board, serialized);
+    }
+    return serialized;
+  }
+  const keyPosition = position => {
     let history = histories.get(position.board);
     if (history === undefined) {
       const timelines = [];
@@ -342,13 +351,7 @@ export function createPositionKeyCache() {
         if (timelineKey === undefined) {
           const turns = [];
           for (const board of timeline) {
-            if (!board) { turns.push('null'); continue; }
-            let serialized = boards.get(board);
-            if (serialized === undefined) {
-              serialized = JSON.stringify(board);
-              boards.set(board, serialized);
-            }
-            turns.push(serialized);
+            turns.push(boardKey(board));
           }
           timelineKey = `[${turns.join(',')}]`;
           timelineKeys.set(timeline, timelineKey);
@@ -361,6 +364,29 @@ export function createPositionKeyCache() {
     const prefix = JSON.stringify([position.action % 2, position.promotions]);
     return `${prefix.slice(0, -1)},${history}]`;
   };
+  // Inside one generated turn, moves only append boards. Every partial state
+  // shares the starting history, side, and promotions. Deduplicate by the
+  // exact appended boards and their timeline indices, avoiding repeated
+  // hashing and retention of that common history. Search-table keys above
+  // still contain the complete history; these smaller keys never leave the
+  // traversal for which they were created.
+  keyPosition.forAction = position => current => {
+    let changes = '';
+    for (let line = 0; line < current.board.length; line++) {
+      const timeline = current.board[line];
+      if (timeline === position.board[line] || !timeline) continue;
+      const start = position.board[line]?.length ?? 0;
+      if (timeline.length === start) continue;
+      changes += `${line}:[`;
+      for (let turn = start; turn < timeline.length; turn++) {
+        if (turn !== start) changes += ',';
+        changes += boardKey(timeline[turn]);
+      }
+      changes += '];';
+    }
+    return changes;
+  };
+  return keyPosition;
 }
 
 export function formatMove(position, move) {
@@ -512,6 +538,7 @@ export async function* generateActionsAsync(position, options = {}) {
 // traversal pauses only to request move ordering or expose a legal submission.
 function* generateActionSteps(position, { tick = () => {}, preferredAction = null, pruneUnsafe = true, tacticalOnly = false, cacheMoves = true, cacheUnsafeMoves = true, keyPosition = positionKey, generateMoves = pseudoMoves, skipOptionalSpatial = false, onSkipOptionalSpatial, royalSafety: searchRoyalSafety } = {}) {
   const { attackedByNextPlayer } = searchRoyalSafety ?? royalSafety.createCached();
+  const keyState = keyPosition.forAction?.(position) ?? keyPosition;
   const visited = new Set();
   const path = [];
   const unsafeSpatialMoves = new Set(), testedSpatialMoves = new Set(), moveKeys = new WeakMap();
@@ -597,7 +624,7 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
       tick();
     }
     if (legal && (!tacticalOnly || tactical) && presentTimelines(current).length === 0 && !attackedByNextPlayer(current)) {
-      preferredKey = keyPosition(current);
+      preferredKey = keyState(current);
       yield { candidate: { moves, position: { ...current, action: current.action + 1 } } };
     }
   }
@@ -611,7 +638,7 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
     // Check before serializing history: dead partial turns need no state key.
     const unsafe = attackedByNextPlayer(current);
     if (pruneUnsafe && unsafe) { learnUnsafeMove(); return; }
-    const stateKey = keyPosition(current);
+    const stateKey = keyState(current);
     const key = (tacticalOnly && hasTacticalMove ? 't:' : '') + stateKey;
     if (visited.has(key)) return;
     visited.add(key);

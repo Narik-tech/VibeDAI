@@ -17,24 +17,6 @@ function finiteOption(value, fallback, min, max) {
   return Number.isFinite(Number(value)) ? Math.max(min, Math.min(max, Number(value))) : fallback;
 }
 
-function moveFeatures(position, move, pieceValues) {
-  const [from, to] = move;
-  const captured = position.board[to[0]]?.[to[1]]?.[to[2]]?.[to[3]] || 0;
-  // The third coordinate is the captured pawn in an en passant move; castling
-  // contains a fourth coordinate and is not a capture.
-  const isCapture = !!captured || move.length === 3, isPromotion = to.length > 4;
-  const mover = isCapture || isPromotion ? position.board[from[0]]?.[from[1]]?.[from[2]]?.[from[3]] || 0 : 0;
-  const moverValue = pieceValues[Math.ceil(Math.abs(mover) / 2)] || 0;
-  const promotion = isPromotion ? (pieceValues[Math.ceil(Math.abs(to[4]) / 2)] || 0) - moverValue : 0;
-  const captureValue = pieceValues[Math.ceil(Math.abs(captured) / 2)] || (move.length === 3 ? pieceValues[1] : 0);
-  // Create every field together so repeated ordering reads use a consistent
-  // object layout without intermediate spread allocations.
-  return { moverValue, captureValue, promotion, isCapture,
-    temporal: from[0] !== to[0] || from[1] !== to[1],
-    key: null, history: null,
-    centralGain: Math.abs(from[2] - 3.5) + Math.abs(from[3] - 3.5) - Math.abs(to[2] - 3.5) - Math.abs(to[3] - 3.5) };
-}
-
 function tacticalMove(position, move) {
   const to = move[1];
   return to.length > 4 || move.length === 3 || !!position.board[to[0]]?.[to[1]]?.[to[2]]?.[to[3]];
@@ -82,7 +64,7 @@ export function createSearchSession(position, options = {}) {
   const deadline = options.unlimitedTime === true ? Infinity : started + timeMs;
   const tt = new SearchCache(maxTableEntries, Math.floor(cacheMemoryMb * 1024 * 1024));
   const history = new Map(), killers = new Map();
-  const evalCache = new WeakMap(), checkCache = new WeakMap(), moveCache = new WeakMap();
+  const evalCache = new WeakMap(), checkCache = new WeakMap();
   const policyPruned = new WeakSet();
   const keyPosition = createPositionKeyCache();
   let nodes = 0, searchNodes = 0, generationNodes = 0, qnodes = 0, ttHits = 0, qTtHits = 0, cutoffs = 0;
@@ -115,34 +97,34 @@ export function createSearchSession(position, options = {}) {
     if (!checkCache.has(pos)) checkCache.set(pos, royalSafety.inCheck(pos));
     return checkCache.get(pos);
   }
-  function orderingFeatures(pos, move) {
-    // Generated move objects are shared across partial-turn siblings. Their
-    // mover, target and coordinates cannot change within that turn; only the
-    // learned ordering bonuses below need refreshing on each visit.
-    let features = moveCache.get(move);
-    if (!features) {
-      features = moveFeatures(pos, move, pieceValues);
-      moveCache.set(move, features);
-    }
-    return features;
-  }
   function* orderMoves(pos, moves, favorites, killerMoves, spatialFirst = false) {
+    // Keep only the numeric priorities for this visit. Retaining a feature
+    // object and weak-cache entry for every generated move costs more than
+    // recomputing these few scalars, especially when most moves get cut off.
     const priorities = new Float64Array(moves.length);
     let first = 0;
     for (let index = 0; index < moves.length; index++) {
       const move = moves[index];
-      const f = orderingFeatures(pos, move);
+      const [from, to] = move;
+      const captured = pos.board[to[0]]?.[to[1]]?.[to[2]]?.[to[3]] || 0;
+      // A third coordinate denotes en passant; castling has four coordinates.
+      const isCapture = !!captured || move.length === 3, isPromotion = to.length > 4;
+      const mover = isCapture || isPromotion ? pos.board[from[0]]?.[from[1]]?.[from[2]]?.[from[3]] || 0 : 0;
+      const moverValue = pieceValues[Math.ceil(Math.abs(mover) / 2)] || 0;
+      const promotion = isPromotion ? (pieceValues[Math.ceil(Math.abs(to[4]) / 2)] || 0) - moverValue : 0;
       // Most fresh tactical nodes have neither preferred nor killer moves.
       // Build string keys only when an ordering lookup can actually use them.
-      if (favorites.size || (!f.isCapture && killerMoves.size)) f.key ??= moveKey(move);
-      let priority = (favorites.size && favorites.has(f.key) ? 10_000_000 : 0) + f.promotion * 100;
-      if (f.isCapture) priority += 1_000_000 + f.captureValue * 100 - f.moverValue;
-      else priority += (killerMoves.size && killerMoves.has(f.key) ? heuristics.killerBonus : 0)
-        + (history.size ? history.get(f.history ??= historyKey(pos, move)) || 0 : 0)
-        + f.centralGain * heuristics.quietCentralization;
+      const key = favorites.size || (!isCapture && killerMoves.size) ? moveKey(move) : null;
+      let priority = (favorites.size && favorites.has(key) ? 10_000_000 : 0) + promotion * 100;
+      if (isCapture) {
+        const captureValue = pieceValues[Math.ceil(Math.abs(captured) / 2)] || (move.length === 3 ? pieceValues[1] : 0);
+        priority += 1_000_000 + captureValue * 100 - moverValue;
+      } else priority += (killerMoves.size && killerMoves.has(key) ? heuristics.killerBonus : 0)
+        + (history.size ? history.get(historyKey(pos, move)) || 0 : 0)
+        + (Math.abs(from[2] - 3.5) + Math.abs(from[3] - 3.5) - Math.abs(to[2] - 3.5) - Math.abs(to[3] - 3.5)) * heuristics.quietCentralization;
       // Unforced early branching expands the reply tree enormously. Explore
       // ordinary development before speculative travel unless it wins material.
-      if (f.temporal) priority -= spatialFirst ? heuristics.temporalMovePenalty : 100;
+      if (from[0] !== to[0] || from[1] !== to[1]) priority -= spatialFirst ? heuristics.temporalMovePenalty : 100;
       priorities[index] = priority;
       if (priority > priorities[first]) first = index;
     }
@@ -150,8 +132,8 @@ export function createSearchSession(position, options = {}) {
     yield moves[first];
     // A beta cutoff often needs only the best component. Defer sorting and
     // allocating its remaining indices until another component is requested.
-    // Numeric snapshots remain stable when deeper sibling visits reuse the
-    // same move features and update history while this iterator is suspended.
+    // Numeric snapshots remain stable when deeper sibling visits update
+    // history while this iterator is suspended.
     const ordered = [];
     for (let index = 0; index < moves.length; index++) if (index !== first) ordered.push(index);
     ordered.sort((a, b) => priorities[b] - priorities[a]);

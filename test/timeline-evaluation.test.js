@@ -56,6 +56,27 @@ test('even starting timelines are balanced and sparse layouts use timeline exten
   assert.equal(reserveScore([0, 5]), reserveScore([0, 1, 3, 5]));
 });
 
+test('pawn entry routes preserve directional adjacency across even and sparse timelines', () => {
+  for (const [color, sourceLine, targetLine, expected] of [
+    [0, 0, 1, 41], [0, 0, 3, 0], [0, 2, 1, 41], [0, 4, 1, 0],
+    [1, 0, 2, -41], [1, 0, 4, 0], [1, 1, 2, -41], [1, 3, 2, 0],
+  ]) {
+    const sourceTime = 2 + color, targetTime = color;
+    const board = [], origin = empty(), target = empty(), latest = empty();
+    origin[3][3] = color === 0 ? 2 : 1;
+    origin[color === 0 ? 0 : 7][0] = color === 0 ? 12 : 11;
+    target[3][3] = color === 0 ? 1 : 2;
+    target[3][4] = latest[3][4] = color === 0 ? 11 : 12;
+    board[sourceLine] = [];
+    board[sourceLine][sourceTime] = origin;
+    board[targetLine] = [];
+    board[targetLine][targetTime] = target;
+    board[targetLine][targetTime + 1] = latest;
+    const position = { board, action: color };
+    assert.equal(travelScore(position), expected, `color ${color}: ${sourceLine} -> ${targetLine}`);
+  }
+});
+
 test('an open historical capture of a king-adjacent pawn is a strong travel opportunity', () => {
   const position = opportunity();
   assert(attacks(position, source, target));

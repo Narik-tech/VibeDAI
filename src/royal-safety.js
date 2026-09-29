@@ -46,6 +46,15 @@ export function createRoyalSafety(raw, { cacheBoards = false } = {}) {
 
   function find(position, describe) {
     const { board } = position, color = (position.action + 1) % 2;
+    // A complete single-timeline turn has no latest board for the opponent
+    // until its first component is applied. Avoid scanning the entire history
+    // in that common case; historical boards can only be capture targets.
+    let firstSource = 0;
+    for (; firstSource < board.length; firstSource++) {
+      const timeline = board[firstSource], turn = timeline?.length - 1;
+      if (turn % 2 === color && timeline[turn]) break;
+    }
+    if (firstSource === board.length) return describe ? null : false;
     const even = raw.boardFuncs.isEvenTimeline(board), targets = [];
     // Captures can target every recorded board of the source's half-turn
     // color, including historical royals on inactive timelines.
@@ -65,7 +74,7 @@ export function createRoyalSafety(raw, { cacheBoards = false } = {}) {
       const choices = position.promotions?.length ? position.promotions : raw.pieceFuncs.availablePromotionPieces(board);
       return promotion = choices.find(piece => piece % 2 === color) ?? null;
     }
-    for (let l = 0; l < board.length; l++) {
+    for (let l = firstSource; l < board.length; l++) {
       const timeline = board[l];
       if (!timeline || (timeline.length - 1) % 2 !== color) continue;
       const t = timeline.length - 1, squares = timeline[t], line = lineCoordinate(l, even);

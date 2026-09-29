@@ -68,6 +68,9 @@ function timelineCoordinate(index, even) {
   const value = index % 2 ? -(index + 1) / 2 : index / 2;
   return even && value > 0 ? value - 1 : value;
 }
+function timelineIndex(coordinate, even) {
+  return coordinate < 0 ? -coordinate * 2 - 1 : (coordinate + (even ? 1 : 0)) * 2;
+}
 
 function timelineResources(board, heuristics) {
   // The rules allocate beyond each side's outermost index, even when a custom
@@ -255,6 +258,10 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
     if (!squares) continue;
     const weight = active.has(l) ? 1 : settings.inactiveWeight;
     const line = timelineCoordinate(l, even);
+    // Ordinary pawns can attack in time only onto the adjacent timeline in
+    // their capture direction. Omit impossible temporal work, especially on
+    // the common single-timeline frontier. Brawns also attack within one line.
+    const pawnTargetLines = [board[timelineIndex(line - 1, even)], board[timelineIndex(line + 1, even)]];
     totalWeight += weight;
     let material = 0, activity = 0, kingSafety = 0;
     const record = inspect ? (key, value) => { featureValues[key] += weight * value; } : null;
@@ -280,7 +287,7 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
         }
         enemyCorridors[1 - color] |= MOVEMENT[type].corridors[1 - color];
         if (ROYAL_TYPES.has(type)) { kings.push(entry); royals[color * 2 + t % 2].push(entry); }
-        attackers.push(entry);
+        if (type !== 1 || pawnTargetLines[color]) attackers.push(entry);
       }
     }
     const middleGame = Math.min(1, phase / settings.phaseDivisor);
