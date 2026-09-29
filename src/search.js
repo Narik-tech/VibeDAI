@@ -1,5 +1,5 @@
 import { createPositionKeyCache, generateActions, inCheck } from './rules.js';
-import { evaluate, pieceValue } from './evaluate.js';
+import { evaluate, pieceValuesFor } from './evaluate.js';
 import { normalizeHeuristics } from './heuristics.js';
 import { SearchCache } from './search-cache.js';
 
@@ -17,16 +17,23 @@ function finiteOption(value, fallback, min, max) {
   return Number.isFinite(Number(value)) ? Math.max(min, Math.min(max, Number(value))) : fallback;
 }
 
-function moveFeatures(position, move, heuristics) {
+function moveFeatures(position, move, pieceValues) {
   const [from, to] = move;
-  const mover = position.board[from[0]]?.[from[1]]?.[from[2]]?.[from[3]] || 0;
   const captured = position.board[to[0]]?.[to[1]]?.[to[2]]?.[to[3]] || 0;
-  const promotion = to.length > 4 ? pieceValue(to[4], heuristics) - pieceValue(mover, heuristics) : 0;
   // The third coordinate is the captured pawn in an en passant move; castling
   // contains a fourth coordinate and is not a capture.
-  const captureValue = pieceValue(captured, heuristics) || (move.length === 3 ? heuristics.pawnValue : 0);
-  return { mover, captureValue, promotion, isCapture: !!captured || move.length === 3, isPromotion: to.length > 4,
+  const isCapture = !!captured || move.length === 3, isPromotion = to.length > 4;
+  const mover = isCapture || isPromotion ? position.board[from[0]]?.[from[1]]?.[from[2]]?.[from[3]] || 0 : 0;
+  const moverValue = pieceValues[Math.ceil(Math.abs(mover) / 2)] || 0;
+  const promotion = isPromotion ? (pieceValues[Math.ceil(Math.abs(to[4]) / 2)] || 0) - moverValue : 0;
+  const captureValue = pieceValues[Math.ceil(Math.abs(captured) / 2)] || (move.length === 3 ? pieceValues[1] : 0);
+  return { moverValue, captureValue, promotion, isCapture,
     temporal: from[0] !== to[0] || from[1] !== to[1] };
+}
+
+function tacticalMove(position, move) {
+  const to = move[1];
+  return to.length > 4 || move.length === 3 || !!position.board[to[0]]?.[to[1]]?.[to[2]]?.[to[3]];
 }
 
 function historyKey(position, move) {
@@ -53,6 +60,7 @@ export function createSearchSession(position, options = {}) {
     : Math.floor(finiteOption(options.quiescenceDepth, 2, 0, 8));
   const heuristics = qDepth === configuredHeuristics.quiescenceDepth ? configuredHeuristics
     : normalizeHeuristics({ ...configuredHeuristics, quiescenceDepth: qDepth });
+  const pieceValues = pieceValuesFor(heuristics);
   const timeMs = finiteOption(options.timeMs, 3000, 0, 3_600_000);
   const maxDepth = Math.floor(finiteOption(options.maxDepth, 8, 1, 64));
   const maxNodes = Math.floor(finiteOption(options.maxNodes, 2_000_000, 0, 1_000_000_000));
@@ -101,17 +109,15 @@ export function createSearchSession(position, options = {}) {
     if (!moveCache.has(move)) {
       const from = move[0], to = move[1];
       const centralGain = Math.abs(from[2] - 3.5) + Math.abs(from[3] - 3.5) - Math.abs(to[2] - 3.5) - Math.abs(to[3] - 3.5);
-      moveCache.set(move, { ...moveFeatures(pos, move, heuristics), key: moveKey(move), history: historyKey(pos, move), centralGain });
+      moveCache.set(move, { ...moveFeatures(pos, move, pieceValues), key: moveKey(move), history: historyKey(pos, move), centralGain });
     }
     return moveCache.get(move);
   }
-  function orderMoves(pos, moves, preferred, ply, spatialFirst = false) {
-    const favorites = new Set((preferred || []).map(moveKey));
-    const killerMoves = new Set((killers.get(ply) || []).flat().map(moveKey));
+  function orderMoves(pos, moves, favorites, killerMoves, spatialFirst = false) {
     return moves.map((move, index) => {
       const f = orderingFeatures(pos, move);
       let priority = (favorites.has(f.key) ? 10_000_000 : 0) + f.promotion * 100;
-      if (f.isCapture) priority += 1_000_000 + f.captureValue * 100 - pieceValue(f.mover, heuristics);
+      if (f.isCapture) priority += 1_000_000 + f.captureValue * 100 - f.moverValue;
       else priority += (killerMoves.has(f.key) ? heuristics.killerBonus : 0) + (history.get(f.history) || 0) + f.centralGain * heuristics.quietCentralization;
       // Unforced early branching expands the reply tree enormously. Explore
       // ordinary development before speculative travel unless it wins material.
@@ -120,16 +126,22 @@ export function createSearchSession(position, options = {}) {
     }).sort((a, b) => b.priority - a.priority || a.index - b.index).map(item => item.move);
   }
   function actions(pos, preferred, ply, { spatialFirst = true, tacticalOnly = false, restricted = true } = {}) {
+    // The iterator is suspended while deeper plies search; only those deeper
+    // plies can update their killers. Build these sets once for a whole turn,
+    // including its many alternative component sequences.
+    let favorites, killerMoves;
     const iterator = generateActions(pos, {
       tick: () => tick(), tacticalOnly, preferredAction: preferred, keyPosition, skipOptionalSpatial: restricted,
       onSkipOptionalSpatial: () => policyPruned.add(iterator),
-      orderMoves: (current, moves) => orderMoves(current, moves, preferred, ply, spatialFirst),
+      orderMoves: (current, moves) => orderMoves(current, moves,
+        favorites ??= new Set((preferred || []).map(moveKey)),
+        killerMoves ??= new Set((killers.get(ply) || []).flat().map(moveKey)), spatialFirst),
     });
     return iterator;
   }
   function rememberCutoff(pos, action, ply, remaining) {
     cutoffs++;
-    if (action.some(move => { const f = moveFeatures(pos, move, heuristics); return f.isCapture || f.isPromotion; })) return;
+    if (action.some(move => tacticalMove(pos, move))) return;
     const list = killers.get(ply) || [];
     const key = actionKey(action);
     killers.set(ply, [action, ...list.filter(a => actionKey(a) !== key)].slice(0, 2));
@@ -168,7 +180,7 @@ export function createSearchSession(position, options = {}) {
     // Keep each tactical horizon separate: a quiet warmup is not an exact
     // result for a later pass that searches recaptures. Share the bounded table
     // with normal search, but never reuse a tactical score as a full-turn one.
-    const key = `q${remaining}:${keyPosition(pos)}`, entry = tt.get(key);
+    const positionKey = keyPosition(pos), key = `q${remaining}:${positionKey}`, entry = tt.get(key);
     if (entry) {
       ttHits++; qTtHits++;
       const value = fromTable(entry.score, ply);
@@ -177,14 +189,29 @@ export function createSearchSession(position, options = {}) {
       else beta = Math.min(beta, value);
       if (alpha >= beta) return { score: value, pv: entry.pv };
     }
+    // Legal-turn existence is independent of the tactical horizon and search
+    // window. Reuse that proof from warmup or an earlier tactical visit, while
+    // keeping their scores separate. In particular, a policy-exhausted leaf
+    // must never be recorded as a legal witness.
+    const warmup = !entry && remaining !== 0 ? tt.get(`q0:${positionKey}`) : null;
+    let hasLegalAction = !!(entry?.hasLegalAction || warmup?.hasLegalAction);
+    const cachedCheck = entry?.inCheck ?? warmup?.inCheck;
+    const cachedStatic = entry?.staticScore ?? warmup?.staticScore;
+    if (cachedCheck !== undefined) checkCache.set(pos, cachedCheck);
+    if (cachedStatic !== undefined) evalCache.set(pos, cachedStatic);
     const searchAlpha = alpha, searchBeta = beta;
     function finish(value, pv = [], exact = false) {
       const flag = exact ? 'exact' : value <= searchAlpha ? 'upper' : value >= searchBeta ? 'lower' : 'exact';
-      store(key, { depth: remaining, score: toTable(value, ply), flag, pv });
+      store(key, { depth: remaining, score: toTable(value, ply), flag, pv, hasLegalAction,
+        inCheck: checkCache.get(pos), staticScore: evalCache.get(pos) });
       return { score: value, pv };
     }
     const isCheck = remaining >= 0 && checked(pos);
     let best = isCheck || remaining < 0 ? -INF : staticScore(pos), bestPv = [];
+    if (hasLegalAction) {
+      if (remaining < 0) return finish(staticScore(pos), [], true);
+      if (!isCheck && (best >= beta || remaining === 0)) return finish(best, [], remaining === 0);
+    }
     // A searched tactical action is also a witness that the position is not
     // terminal. Reuse it instead of constructing and abandoning a separate
     // legal turn first, which is costly when several boards must be played.
@@ -192,16 +219,19 @@ export function createSearchSession(position, options = {}) {
     let iterator = actions(pos, entry?.pv[0], ply, { tacticalOnly });
     let next = iterator.next();
     if (next.done && tacticalOnly) {
+      if (hasLegalAction) return finish(best, [], true);
       iterator = actions(pos, null, ply);
       const witness = iterator.next();
       iterator.return?.();
       // No captures does not prove stalemate: quiet legal turns still count.
       if (witness.done) return finish(emptyResult(pos, ply, iterator).score, [], true);
-      return finish(best);
+      hasLegalAction = true;
+      return finish(best, [], true);
     }
     // Prove at least one legal action before returning stand-pat: otherwise
     // stalemate or mate at the horizon could be mistaken for material gain.
     if (next.done) return finish(emptyResult(pos, ply, iterator).score, [], true);
+    hasLegalAction = true;
     // One extra real evasion is allowed at a checked horizon. Its resulting
     // position still needs a terminal proof before static evaluation: an
     // evasion can itself deliver mate or stalemate. Do not extend check chains.
@@ -270,7 +300,12 @@ export function createSearchSession(position, options = {}) {
       alpha = Math.max(alpha, value);
       if (alpha >= beta) { rememberCutoff(pos, candidate.moves, ply, remaining); break; }
     }
-    if (!count) return emptyResult(pos, ply, iterator);
+    if (!count) {
+      const result = emptyResult(pos, ply, iterator);
+      store(key, { depth: remaining, quiescenceDepth: activeQDepth,
+        score: toTable(result.score, ply), flag: 'exact', pv: [] });
+      return result;
+    }
     const flag = best <= searchAlpha ? 'upper' : best >= searchBeta ? 'lower' : 'exact';
     store(key, { depth: remaining, quiescenceDepth: activeQDepth, score: toTable(best, ply), flag, bestAction: bestMove, pv: bestPv });
     return { score: best, pv: bestPv };
@@ -344,6 +379,10 @@ export function createSearchSession(position, options = {}) {
   // A worker keeps this context alive across jobs and iterative depths.
   return {
     iterations, snapshot,
+    // Root workers report counters after each candidate. Omit result metadata,
+    // configuration, and PV arrays from these frequent cross-thread messages.
+    statistics: () => ({ searchNodes, generationNodes, qnodes, ttHits, qTtHits, cutoffs,
+      policyLeaves, tableEntries: tt.size, cacheMemoryBytes: tt.memoryBytes, selectiveDepth }),
     root: request => negamax(position, request.remaining, request.alpha, request.beta, 0, request.preferred),
     subtree(request) {
       activeQDepth = request.horizon;

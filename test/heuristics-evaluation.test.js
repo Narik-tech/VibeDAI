@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DEFAULT_HEURISTICS, HEURISTIC_SETTINGS, normalizeHeuristics } from '../src/heuristics.js';
-import { evaluate, evaluateDetailed, inspectEvaluation, pieceValue, PIECE_VALUES } from '../src/evaluate.js';
+import { evaluate, evaluateDetailed, inspectEvaluation, pieceValue, pieceValuesFor, PIECE_VALUES } from '../src/evaluate.js';
 import { createPosition } from '../src/rules.js';
 
 const empty = () => Array.from({ length: 8 }, () => Array(8).fill(0));
@@ -55,6 +55,22 @@ test('heuristic schema is immutable and normalization fills defaults without ret
   assert.equal(normalized.pawnValue, 180);
 });
 
+test('compiled piece values stay isolated from mutable inputs and other search profiles', () => {
+  const input = { queenValue: 1500, pawnValue: 0 };
+  const settings = normalizeHeuristics(input);
+  const values = pieceValuesFor(settings);
+  assert(Object.isFrozen(values));
+  assert.equal(pieceValuesFor(settings), values);
+  assert.equal(values[5], 1500);
+  assert.equal(values[1], 0);
+  assert.equal(values[6], 0);
+  assert.equal(values[10], 0);
+  input.queenValue = 2000;
+  assert.equal(pieceValuesFor(input)[5], 2000);
+  assert.equal(values[5], 1500);
+  assert.deepEqual(pieceValuesFor(), PIECE_VALUES);
+});
+
 test('heuristic validation rejects malformed, unknown, nonfinite, and out-of-range values', () => {
   for (const value of [null, false, 3, 'settings', [], new Date(), new Map()]) assert.throws(() => normalizeHeuristics(value), /plain object/);
   for (const value of [NaN, Infinity, -Infinity, '1', null, undefined, true]) {
@@ -104,6 +120,7 @@ test('feature controls change their actual score contributions and can disable e
   const disabled = Object.fromEntries(HEURISTIC_SETTINGS.filter(entry => entry.key.endsWith('Weight') && entry.group !== 'Position weighting').map(entry => [entry.key, 0]));
   const result = inspectEvaluation(position, disabled);
   assert.equal(result.total, 0);
+  assert.equal(evaluate(position, disabled), result.total);
   assert(result.features.every(feature => feature.value === 0));
 });
 
@@ -122,6 +139,7 @@ test('detailed contributions reconcile for multiple frontiers, historical travel
     const result = inspectEvaluation(position, settings);
     const { features, boards, ...score } = result;
     assert.deepEqual(score, evaluateDetailed(position, settings));
+    assert.equal(evaluate(position, settings), result.total);
     assert(Math.abs(features.reduce((sum, feature) => sum + feature.value, 0) - result.total) <= 0.500001);
     for (const component of ['material', 'activity', 'kingSafety', 'temporal', 'timelines', 'travel']) {
       const sum = features.filter(feature => feature.component === component).reduce((sum, feature) => sum + feature.value, 0);

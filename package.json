@@ -11,6 +11,7 @@
     "analyze": "node src/cli.js",
     "test": "node --test",
     "benchmark": "node scripts/benchmark.js",
+    "benchmark:classical": "node scripts/benchmark-classical.js",
     "benchmark:checkmate": "node scripts/benchmark-checkmate.js",
     "benchmark:parallel": "node scripts/benchmark-parallel.js",
     "benchmark:transformer": "node scripts/benchmark-transformer.js",

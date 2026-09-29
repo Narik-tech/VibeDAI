@@ -13,10 +13,10 @@ const session = createSearchSession(workerData.position, {
 parentPort.on('message', ({ position, request }) => {
   try {
     const result = searchCandidate(session, position, request);
-    parentPort.postMessage({ result, stats: session.snapshot() });
+    parentPort.postMessage({ result, stats: session.statistics() });
   } catch (error) {
     parentPort.postMessage(session.isInterrupted(error)
-      ? { interrupted: session.snapshot().stoppedReason, stats: session.snapshot() }
+      ? { interrupted: session.snapshot().stoppedReason, stats: session.statistics() }
       : { error: error.stack || error.message });
   }
 });

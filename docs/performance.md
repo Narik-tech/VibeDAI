@@ -27,6 +27,10 @@ tactical suite checks its expected mates against unrestricted legal replies.
   each search. The complete history, side, and promotion set remain in the
   key; this introduces no hash-collision risk. Public `positionKey` calls still
   observe edits to caller-owned boards, and each search starts a fresh cache.
+  Complete serialized history bodies are also weakly cached by their outer
+  board container, so submitted turns and repeated search windows can reuse
+  them without keeping discarded positions alive. Side and promotion keys
+  remain distinct.
 - Temporal attacks use small integer lookup tables instead of allocating and
   serializing vectors for every piece/royal pair. Directional pawn and brawn
   royal threats are included. Geometry is checked against the pinned rules
@@ -34,6 +38,15 @@ tactical suite checks its expected mates against unrestricted legal replies.
 - Tactical search reuses a searched capture as evidence that a legal turn
   exists, avoiding duplicate generation. Quiet-only positions and terminal
   positions still receive legality checks.
+- Positive legal-turn proofs, check status, and static evaluations are reused
+  across tactical horizons. Searched scores remain isolated by horizon. A
+  legal move outside the search policy never supplies a permitted-turn proof.
+  Exhausted tactical trees and empty full-turn trees retain exact results,
+  including normalized mate distances, within the existing cache budget.
+- The present is found by scanning backward from each active frontier and is
+  computed once per partial action state. Move application copies only the
+  timeline containers that change; untouched history stays shared. Preferred
+  and killer move sets are also reused while constructing a complete turn.
 - Mate-distance bounds avoid searching scores that cannot improve an already
   found mate. Iterative search uses a 60-centipawn aspiration window starting
   at depth two, with a full-window retry whenever the estimate falls outside.
@@ -64,6 +77,50 @@ produced identical search results and no invalid principal variations or
 false terminal certificates. The suite's defended-pawn case requires depth
 one with recapture analysis; the deeper depth-two experiment above is a
 separate diagnostic.
+
+### Repeating classical search comparisons
+
+```sh
+npm run benchmark:classical
+npm run benchmark:classical -- --baseline path/to/baseline/search.js --repeat 3 --json
+```
+
+The baseline must keep its matching rules, evaluation, heuristics, royal-safety,
+and cache modules alongside `search.js`. `scripts/snapshot-engine.js` can save
+these from a Git revision. The comparison warms both engines, alternates their
+order, and measures fixed-depth and fixed-time runs on four positions. Fixed
+depth timings are comparable only when both searches complete the requested
+full-turn depth and tactical horizon. The report validates every returned
+principal variation, input immutability, and node accounting, and records
+source hashes with individual timings. Use `--mode depth` or `--mode time` to
+run either measurement alone.
+
+On 2026-09-29, Node 22.15.1, three warmed comparisons against the working tree
+saved before the latest changes produced the following medians. Both engines
+completed the same requested depth and tactical horizon with identical scores;
+each run used a fresh search cache and their execution order alternated.
+
+| Position | Depth / tactical horizon | Previous work nodes | Current work nodes | Previous ms | Current ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Standard | 4 / 2 | 18,073 | 17,947 | 331 | 317 |
+| Opening | 2 / 2 | 4,598 | 4,361 | 72 | 62 |
+| Two timelines | 2 / 1 | 26,184 | 23,579 | 534 | 444 |
+| Temporal | 2 / 1 | 9,516 | 9,393 | 208 | 197 |
+
+Across all twelve measured fixed-depth searches, total elapsed time fell by
+11.9% and work nodes by 5.3%. Under a deterministic 25,000-node limit, the
+two-timeline case completed depth two instead of depth one in all three
+comparisons. At a one-second time limit, both engines still completed the same
+depths on these four fixtures. These local results show reduced work and
+latency; the standard-position timing ranges overlap, and the measured depth
+gain is at the fixed work budget. All 530 tests
+passed, and the 12-case tactical suite passed twice at 20,000 nodes per case.
+
+The local reports `artifacts/classical-search-final.json` and
+`artifacts/classical-search-work-final.json` retain timings, settings, source
+hashes, and validation results. Their baseline is the initial working-tree
+snapshot in `artifacts/classical-search-before/src`, including the local
+evaluation changes already present when the comparison began.
 
 ## Checkmate detection
 

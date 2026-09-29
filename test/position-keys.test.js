@@ -72,3 +72,21 @@ test('shared immutable histories remain distinct after sibling moves and submiss
     assert.equal(cache(position), before);
   }
 });
+
+test('a reused immutable history retains independent mover and promotion keys', () => {
+  const position = createPosition({ pgn: '1. e4 / e5 2. Nf3 / Nc6' });
+  const cache = createPositionKeyCache();
+  const keys = new Set();
+  for (const action of [4, 5]) for (const promotions of [position.promotions, [10, 9], [], undefined]) {
+    const variant = { ...position, action, promotions };
+    const key = cache(variant);
+    assert.equal(key, positionKey(variant));
+    assert.equal(cache(variant), key);
+    keys.add(key);
+  }
+  assert.equal(keys.size, 8);
+  const before = cache(position);
+  position.promotions.push(24, 23);
+  assert.notEqual(cache(position), before);
+  assert.equal(cache(position), positionKey(position));
+});

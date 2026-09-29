@@ -49,6 +49,16 @@ test('present-spatial search reaches opening depth four within 20000 work nodes'
   validatePolicyPv(position, result);
 });
 
+test('two-timeline search finishes depth two with recaptures within 25000 work nodes', () => {
+  const position = createPosition({ variant: 'two_timelines' });
+  const result = analyze(position, { ...limits, maxDepth: 2, quiescenceDepth: 1, maxNodes: 25000 });
+  assert.equal(result.depth, 2);
+  assert.equal(result.effectiveQuiescenceDepth, 1);
+  assert.equal(result.stoppedReason, 'depth');
+  assert.equal(result.score, 0);
+  validatePolicyPv(position, result);
+});
+
 test('aspiration and tactical witnesses complete the locked-king puzzle within 5000 work nodes', () => {
   const position = createPosition({ pgn: '[Board "Custom"]\n[k7/pn6/K7/8/8/8/6PB/8:0:1:w]' });
   const result = analyze(position, { ...limits, maxDepth: 3, maxNodes: 5000 });

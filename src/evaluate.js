@@ -6,6 +6,7 @@ import { HEURISTIC_SETTINGS, normalizeHeuristics } from './heuristics.js';
 export const PIECE_VALUES = Object.freeze([0, 100, 355, 340, 550, 1150, 0, 900, 140, 370, 0, 450, 350]);
 const VALUE_KEYS = [null, 'pawnValue', 'bishopValue', 'knightValue', 'rookValue', 'queenValue', null,
   'princessValue', 'brawnValue', 'commonKingValue', null, 'unicornValue', 'dragonValue'];
+const pieceValueTables = new WeakMap();
 const FEATURE_COMPONENTS = Object.freeze({
   ...Object.fromEntries(VALUE_KEYS.filter(Boolean).map(key => [key, 'material'])),
   ...Object.fromEntries(['pawnAdvanceWeight', 'pawnCenterWeight', 'doubledPawnWeight', 'isolatedPawnWeight',
@@ -36,9 +37,19 @@ const MOVEMENT = Array.from({ length: PIECE_VALUES.length }, (_, type) => {
   return { steps, rays };
 });
 
+/** Compile once per immutable profile; search reuses the numeric lookup table. */
+export function pieceValuesFor(heuristics) {
+  const settings = normalizeHeuristics(heuristics);
+  let values = pieceValueTables.get(settings);
+  if (!values) {
+    values = Object.freeze(VALUE_KEYS.map(key => key ? settings[key] : 0));
+    pieceValueTables.set(settings, values);
+  }
+  return values;
+}
+
 export function pieceValue(piece, heuristics) {
-  const values = normalizeHeuristics(heuristics);
-  return values[VALUE_KEYS[Math.ceil(Math.abs(piece || 0) / 2)]] || 0;
+  return pieceValuesFor(heuristics)[Math.ceil(Math.abs(piece || 0) / 2)] || 0;
 }
 
 function owner(piece) { return Math.abs(piece) % 2; }
@@ -186,8 +197,9 @@ function spatialActivity(board, r, f, type, color) {
 
 // Evaluate only the frontier of each timeline, never add up historical copies.
 // Inactive timelines retain some value because they can reactivate later.
-function evaluatePosition(position, heuristics, inspect = false) {
+function evaluatePosition(position, heuristics, inspect = false, scoreOnly = false) {
   const settings = normalizeHeuristics(heuristics);
+  const pieceValues = pieceValuesFor(settings);
   const { board } = position;
   const active = new Set(raw.boardFuncs.active(board));
   const even = raw.boardFuncs.isEvenTimeline(board);
@@ -217,7 +229,7 @@ function evaluatePosition(position, heuristics, inspect = false) {
         const type = Math.ceil(Math.abs(piece) / 2), color = owner(piece), sign = signFor(color);
         const entry = { l, line, t, r, f, piece, type, color, weight };
         pieces.push(entry);
-        const value = settings[VALUE_KEYS[type]] || 0;
+        const value = pieceValues[type] || 0;
         material += sign * value;
         if (record && VALUE_KEYS[type]) record(VALUE_KEYS[type], sign * value);
         if ([2, 3, 4, 5, 7].includes(type)) phase += value;
@@ -348,7 +360,7 @@ function evaluatePosition(position, heuristics, inspect = false) {
       }
     }
   }
-  if (!totalWeight) return finishEvaluation(totals, settings, featureValues, boards);
+  if (!totalWeight) return finishEvaluation(totals, settings, featureValues, boards, scoreOnly);
   for (const key of ['material', 'activity', 'kingSafety']) totals[key] /= totalWeight;
   if (inspect) {
     for (const key of Object.keys(featureValues)) featureValues[key] /= totalWeight;
@@ -379,7 +391,7 @@ function evaluatePosition(position, heuristics, inspect = false) {
       if (target.color === attacker.color || !temporalAttack(board, source, target, even)) continue;
       // Reserve is a scarce option. Count the best entry once, rather than
       // multiplying it by attackers, parallel boards, or historical copies.
-      const value = 140 * (ready ? 1 : 0.5) * Math.min(1, pieceValue(attacker.piece, settings) / 340)
+      const value = 140 * (ready ? 1 : 0.5) * Math.min(1, pieceValues[attacker.type] / 340)
         * Math.min(attacker.weight, target.weight) * settings.travelOpportunityWeight;
       travel[attacker.color] = Math.max(travel[attacker.color], value);
     }
@@ -403,12 +415,20 @@ function evaluatePosition(position, heuristics, inspect = false) {
     totals.timelines += weakBoard;
     if (inspect) featureValues.weakBoardWeight = weakBoard;
   }
-  return finishEvaluation(totals, settings, featureValues, boards);
+  return finishEvaluation(totals, settings, featureValues, boards, scoreOnly);
 }
 
-function finishEvaluation(totals, settings, featureValues, boards) {
-  for (const key of Object.keys(totals)) totals[key] *= settings[`${key}Weight`];
-  const total = Math.round(Object.values(totals).reduce((a, b) => a + b, 0));
+function finishEvaluation(totals, settings, featureValues, boards, scoreOnly) {
+  totals.material *= settings.materialWeight;
+  totals.activity *= settings.activityWeight;
+  totals.kingSafety *= settings.kingSafetyWeight;
+  totals.temporal *= settings.temporalWeight;
+  totals.timelines *= settings.timelinesWeight;
+  totals.travel *= settings.travelWeight;
+  const total = Math.round(0 + totals.material + totals.activity + totals.kingSafety + totals.temporal + totals.timelines + totals.travel);
+  // Recursive search consumes only the number. Allocate rounded component
+  // reports only when the caller actually requested diagnostic information.
+  if (scoreOnly) return total;
   const result = { ...Object.fromEntries(Object.entries(totals).map(([k, v]) => [k, Math.round(v)])), total };
   if (featureValues) {
     result.features = FEATURE_SETTINGS.map(({ key, label, description }) => ({ key, label, description,
@@ -430,4 +450,4 @@ export function evaluateDetailed(position, heuristics) { return evaluatePosition
 export function inspectEvaluation(position, heuristics) { return evaluatePosition(position, heuristics, true); }
 
 /** Positive values favor White. Mate scores are assigned by search only. */
-export function evaluate(position, heuristics) { return evaluateDetailed(position, heuristics).total; }
+export function evaluate(position, heuristics) { return evaluatePosition(position, heuristics, false, true); }

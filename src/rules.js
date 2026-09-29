@@ -206,15 +206,46 @@ export function isTacticalMove(position, move) {
 
 /** Apply a generated move. Call parseMove first when accepting untrusted input. */
 export function applyMove(position, move) {
-  // Upstream copies the changed single boards. Copy only timeline containers;
-  // immutable historical boards remain shared among search siblings.
-  const board = position.board.map(timeline => timeline?.slice() ?? timeline);
+  // Upstream copies changed single boards and creates branch containers. Only
+  // the source and an arrival onto another latest board append to an existing
+  // timeline; keep every unaffected history container shared among siblings.
+  const board = position.board.slice();
+  const source = move[0][0], destination = move[1][0];
+  board[source] = board[source]?.slice() ?? board[source];
+  if (destination !== source && board[destination]?.length - 1 === move[1][1]) {
+    board[destination] = board[destination].slice();
+  }
   raw.boardFuncs.move(board, move);
   return { ...position, board };
 }
 
+/** The upstream present rule, scanning from the frontier instead of turn zero. */
+export function presentTimelines(position) {
+  const active = raw.boardFuncs.active(position.board);
+  const latest = [], color = position.action % 2;
+  let lowest = -1;
+  for (const line of active) {
+    const timeline = position.board[line];
+    let end = timeline.length - 1;
+    while (end >= 0 && !timeline[end]) end--;
+    // Upstream treats an empty active timeline's latest turn as zero.
+    latest.push(Math.max(0, end));
+    let turn = end;
+    if (turn % 2 !== color) turn--;
+    while (turn >= 0 && !timeline[turn]) turn -= 2;
+    if (turn >= 0 && (lowest < 0 || turn < lowest)) lowest = turn;
+  }
+  const present = [];
+  if (lowest < 0) return present;
+  for (let index = 0; index < active.length; index++) {
+    if (latest[index] < lowest) return [];
+    if (latest[index] === lowest) present.push(active[index]);
+  }
+  return present;
+}
+
 export function canSubmit(position) {
-  return raw.boardFuncs.present(position.board, position.action).length === 0 && !attackedByNextPlayer(position);
+  return presentTimelines(position).length === 0 && !attackedByNextPlayer(position);
 }
 
 export function submitPosition(position) {
@@ -238,29 +269,35 @@ export function positionKey(position) {
 /**
  * Exact history keys for one immutable search. Public positions can be edited,
  * so positionKey deliberately does not share this cache between calls/searches.
- * Only single-board encodings are retained: sibling positions share their old
- * boards, while caching whole history strings would multiply retained memory.
+ * Single boards share encodings across sibling histories. Whole histories are
+ * weakly cached by their immutable outer container, so a yielded submission or
+ * a repeated search window can reuse its body without retaining dead positions.
  */
 export function createPositionKeyCache() {
-  const boards = new WeakMap();
+  const boards = new WeakMap(), histories = new WeakMap();
   return position => {
-    const timelines = [];
-    for (const timeline of position.board) {
-      if (!timeline) { timelines.push('null'); continue; }
-      const turns = [];
-      for (const board of timeline) {
-        if (!board) { turns.push('null'); continue; }
-        let serialized = boards.get(board);
-        if (serialized === undefined) {
-          serialized = JSON.stringify(board);
-          boards.set(board, serialized);
+    let history = histories.get(position.board);
+    if (history === undefined) {
+      const timelines = [];
+      for (const timeline of position.board) {
+        if (!timeline) { timelines.push('null'); continue; }
+        const turns = [];
+        for (const board of timeline) {
+          if (!board) { turns.push('null'); continue; }
+          let serialized = boards.get(board);
+          if (serialized === undefined) {
+            serialized = JSON.stringify(board);
+            boards.set(board, serialized);
+          }
+          turns.push(serialized);
         }
-        turns.push(serialized);
+        timelines.push(`[${turns.join(',')}]`);
       }
-      timelines.push(`[${turns.join(',')}]`);
+      history = `[${timelines.join(',')}]`;
+      histories.set(position.board, history);
     }
     const prefix = JSON.stringify([position.action % 2, position.promotions]);
-    return `${prefix.slice(0, -1)},[${timelines.join(',')}]]`;
+    return `${prefix.slice(0, -1)},${history}]`;
   };
 }
 
@@ -441,12 +478,12 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
     }
   }
   let initialMoves, preferredKey;
-  const availableMoves = (current, restrict = skipOptionalSpatial) => {
+  const availableMoves = (current, restrict = skipOptionalSpatial, present) => {
     const moves = cacheMoves
       ? (initialMoves ??= pseudoMoves(position)).filter(move => current.board[move[0][0]].length - 1 === move[0][1])
       : pseudoMoves(current);
     if (!restrict) return moves;
-    const present = raw.boardFuncs.present(current.board, current.action);
+    present ??= presentTimelines(current);
     const allowed = moves.filter(([from, to]) => from[0] !== to[0] || from[1] !== to[1] || present.includes(from[0]));
     if (allowed.length !== moves.length) onSkipOptionalSpatial?.();
     return allowed;
@@ -468,7 +505,7 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
       current = applyMove(current, move);
       tick();
     }
-    if (legal && (!tacticalOnly || tactical) && raw.boardFuncs.present(current.board, current.action).length === 0 && !attackedByNextPlayer(current)) {
+    if (legal && (!tacticalOnly || tactical) && presentTimelines(current).length === 0 && !attackedByNextPlayer(current)) {
       preferredKey = keyPosition(current);
       yield { candidate: { moves, position: { ...current, action: current.action + 1 } } };
     }
@@ -487,14 +524,16 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
     const key = (tacticalOnly && hasTacticalMove ? 't:' : '') + stateKey;
     if (visited.has(key)) return;
     visited.add(key);
-    if (stateKey !== preferredKey && (!tacticalOnly || hasTacticalMove) && !unsafe && raw.boardFuncs.present(current.board, current.action).length === 0) {
+    const canYield = stateKey !== preferredKey && (!tacticalOnly || hasTacticalMove) && !unsafe;
+    const present = canYield || skipOptionalSpatial ? presentTimelines(current) : null;
+    if (canYield && present.length === 0) {
       yield { candidate: { moves: path.slice(), position: { ...current, action: current.action + 1 } } };
     }
     // Every move consumes existing mover-color sources and creates only
     // opponent-color boards. Geometry, unmoved flags, and en-passant history
     // on every remaining source therefore stay fixed throughout this action.
     // A destination becoming historical changes branching, not its geometry.
-    const moves = availableMoves(current);
+    const moves = availableMoves(current, skipOptionalSpatial, present);
     // No mover-color board is added or changed within an action. Remaining
     // source pieces and capture targets are unchanged; consuming other sources
     // cannot create a capture or promotion that is absent from this move set.

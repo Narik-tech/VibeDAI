@@ -104,6 +104,7 @@ For parallel Classical search, import `analyze` from `src/parallel-search.js` an
 ```sh
 npm test
 npm run benchmark
+npm run benchmark:classical
 npm run benchmark:checkmate
 npm run benchmark:parallel
 npm run strength -- --nodes 50000 --repeat 2 --strict
@@ -112,6 +113,8 @@ npm run selfplay
 ```
 
 Tests cover temporal geometry, history immutability, present shifting, complete-turn legality, optional inactive boards, tactical search, interruption, game export/import, and HTTP integration. The benchmark reports local throughput and verifies returned actions. Self-play is a diagnostic and stops at a turn limit; it does not assign an Elo or count an unfinished game as a draw.
+
+`npm run benchmark:classical -- --baseline path/to/baseline/search.js --repeat 3` compares warmed classical searches at fixed depth and fixed time, alternating engine order. It checks full PV legality, input immutability, and work accounting. `--json` records source hashes and individual measurements; `--mode depth` or `--mode time` runs just one comparison.
 
 The tactical suite in `examples/tactics/` measures captures for both colors, coordinated multi-board captures and evasions, temporal mates, knight underpromotion, defended captures, and terminal positions. `npm run strength -- --nodes 1000,5000,20000,50000 --repeat 2 --json` reports results at fixed work budgets. Each run validates the full principal variation and checks that the input history is unchanged; repeats check deterministic search results. `--strict` exits with failure if a selected case is unsolved or invalid. Use `--case ID` to inspect one case and `--engine PATH` to compare an earlier compatible search module. These are curated regressions, not an independent rating.
 
@@ -122,6 +125,8 @@ Only exhaustive full-rule verification awards a checkmate win or stalemate draw.
 [The heuristic experiment report](docs/heuristic-tuning.md) records 54 alternatives, paired matches, rejected changes, and reproduction commands. `scripts/snapshot-engine.js` freezes a Git revision for comparison, and `scripts/tune-weights.js` screens isolated evaluation profiles before matches. No candidate established a reliable improvement in this experiment, so the production heuristics were retained.
 
 Search retains the exact order of a preferred full turn, including optional moves after a legal submission. Quiet-move history transfers across half-turns, so useful ordering survives as the search deepens. Tactical cache entries are isolated by horizon and share the configured table-size limit; `qTtHits` reports their reuse. The checked-horizon boundary also verifies whether an evasion itself ends the game before assigning a static score. Immutable board encodings are reused within each search while keeping exact, complete-history position keys. Temporal evaluation uses allocation-free integer geometry and includes pawn and brawn royal threats.
+
+Tactical passes also reuse proven legal-turn existence, check status, and static evaluations across horizons while keeping searched scores separate. Empty full-turn trees are cached with mate-distance normalization. Move generation scans backward from timeline frontiers, calculates the present once per partial state, and copies only timeline containers changed by a move.
 
 The locked-king puzzle in `examples/locked-king.5dpgn` is a performance regression: depth three with two capture-extension plies must complete within 20,000 search/generation work nodes. The original search stalled at depth one because it explored already-lost partial turns and lengthy sequences of checks at the tactical horizon. Search now rejects irreversible royal attacks early, reuses unchanged move geometry within a turn, and directly generates tactical actions during quiescence. The app reports live work counts and the depth currently being searched separately from completed depth.
 

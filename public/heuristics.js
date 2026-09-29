@@ -29,12 +29,14 @@ export function createHeuristicsPanel({api, onChange, onReady, boardLabel}) {
   let settings = [], defaults = {}, values = {}, loaded = false;
   let revision = null, engine = 'classical', busy = false;
   let evaluationToken = 0, evaluationTimer = null;
+  let settingsSignature = '[]', evaluationCleared = false;
   const controls = new Map(), componentNodes = new Map();
 
-  const signature = () => JSON.stringify(settings.map(setting => values[setting.key]));
+  const signature = () => settingsSignature;
+  const refreshSignature = () => { settingsSignature = JSON.stringify(settings.map(setting => values[setting.key])); };
   const configuration = () => ({...values});
   function status(message, error = false) {
-    $('heuristics-status').textContent = message;
+    if ($('heuristics-status').textContent !== message) $('heuristics-status').textContent = message;
     $('heuristics-status').classList.toggle('error', error);
   }
   function cleanValue(setting, value) {
@@ -46,22 +48,37 @@ export function createHeuristicsPanel({api, onChange, onReady, boardLabel}) {
   function persist() {
     try { localStorage.setItem(storageKey, JSON.stringify(values)); } catch { /* In-memory settings still work. */ }
   }
-  function syncControls(editingNumber = document.activeElement) {
-    let changed = 0;
-    for (const setting of settings) {
-      const control = controls.get(setting.key), value = values[setting.key];
-      control.range.value = value;
-      if (control.number !== editingNumber) control.number.value = value;
-      const modified = value !== defaults[setting.key];
+  function syncControl(setting, editingNumber = document.activeElement) {
+    const control = controls.get(setting.key), value = values[setting.key], text = String(value);
+    if (control.range.value !== text) control.range.value = text;
+    if (control.number !== editingNumber && control.number.value !== text) control.number.value = text;
+    const modified = value !== defaults[setting.key];
+    if (control.modified !== modified) {
       control.row.classList.toggle('modified', modified);
-      control.range.disabled = control.number.disabled = busy || engine !== 'classical';
-      control.range.setAttribute('aria-valuetext', `${value}${setting.unit ? ` ${setting.unit}` : ''}`);
-      if (modified) changed++;
+      control.modified = modified;
     }
-    $('heuristics-profile').textContent = changed ? `${changed} CUSTOM ${changed === 1 ? 'VALUE' : 'VALUES'}` : 'DEFAULT WEIGHTS';
-    $('heuristics-reset').disabled = !loaded || !changed || busy || engine !== 'classical';
+    const disabled = busy || engine !== 'classical';
+    if (control.range.disabled !== disabled) control.range.disabled = disabled;
+    if (control.number.disabled !== disabled) control.number.disabled = disabled;
+    if (control.renderedValue !== value) {
+      control.range.setAttribute('aria-valuetext', `${value}${setting.unit ? ` ${setting.unit}` : ''}`);
+      control.renderedValue = value;
+    }
+  }
+  function syncProfile() {
+    const changed = settings.reduce((count, setting) => count + Number(values[setting.key] !== defaults[setting.key]), 0);
+    const label = changed ? `${changed} CUSTOM ${changed === 1 ? 'VALUE' : 'VALUES'}` : 'DEFAULT WEIGHTS';
+    if ($('heuristics-profile').textContent !== label) $('heuristics-profile').textContent = label;
+    const disabled = !loaded || !changed || busy || engine !== 'classical';
+    if ($('heuristics-reset').disabled !== disabled) $('heuristics-reset').disabled = disabled;
+  }
+  function syncControls(editingNumber = document.activeElement) {
+    for (const setting of settings) syncControl(setting, editingNumber);
+    syncProfile();
   }
   function clearEvaluation() {
+    if (evaluationCleared) return;
+    evaluationCleared = true;
     $('heuristics-total').textContent = '—';
     scoreColor($('heuristics-total'), null);
     for (const value of componentNodes.values()) { value.textContent = '—'; scoreColor(value, null); }
@@ -82,7 +99,8 @@ export function createHeuristicsPanel({api, onChange, onReady, boardLabel}) {
     const next = cleanValue(setting, Number(raw));
     if (values[setting.key] === next) return;
     values = {...values, [setting.key]: next};
-    syncControls(input.type === 'number' ? input : null); persist();
+    refreshSignature();
+    syncControl(setting, input.type === 'number' ? input : null); syncProfile(); persist();
     onChange?.();
     queueEvaluation(220, 'Weights changed · updating the current position. Run analysis for a new continuation.');
   }
@@ -118,7 +136,7 @@ export function createHeuristicsPanel({api, onChange, onReady, boardLabel}) {
           input.setAttribute('aria-label', `${setting.label}${input === range ? ' slider' : ' value'}`);
           input.setAttribute('aria-describedby', descriptionId);
           input.addEventListener('input', () => change(setting, input.value, input));
-          input.addEventListener('change', () => { input.setCustomValidity(''); syncControls(null); });
+          input.addEventListener('change', () => { input.setCustomValidity(''); syncControl(setting, null); });
         }
         inputs.append(range, number, node('span', 'heuristic-unit', setting.unit || 'weight'));
         const description = node('p', 'heuristic-description', setting.description); description.id = descriptionId;
@@ -138,6 +156,7 @@ export function createHeuristicsPanel({api, onChange, onReady, boardLabel}) {
     syncControls();
   }
   function showEvaluation(evaluation) {
+    evaluationCleared = false;
     $('heuristics-total').textContent = `${cp(evaluation.total)} cp`;
     scoreColor($('heuristics-total'), evaluation.total);
     for (const [key, value] of componentNodes) {
@@ -207,7 +226,7 @@ export function createHeuristicsPanel({api, onChange, onReady, boardLabel}) {
   }
   $('heuristics-reset').addEventListener('click', () => {
     if (!loaded || busy || engine !== 'classical') return;
-    values = {...defaults}; syncControls(); persist(); onChange?.();
+    values = {...defaults}; refreshSignature(); syncControls(); persist(); onChange?.();
     queueEvaluation(0, 'Default weights restored · updating the current position.');
   });
   return {
@@ -221,15 +240,21 @@ export function createHeuristicsPanel({api, onChange, onReady, boardLabel}) {
           const saved = JSON.parse(localStorage.getItem(storageKey));
           for (const setting of settings) if (saved && Object.hasOwn(saved, setting.key)) values[setting.key] = cleanValue(setting, saved[setting.key]);
         } catch { /* Ignore unavailable storage and obsolete saved formats. */ }
-        loaded = true; buildControls(); queueEvaluation(); onReady?.();
+        refreshSignature(); loaded = true; buildControls(); queueEvaluation(); onReady?.();
       } catch (error) { status(`Heuristic controls unavailable: ${error.message}`, true); onReady?.(); }
     },
     setContext(context) {
-      const changed = revision !== context.revision || engine !== context.engine;
-      revision = context.revision ?? null; engine = context.engine || 'classical'; busy = Boolean(context.busy);
-      $('heuristics-engine-note').hidden = engine === 'classical';
-      $('heuristics-content').hidden = engine !== 'classical';
-      syncControls();
+      const nextRevision = context.revision ?? null, nextEngine = context.engine || 'classical', nextBusy = Boolean(context.busy);
+      const engineChanged = engine !== nextEngine, changed = revision !== nextRevision || engineChanged;
+      const controlsChanged = busy !== nextBusy || engineChanged;
+      // Analysis polls repeat this context; leave the entire panel untouched.
+      if (!changed && !controlsChanged) return;
+      revision = nextRevision; engine = nextEngine; busy = nextBusy;
+      if (engineChanged) {
+        $('heuristics-engine-note').hidden = engine === 'classical';
+        $('heuristics-content').hidden = engine !== 'classical';
+      }
+      if (controlsChanged) syncControls();
       if (changed) queueEvaluation();
     },
   };
