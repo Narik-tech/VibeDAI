@@ -70,6 +70,26 @@ test('aspiration and tactical witnesses complete the locked-king puzzle within 5
   validatePolicyPv(position, result);
 });
 
+test('immediate temporal evasions keep the locked-king continuation within 20000 work nodes', () => {
+  const position = createPosition({
+    pgn: '[Board "Custom"]\n[Mode "5D"]\n[k7/pn6/K7/8/8/8/6PB/8:0:1:w]\n\n1. Bg1 / Kb8',
+  });
+  const original = structuredClone(position);
+  // The old component ordering spent 341,028 work nodes finding one legal
+  // evasion at a multiboard horizon, despite a complete one-move escape.
+  const result = analyze(position, {
+    unlimitedTime: true, maxDepth: 3, quiescenceDepth: 2, maxNodes: 20000,
+  });
+  assert.equal(result.depth, 3);
+  assert.equal(result.effectiveQuiescenceDepth, 2);
+  assert.equal(result.stoppedReason, 'depth');
+  assert.equal(result.score, 145);
+  assert.deepEqual(result.bestAction, [[[0, 2, 0, 6], [0, 2, 6, 0]]]);
+  assert.equal(result.nodes, result.searchNodes + result.generationNodes);
+  validatePolicyPv(position, result);
+  assert.deepEqual(position, original);
+});
+
 test('search PV and progress snapshots never include ordinary moves on future or inactive boards', () => {
   const board = [[12, 0, 0, 0], [8, 0, 9, 0], [0, 0, 0, 0], [0, 0, 0, 11]];
   const position = {

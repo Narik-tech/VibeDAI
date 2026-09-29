@@ -1,4 +1,4 @@
-import { createPositionKeyCache, createSearchMoveGenerator, createSearchRoyalSafety, generateActions } from './rules.js';
+import { applyMove, presentTimelines, createPositionKeyCache, createSearchMoveGenerator, createSearchRoyalSafety, generateActions } from './rules.js';
 import { createEvaluator, pieceValuesFor } from './evaluate.js';
 import { normalizeHeuristics } from './heuristics.js';
 import { SearchCache } from './search-cache.js';
@@ -140,6 +140,26 @@ export function createSearchSession(position, options = {}) {
     for (const index of ordered) yield moves[index];
   }
   function actions(pos, preferred, ply, { spatialFirst = true, tacticalOnly = false, restricted = true, firstOnly = false } = {}) {
+    // A checked multiverse can have a one-move escape even when several boards
+    // are required: a temporal arrival can advance two boards, or a branch can
+    // move the present into the past. Find that reply before the depth-first
+    // generator combines unrelated components on every other board. This only
+    // supplies an ordering hint; normal generation still searches all turns.
+    if (!preferred && !tacticalOnly && pos.board.length > 1 && checked(pos)
+        && presentTimelines(pos).length > 1) {
+      tick();
+      for (const move of generateMoves(pos)) {
+        // A spatial move cannot complete several required boards. Temporal
+        // moves are permitted from optional boards under either search policy.
+        if (move[0][0] === move[1][0] && move[0][1] === move[1][1]) continue;
+        tick();
+        const next = applyMove(pos, move);
+        if (presentTimelines(next).length === 0 && !royalSafety.attackedByNextPlayer(next)) {
+          preferred = [move];
+          break;
+        }
+      }
+    }
     // The iterator is suspended while deeper plies search; only those deeper
     // plies can update their killers. Build these sets once for a whole turn,
     // including its many alternative component sequences.
