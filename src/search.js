@@ -13,6 +13,28 @@ const colorSign = position => position.action % 2 === 0 ? 1 : -1;
 const toTable = (score, ply) => score > MATE_THRESHOLD ? score + ply : score < -MATE_THRESHOLD ? score - ply : score;
 const fromTable = (score, ply) => score > MATE_THRESHOLD ? score - ply : score < -MATE_THRESHOLD ? score + ply : score;
 
+function orderingLookup(moves) {
+  // A preferred turn and two killers usually contain only a few components.
+  // Keep constant-time lookup for unusually large multiverse turns.
+  return moves.length > 8 ? new Set(moves.map(moveKey)) : moves;
+}
+
+function hasOrderingMove(lookup, move) {
+  if (lookup instanceof Set) return lookup.has(moveKey(move));
+  candidate: for (let index = 0; index < lookup.length; index++) {
+    const other = lookup[index];
+    if (move === other) return true;
+    if (move.length !== other.length) continue;
+    for (let component = 0; component < move.length; component++) {
+      const left = move[component], right = other[component];
+      if (left.length !== right.length) continue candidate;
+      for (let axis = 0; axis < left.length; axis++) if (left[axis] !== right[axis]) continue candidate;
+    }
+    return true;
+  }
+  return false;
+}
+
 function finiteOption(value, fallback, min, max) {
   return Number.isFinite(Number(value)) ? Math.max(min, Math.min(max, Number(value))) : fallback;
 }
@@ -66,7 +88,7 @@ export function createSearchSession(position, options = {}) {
   const history = new Map(), killers = new Map();
   const evalCache = new WeakMap(), checkCache = new WeakMap();
   const policyPruned = new WeakSet();
-  const keyPosition = createPositionKeyCache();
+  const keyPosition = createPositionKeyCache({ compact: true });
   let nodes = 0, searchNodes = 0, generationNodes = 0, qnodes = 0, ttHits = 0, qTtHits = 0, cutoffs = 0;
   let policyLeaves = 0;
   let interruption = null, depth = 0, bestAction = null, pv = [], score = null;
@@ -112,14 +134,13 @@ export function createSearchSession(position, options = {}) {
       const mover = isCapture || isPromotion ? pos.board[from[0]]?.[from[1]]?.[from[2]]?.[from[3]] || 0 : 0;
       const moverValue = pieceValues[Math.ceil(Math.abs(mover) / 2)] || 0;
       const promotion = isPromotion ? (pieceValues[Math.ceil(Math.abs(to[4]) / 2)] || 0) - moverValue : 0;
-      // Most fresh tactical nodes have neither preferred nor killer moves.
-      // Build string keys only when an ordering lookup can actually use them.
-      const key = favorites.size || (!isCapture && killerMoves.size) ? moveKey(move) : null;
-      let priority = (favorites.size && favorites.has(key) ? 10_000_000 : 0) + promotion * 100;
+      // Compare short preferred/killer lists directly, including all auxiliary
+      // coordinates. Most moves need no serialized key for either lookup.
+      let priority = (hasOrderingMove(favorites, move) ? 10_000_000 : 0) + promotion * 100;
       if (isCapture) {
         const captureValue = pieceValues[Math.ceil(Math.abs(captured) / 2)] || (move.length === 3 ? pieceValues[1] : 0);
         priority += 1_000_000 + captureValue * 100 - moverValue;
-      } else priority += (killerMoves.size && killerMoves.has(key) ? heuristics.killerBonus : 0)
+      } else priority += (hasOrderingMove(killerMoves, move) ? heuristics.killerBonus : 0)
         + (history.size ? history.get(historyKey(pos, move)) || 0 : 0)
         + (Math.abs(from[2] - 3.5) + Math.abs(from[3] - 3.5) - Math.abs(to[2] - 3.5) - Math.abs(to[3] - 3.5)) * heuristics.quietCentralization;
       // Unforced early branching expands the reply tree enormously. Explore
@@ -161,15 +182,15 @@ export function createSearchSession(position, options = {}) {
       }
     }
     // The iterator is suspended while deeper plies search; only those deeper
-    // plies can update their killers. Build these sets once for a whole turn,
+    // plies can update their killers. Snapshot these lists once for a whole turn,
     // including its many alternative component sequences.
     let favorites, killerMoves;
     const iterator = generateActions(pos, {
       tick: () => tick(), tacticalOnly, firstOnly, preferredAction: preferred, keyPosition, generateMoves, royalSafety, skipOptionalSpatial: restricted,
       onSkipOptionalSpatial: () => policyPruned.add(iterator),
       orderMoves: (current, moves) => orderMoves(current, moves,
-        favorites ??= new Set((preferred || []).map(moveKey)),
-        killerMoves ??= new Set((killers.get(ply) || []).flat().map(moveKey)), spatialFirst),
+        favorites ??= orderingLookup(preferred || []),
+        killerMoves ??= orderingLookup((killers.get(ply) || []).flat()), spatialFirst),
     });
     return iterator;
   }

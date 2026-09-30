@@ -205,6 +205,12 @@ export function pseudoMoves(position) {
 const SEARCH_MOVEMENT = Array.from({ length: 13 }, (_, type) => ({
   steps: raw.pieceFuncs.movePos(type * 2), rays: raw.pieceFuncs.moveVecs(type * 2),
 }));
+const SEARCH_SINGLE_TIMELINE_MOVEMENT = SEARCH_MOVEMENT.map(({ steps, rays }) => ({
+  steps: steps.filter(vector => vector[0] === 0), rays: rays.filter(vector => vector[0] === 0),
+}));
+const SEARCH_SPATIAL_MOVEMENT = SEARCH_SINGLE_TIMELINE_MOVEMENT.map(({ steps, rays }) => ({
+  steps: steps.filter(vector => vector[1] === 0), rays: rays.filter(vector => vector[1] === 0),
+}));
 
 function searchPseudoMoves(position) {
   const { board } = position, color = position.action % 2;
@@ -213,6 +219,11 @@ function searchPseudoMoves(position) {
     const timeline = board[l], t = timeline?.length - 1;
     if (t % 2 !== color) continue;
     const squares = timeline[t];
+    // A lone timeline has no destination for timeline-changing directions.
+    // Before its first same-color historical board, only spatial directions
+    // can land anywhere. Filtering the fixed tables retains move tie order.
+    const movement = board.length === 1
+      ? (t < 2 ? SEARCH_SPATIAL_MOVEMENT : SEARCH_SINGLE_TIMELINE_MOVEMENT) : SEARCH_MOVEMENT;
     for (let r = 0; squares && r < squares.length; r++) {
       for (let f = 0; squares[r] && f < squares[r].length; f++) {
         const piece = squares[r][f], absolute = Math.abs(piece);
@@ -228,7 +239,7 @@ function searchPseudoMoves(position) {
           }
           continue;
         }
-        const { steps, rays } = SEARCH_MOVEMENT[type];
+        const { steps, rays } = movement[type];
         for (let index = 0; index < steps.length; index++) {
           const vector = steps[index], dl = vector[0], dt = vector[1], dr = vector[2], df = vector[3];
           const line = raw.pieceFuncs.timelineMove(l, dl, even), turn = t + dt * 2;
@@ -392,15 +403,42 @@ export function positionKey(position) {
  * Single boards and unchanged timelines share encodings across sibling
  * histories. Whole histories are weakly cached by their immutable outer
  * container, so submissions and repeated windows reuse their body without
- * retaining dead positions.
+ * retaining dead positions. Compact mode encodes signed pieces as individual
+ * characters for internal search keys; the default keeps the public JSON form.
  */
-export function createPositionKeyCache() {
+export function createPositionKeyCache({ compact = false } = {}) {
   const boards = new WeakMap(), timelineKeys = new WeakMap(), histories = new WeakMap();
+  const codes = [];
+  function encodeBoard(board) {
+    // All supported signed piece codes fit in one Latin-1 character. Array
+    // boundaries remain explicit, so board dimensions and empty rows cannot
+    // collide. These characters never overlap the '[' / ']' delimiters.
+    // Retain exact JSON semantics for unusual caller-supplied cell values.
+    if (!Array.isArray(board)) return `j${JSON.stringify(board)}`;
+    // Reuse the scratch array and build a flat string in one allocation.
+    // Character-by-character concatenation creates ropes that need flattening
+    // before hashing; clearing this array would also discard its capacity.
+    let length = 2;
+    codes[0] = 99; codes[1] = 91;
+    for (const row of board) {
+      if (!Array.isArray(row)) return `j${JSON.stringify(board)}`;
+      if (length + row.length + 2 > 4096) return `j${JSON.stringify(board)}`;
+      codes[length++] = 91;
+      for (const piece of row) {
+        if (!Number.isInteger(piece) || piece < -32 || piece > 32) return `j${JSON.stringify(board)}`;
+        codes[length++] = piece + 128;
+      }
+      codes[length++] = 93;
+    }
+    codes[length++] = 93;
+    codes.length = length;
+    return String.fromCharCode(...codes);
+  }
   function boardKey(board) {
     if (!board) return 'null';
     let serialized = boards.get(board);
     if (serialized === undefined) {
-      serialized = JSON.stringify(board);
+      serialized = compact ? encodeBoard(board) : JSON.stringify(board);
       boards.set(board, serialized);
     }
     return serialized;

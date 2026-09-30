@@ -531,6 +531,62 @@ node --expose-gc scripts/benchmark-classical.js --baseline artifacts/classical-o
 node --test --test-concurrency=2
 ```
 
+### Compact history keys and cheaper move ordering
+
+Classical search uses an exact compact encoding of signed piece codes in its
+internal history keys. Row, board, turn, and timeline boundaries remain
+explicit; side to move and promotion choices remain part of the key. Unusual
+cell values use a tagged JSON fallback. The public position-key format stays
+unchanged. The encoder reuses its scratch array and creates flat strings,
+reducing the size of strings hashed and retained by the search table.
+
+Preferred and killer moves are compared by every coordinate when their lists
+are short, avoiding repeated move serialization. Lists with more than eight
+components retain Set lookups. Single-timeline move generation uses prefiltered
+direction tables to skip destinations on nonexistent timelines; before any
+same-color history exists, it also skips time jumps. Evaluation advances spatial
+rays incrementally and reads each destination square once.
+
+A local comparison used Node 22.15.1, baseline revision
+`970194c19acacbfc2950ff1f03988c6475588469`, five alternating pairs, three warm-up
+rounds, and garbage collection before each measured search. Median fixed-depth
+wall times were:
+
+| Position | Depth / quiescence | Baseline | Updated |
+| --- | --- | ---: | ---: |
+| Standard | 4 / 2 | 228 ms | 213 ms |
+| Opening | 2 / 2 | 55 ms | 45 ms |
+| Two timelines | 2 / 1 | 366 ms | 339 ms |
+| Temporal | 2 / 1 | 135 ms | 141 ms |
+| Standard | 5 / 2 | 2,007 ms | 2,007 ms |
+
+At an equal two-second budget, the updated engine completed depth five in four
+of five runs, versus one of five baseline runs. Median work completed increased
+from 155,576 to 177,739 nodes. Timing varied: the separate depth-five medians
+were effectively equal, and the temporal fixture was 4.4% slower. These local
+samples show more frequent depth-five completion at this budget, not a
+guaranteed extra depth on every position or machine.
+
+All fixed-depth pairs retained identical scores and work counts. At standard
+depth five, estimated table memory fell from 57,800,570 to 31,879,426 bytes
+(44.8%); this is the cache accounting estimate, not measured process RAM.
+Every benchmark validated complete PV legality, input immutability, and work
+accounting. All 588 regression tests passed, including compact-key collision
+cases, sparse histories, signed piece flags, exact ordering traces, and
+single-timeline temporal geometry.
+
+Raw reports are `artifacts/classical-deeper-final-depth.json`,
+`artifacts/classical-deeper-final-depth5.json`, and
+`artifacts/classical-deeper-final-time.json`. Reproduce with:
+
+```sh
+node scripts/snapshot-engine.js 970194c19acacbfc2950ff1f03988c6475588469 artifacts/classical-deeper-baseline-20260930
+node --expose-gc scripts/benchmark-classical.js --baseline artifacts/classical-deeper-baseline-20260930/search.js --mode depth --depth-time-ms 15000 --repeat 5 --warmup 3 --json
+node --expose-gc scripts/benchmark-classical.js --baseline artifacts/classical-deeper-baseline-20260930/search.js --case standard --mode depth --depth 5 --depth-time-ms 15000 --repeat 5 --warmup 3 --json
+node --expose-gc scripts/benchmark-classical.js --baseline artifacts/classical-deeper-baseline-20260930/search.js --case standard --mode time --time-ms 2000 --repeat 5 --warmup 3 --json
+node --test --test-concurrency=2
+```
+
 ## Parallel CPU search
 
 Classical analysis supports a configurable root-search pool through the app's

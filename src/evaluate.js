@@ -126,9 +126,10 @@ function temporalAttack(board, attacker, king, even, sourceTime = attacker.t) {
 // point. Defenders discount danger, but cannot make a temporal capture safe.
 function pawnDefenders(squares, r, f, color) {
   let defenders = 0;
-  for (const [dr, df] of DIRECTIONS) {
-    for (let distance = 1; ; distance++) {
-      const piece = squares[r + dr * distance]?.[f + df * distance];
+  for (let direction = 0; direction < DIRECTIONS.length; direction++) {
+    const dr = DIRECTIONS[direction][0], df = DIRECTIONS[direction][1];
+    for (let distance = 1, y = r + dr, x = f + df; ; distance++, y += dr, x += df) {
+      const piece = squares[y]?.[x];
       if (piece === undefined) break;
       if (!piece) continue;
       const type = Math.ceil(Math.abs(piece) / 2);
@@ -141,7 +142,8 @@ function pawnDefenders(squares, r, f, color) {
       break;
     }
   }
-  for (const [dr, df] of KNIGHT_STEPS) {
+  for (let step = 0; step < KNIGHT_STEPS.length; step++) {
+    const dr = KNIGHT_STEPS[step][0], df = KNIGHT_STEPS[step][1];
     const piece = squares[r + dr]?.[f + df];
     if (piece && owner(piece) === color && Math.ceil(Math.abs(piece) / 2) === 3) defenders++;
   }
@@ -222,10 +224,12 @@ function spatialActivity(board, r, f, type, color) {
   const steps = SPATIAL_STEPS[type];
   const slider = SPATIAL_SLIDERS.has(type);
   let count = 0;
-  for (const [dr, df] of steps) {
+  for (let step = 0; step < steps.length; step++) {
+    const dr = steps[step][0], df = steps[step][1];
     let y = r + dr, x = f + df;
-    while (board[y]?.[x] !== undefined) {
-      const target = board[y][x];
+    while (true) {
+      const target = board[y]?.[x];
+      if (target === undefined) break;
       if (!target || owner(target) !== color) count++;
       if (target || !slider) break;
       y += dr; x += df;

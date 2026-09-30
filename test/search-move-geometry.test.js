@@ -49,6 +49,25 @@ test('every nonpawn geometry preserves direction order for both colors, flags an
   }
 });
 
+test('single-timeline direction tables preserve initial, historical and sparse move geometry', () => {
+  for (const type of [2, 3, 4, 5, 6, 7, 9, 10, 11, 12]) {
+    for (const color of [0, 1]) for (const turn of [color, 2 + color, 6 + color]) {
+      const timeline = Array.from({ length: turn + 1 }, () => empty());
+      timeline[turn][2][2] = type * 2 - color;
+      const start = position([timeline], color);
+      const moves = compare(start, `single timeline, type ${type}, turn ${turn}`);
+      if (type === 3 || type === 4) assert(moves.length > 0, 'knights and rooks retain spatial moves');
+      if (type === 4 && turn >= 2) assert(moves.some(move => move[1][1] < turn), 'time rays stay available');
+      assert(moves.every(move => move[1][0] === 0));
+      if (turn < 2) assert(moves.every(move => move[1][1] === turn));
+      if (turn >= 2) {
+        delete timeline[turn - 2];
+        compare(start, `single timeline, type ${type}, missing historical board`);
+      }
+    }
+  }
+});
+
 test('step captures, friendly blockers and royal exclusions retain their exact order', () => {
   for (const color of [0, 1]) for (const sign of [1, -1]) {
     const squares = empty(7), turn = color;
