@@ -219,6 +219,49 @@ function corridorRisk(timeline, latest, target, enemyCorridors, targetTime) {
   return risk;
 }
 
+// A move shares every untouched timeline with its siblings. Corridor samples
+// and historical targets depend on that history and the fixed search profile,
+// so reuse them together. Coordinates, active weights and branch reserves are
+// deliberately attached later: the same history can occupy another timeline.
+function timelineEvaluation(timeline, spatial, settings, cache) {
+  let result = cache?.timelines.get(timeline);
+  if (result) return result;
+  const t = timeline.length - 1;
+  const { kings, enemyCorridors, middleGame } = spatial;
+  const zoneRisk = [0, 0], royals = [], pawns = [];
+  // Retain the first king zone of each half-turn color and recent history: a
+  // late blocker cannot erase an early route through a king-zone pawn.
+  const sampleTimes = new Set([t]);
+  for (const parity of [0, 1]) for (let first = parity; first <= t; first += 2) {
+    if (timeline[first]) { sampleTimes.add(first); break; }
+  }
+  for (let past = t - 2, sampled = 0; past >= 0 && sampled < 6; past -= 2, sampled++) sampleTimes.add(past);
+  // Entry opportunities also include intervening half-turn snapshots.
+  const entryTimes = new Set(sampleTimes);
+  for (let past = t - 1, sampled = 0; past >= 0 && sampled < 12; past--, sampled++) entryTimes.add(past);
+  for (const past of entryTimes) {
+    const snapshot = timeline[past];
+    if (!snapshot) continue;
+    const targets = boardTargets(snapshot, past === t ? kings : null, cache?.targets);
+    if (past < t && past >= t - 12 && (t - past) % 2 === 0) {
+      for (const king of targets.kings) royals.push(past, king);
+    }
+    const risk = [0, 0];
+    for (const target of targets.zone) {
+      if (sampleTimes.has(past)) risk[target.color] += corridorRisk(timeline, t, target, enemyCorridors[target.color], past);
+      if (past < t && target.pawn && target.defenders === 0) {
+        pawns.push(past, target);
+      }
+    }
+    // Preserve multiplication order so configurable profiles retain exactly
+    // the same contributions, including scores close to rounding boundaries.
+    for (const color of [0, 1]) zoneRisk[color] = Math.max(zoneRisk[color], risk[color] * middleGame * settings.corridorWeight);
+  }
+  result = { zoneRisk, royals, pawns };
+  cache?.timelines.set(timeline, result);
+  return result;
+}
+
 function spatialActivity(board, r, f, type, color) {
   const steps = SPATIAL_STEPS[type];
   const slider = SPATIAL_SLIDERS.has(type);
@@ -383,7 +426,7 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
     totalWeight += weight;
     const record = inspect ? (key, value) => { featureValues[key] += weight * value; } : null;
     const spatial = spatialEvaluation(squares, settings, record, cache?.spatial);
-    const { material, activity, middleGame, kings, enemyCorridors } = spatial;
+    const { material, activity, middleGame } = spatial;
     let kingSafety = spatial.kingSafety;
     // Only temporal participants need timeline coordinates. In a single-line
     // position ordinary pawns cannot attack historical targets at all.
@@ -395,40 +438,18 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
       attackers.push(entry);
       if (ROYAL_TYPES.has(type)) royals[color * 2 + t % 2].push(entry);
     }
-    const zoneRisk = [0, 0];
-    // Keep the first king zone of each half-turn color as well as recent history:
-    // a late blocker cannot erase an open route through early f-pawn snapshots.
-    const sampleTimes = new Set([t]);
-    for (const parity of [0, 1]) for (let first = parity; first <= t; first += 2) {
-      if (timeline[first]) { sampleTimes.add(first); break; }
+    const history = timelineEvaluation(timeline, spatial, settings, cache);
+    const { zoneRisk } = history;
+    for (let index = 0; index < history.royals.length; index += 2) {
+      const past = history.royals[index], king = history.royals[index + 1];
+      royals[king.color * 2 + past % 2].push({ l, line, t: past, r: king.r, f: king.f,
+        color: king.color, weight: weight * settings.historicalPressureWeight });
     }
-    for (let past = t - 2, sampled = 0; past >= 0 && sampled < 6; past -= 2, sampled++) sampleTimes.add(past);
-    // Travel setup can matter on either half-turn color. Inspect intervening
-    // snapshots for concrete entry targets without changing the shelter sample.
-    const entryTimes = new Set(sampleTimes);
-    for (let past = t - 1, sampled = 0; past >= 0 && sampled < 12; past--, sampled++) entryTimes.add(past);
-    for (const past of entryTimes) {
-      const snapshot = timeline[past];
-      if (!snapshot) continue;
-      const targets = boardTargets(snapshot, past === t ? kings : null, cache?.targets);
-      // These snapshots were just scanned for king zones. Reuse their royals
-      // for temporal pressure instead of scanning the same boards again below.
-      if (past < t && past >= t - 12 && (t - past) % 2 === 0) {
-        for (const king of targets.kings) royals[king.color * 2 + past % 2].push({ l, line, t: past, r: king.r, f: king.f,
-          color: king.color, weight: weight * settings.historicalPressureWeight });
-      }
-      const risk = [0, 0];
-      for (const target of targets.zone) {
-        if (sampleTimes.has(past)) risk[target.color] += corridorRisk(timeline, t, target, enemyCorridors[target.color], past);
-        if (past < t && target.pawn && target.defenders === 0 && resources.available[1 - target.color] > 0) {
-          // Being historical is what makes this an entry opportunity; unlike
-          // royal pressure, it should not itself discount the target's value.
-          entryPawns[target.color * 2 + past % 2].push({ l, line, t: past, r: target.r, f: target.f, color: target.color, weight });
-        }
-      }
-      // Shelter matters most with armies still on the board. Use the worst
-      // snapshot rather than multiplying a weakness by its historical copies.
-      for (const color of [0, 1]) zoneRisk[color] = Math.max(zoneRisk[color], risk[color] * middleGame * settings.corridorWeight);
+    for (let index = 0; index < history.pawns.length; index += 2) {
+      const past = history.pawns[index], target = history.pawns[index + 1];
+      if (resources.available[1 - target.color] <= 0) continue;
+      // Historical entry targets keep their timeline's full weight.
+      entryPawns[target.color * 2 + past % 2].push({ l, line, t: past, r: target.r, f: target.f, color: target.color, weight });
     }
     if (active.has(l)) for (let color = 0; color < 2; color++) {
       if (spatial.royalRisk[color] >= 0) worstKing[color] = Math.max(worstKing[color], spatial.royalRisk[color] + zoneRisk[color]);
@@ -542,11 +563,11 @@ export function inspectEvaluation(position, heuristics) { return evaluatePositio
 /** Positive values favor White. Mate scores are assigned by search only. */
 export function evaluate(position, heuristics) { return evaluatePosition(position, heuristics, false, true); }
 
-/** Reuse board-local facts for one immutable search, without retaining boards.
+/** Reuse board and timeline facts for one immutable search, without retaining boards.
  * Public evaluation stays uncached so edits to caller-owned squares are seen.
  */
 export function createEvaluator(heuristics) {
   const settings = normalizeHeuristics(heuristics);
-  const cache = { targets: new WeakMap(), spatial: new WeakMap() };
+  const cache = { targets: new WeakMap(), spatial: new WeakMap(), timelines: new WeakMap() };
   return position => evaluatePosition(position, settings, false, true, cache);
 }

@@ -201,7 +201,7 @@ export function pseudoMoves(position) {
 }
 
 // Keep the pinned library's direction order: tied search moves must retain
-// their order. Pawns, brawns and unmoved kings use its special-move handling.
+// their order. Unmoved kings use its special castling handling.
 const SEARCH_MOVEMENT = Array.from({ length: 13 }, (_, type) => ({
   steps: raw.pieceFuncs.movePos(type * 2), rays: raw.pieceFuncs.moveVecs(type * 2),
 }));
@@ -212,9 +212,77 @@ const SEARCH_SPATIAL_MOVEMENT = SEARCH_SINGLE_TIMELINE_MOVEMENT.map(({ steps, ra
   steps: steps.filter(vector => vector[1] === 0), rays: rays.filter(vector => vector[1] === 0),
 }));
 
+// The library's pawn helpers repeatedly allocate coordinates to probe empty
+// or missing destinations. Probe scalars and append only real moves here.
+function appendPawnMoves(position, from, piece, even, moves, promotionChoices) {
+  const { board } = position, [line, turn, rank, file] = from;
+  const squares = board[line][turn], color = Math.abs(piece) % 2;
+  const forward = color ? -1 : 1, nextRank = rank + forward;
+  const promotionRank = color ? 0 : squares.length - 1;
+  const append = (destinationLine, destinationTurn, destinationRank, destinationFile, promotes = true) => {
+    if (promotes && destinationRank === promotionRank) {
+      for (const promotion of promotionChoices()) if (promotion % 2 === color) {
+        moves.push([from, [destinationLine, destinationTurn, destinationRank, destinationFile, promotion]]);
+      }
+    } else moves.push([from, [destinationLine, destinationTurn, destinationRank, destinationFile]]);
+  };
+  if (squares[nextRank]?.[file] === 0) {
+    append(line, turn, nextRank, file);
+    if (piece < 0 && squares[nextRank + forward]?.[file] === 0) append(line, turn, nextRank + forward, file);
+  }
+  // Match the library's capture-before-en-passant order on each file. Its
+  // en-passant history recognizes only a previously unmoved pawn or brawn;
+  // checking the current neighboring piece first avoids historical probes
+  // for almost every pawn in ordinary opening positions.
+  for (const destinationFile of [file + 1, file - 1]) {
+    const target = squares[nextRank]?.[destinationFile];
+    if (target === undefined) continue;
+    if (target !== 0 && Math.abs(target) % 2 !== color && !royal(target)) {
+      append(line, turn, nextRank, destinationFile);
+    }
+    const neighbor = squares[rank][destinationFile] - color;
+    if (neighbor !== 1 && neighbor !== 15) continue;
+    const previousRank = nextRank + forward;
+    if (squares[previousRank]?.[destinationFile] !== 0) continue;
+    const previous = board[line][turn - 2];
+    if (previous?.[rank]?.[destinationFile] !== 0) continue;
+    const origin = previous?.[previousRank]?.[destinationFile] + color;
+    if ((origin === -1 || origin === -15) && !royal(target)) {
+      moves.push([from, [line, turn, nextRank, destinationFile], [line, turn, rank, destinationFile]]);
+    }
+  }
+  const adjacent = raw.pieceFuncs.timelineMove(line, -forward, even), neighbor = board[adjacent];
+  if (!neighbor && Math.abs(piece) < 15) return;
+  if (neighbor?.[turn]?.[rank]?.[file] === 0) {
+    append(adjacent, turn, rank, file, false);
+    if (piece < 0) {
+      const twice = raw.pieceFuncs.timelineMove(line, -2 * forward, even);
+      if (board[twice]?.[turn]?.[rank]?.[file] === 0) append(twice, turn, rank, file, false);
+    }
+  }
+  for (const destinationTurn of [turn + 2, turn - 2]) {
+    const target = neighbor?.[destinationTurn]?.[rank]?.[file];
+    if (target !== undefined && target !== 0 && Math.abs(target) % 2 !== color && !royal(target)) {
+      append(adjacent, destinationTurn, rank, file, false);
+    }
+  }
+  if (Math.abs(piece) < 15) return;
+  for (const [destinationLine, destinationTurn, destinationRank, destinationFile] of [
+    [adjacent, turn, rank, file + 1], [adjacent, turn, rank, file - 1],
+    [adjacent, turn, nextRank, file], [line, turn - 2, nextRank, file],
+  ]) {
+    const target = board[destinationLine]?.[destinationTurn]?.[destinationRank]?.[destinationFile];
+    if (target !== undefined && target !== 0 && Math.abs(target) % 2 !== color && !royal(target)) {
+      append(destinationLine, destinationTurn, destinationRank, destinationFile);
+    }
+  }
+}
+
 function searchPseudoMoves(position) {
   const { board } = position, color = position.action % 2;
   const even = raw.boardFuncs.isEvenTimeline(board), moves = [];
+  let promotions = position.promotions;
+  const promotionChoices = () => promotions?.length ? promotions : (promotions = raw.pieceFuncs.availablePromotionPieces(board));
   for (let l = 0; l < board.length; l++) {
     const timeline = board[l], t = timeline?.length - 1;
     if (t % 2 !== color) continue;
@@ -229,12 +297,12 @@ function searchPseudoMoves(position) {
         const piece = squares[r][f], absolute = Math.abs(piece);
         if (!absolute || absolute % 2 !== color) continue;
         const from = [l, t, r, f], type = Math.ceil(absolute / 2);
-        if (type === 1 || type === 8 || piece === -11 || piece === -12) {
-          // Ordinary pawns need the adjacent timeline for every temporal
-          // move, including the first step of a double push. Brawns can also
-          // capture into their own past, so keep their full geometry.
-          const spatialOnly = type === 1 && !board[raw.pieceFuncs.timelineMove(l, color ? 1 : -1, even)];
-          for (const move of raw.pieceFuncs.moves(board, from, spatialOnly, position.promotions)) {
+        if (type === 1 || type === 8) {
+          appendPawnMoves(position, from, piece, even, moves, promotionChoices);
+          continue;
+        }
+        if (piece === -11 || piece === -12) {
+          for (const move of raw.pieceFuncs.moves(board, from, false, position.promotions)) {
             if (!royal(pieceAt(board, move[1]))) moves.push(move);
           }
           continue;

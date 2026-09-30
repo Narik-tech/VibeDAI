@@ -109,7 +109,9 @@ test('temporal target groups preserve mixed parity, projected travel, and weight
   ];
   for (let profile = 0; profile < profiles.length; profile++) {
     const cached = createEvaluator(profiles[profile]);
-    for (let layout = 0; layout < boards.length; layout++) {
+    // Visit the spent-reserve layout first. Cached history must retain its
+    // pawn-entry targets when a later position makes a branch available.
+    for (const layout of [2, 1, 0, 2]) {
       const position = { board: boards[layout], action: 0 };
       const result = evaluateDetailed(position, profiles[profile]);
       assert.deepEqual([result.temporal, result.travel, result.total], expected[layout][profile]);

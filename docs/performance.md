@@ -647,6 +647,62 @@ node --test --test-concurrency=2
 node scripts/strength.js --nodes 50000 --repeat 2 --strict
 ```
 
+## Timeline evaluation and tactical cache reuse
+
+This update reduces repeated work in four places:
+
+- Evaluation caches corridor samples and historical royal/pawn targets for
+  unchanged timeline arrays. Timeline coordinates, active weights, and branch
+  reserves are applied for each position, including configurable profiles.
+- Pawn and brawn generation uses direct destination probes, preserving the
+  pinned rules library's move order, promotions, temporal moves, and en passant.
+- Tactical cache indexes reuse the complete position-history string across
+  horizons. Their entries share one FIFO and memory budget; the estimate also
+  charges the extra index metadata.
+- An unchecked position with a proved legal turn and no legal tactical turns
+  shares its exact static result across capture horizons. A depth-zero visit
+  alone cannot establish that proof. Checked evasions, terminal positions,
+  and searched captures retain their existing handling.
+
+Local measurements used Node 22.15.1, baseline
+`1f9cf4f444864410d697d74d4449c8487a3b6998`, five alternating runs,
+three warmup rounds, and garbage collection before each timed search.
+Median fixed-depth wall times were:
+
+| Position | Full depth / tactical depth | Before | After |
+| --- | ---: | ---: | ---: |
+| Standard | 4 / 2 | 171 ms | 177 ms |
+| Opening | 2 / 2 | 50 ms | 44 ms |
+| Two timelines | 2 / 1 | 338 ms | 332 ms |
+| Temporal | 2 / 1 | 125 ms | 122 ms |
+| Standard, deeper run | 5 / 2 | 1,784 ms | 1,768 ms |
+
+All fixed-depth searches completed with matching scores and legal PVs.
+At 1.8 seconds, the final version completed standard depth five in five of
+five runs, compared with four of five baseline runs. Timing varied between
+runs; these small samples show modest gains and do not guarantee another
+completed depth on other positions. Estimated depth-five cache usage rose
+from 30.40 to 31.47 MiB because the extra index metadata is charged.
+
+All 604 tests pass. New regressions compare pawn generation directly with
+the pinned rules library, exercise cache eviction across tactical horizons,
+and check that quiet-result reuse cannot hide recaptures, check evasions, or
+stalemate. The tactical suite retains 9/12, 10/12, and 12/12 solutions at
+1,000, 5,000, and 20,000 work nodes, respectively, across two deterministic
+runs per case, with no invalid moves.
+
+The local reports are `artifacts/classical-optimized-20260930-depth-final.json`,
+`artifacts/classical-optimized-20260930-standard-final.json`, and
+`artifacts/classical-optimized-20260930-strength.json`. Reproduce with:
+
+```sh
+node scripts/snapshot-engine.js 1f9cf4f444864410d697d74d4449c8487a3b6998 artifacts/classical-reuse-baseline
+node --expose-gc scripts/benchmark-classical.js --baseline artifacts/classical-reuse-baseline/search.js --mode depth --repeat 5 --warmup 3 --depth-time-ms 15000 --json
+node --expose-gc scripts/benchmark-classical.js --baseline artifacts/classical-reuse-baseline/search.js --case standard --mode both --depth 5 --time-ms 1800 --repeat 5 --warmup 3 --depth-time-ms 15000 --json
+node scripts/strength.js --nodes 1000,5000,20000 --repeat 2 --json
+node --test
+```
+
 ## Parallel CPU search
 
 Classical analysis supports a configurable root-search pool through the app's

@@ -175,8 +175,8 @@ export function createSearchSession(position, options = {}) {
     // move the present into the past. Find that reply before the depth-first
     // generator combines unrelated components on every other board. This only
     // supplies an ordering hint; normal generation still searches all turns.
-    if (!preferred && !tacticalOnly && pos.board.length > 1 && checked(pos)
-        && presentTimelines(pos).length > 1) {
+    if (!preferred && !tacticalOnly && pos.board.length > 1
+        && presentTimelines(pos).length > 1 && checked(pos)) {
       tick();
       for (const move of generateMoves(pos)) {
         // A spatial move cannot complete several required boards. Temporal
@@ -244,7 +244,7 @@ export function createSearchSession(position, options = {}) {
     // Keep each tactical horizon separate: a quiet warmup is not an exact
     // result for a later pass that searches recaptures. Share the bounded table
     // with normal search, but never reuse a tactical score as a full-turn one.
-    const positionKey = keyPosition(pos), key = `q${remaining}:${positionKey}`, entry = tt.get(key);
+    const positionKey = keyPosition(pos), entry = tt.get(positionKey, remaining);
     if (entry) {
       ttHits++; qTtHits++;
       const value = fromTable(entry.score, ply);
@@ -257,17 +257,30 @@ export function createSearchSession(position, options = {}) {
     // window. Reuse that proof from warmup or an earlier tactical visit, while
     // keeping their scores separate. In particular, a policy-exhausted leaf
     // must never be recorded as a legal witness.
-    const warmup = !entry && remaining !== 0 ? tt.get(`q0:${positionKey}`) : null;
+    const warmup = !entry && remaining !== 0 ? tt.get(positionKey, 0) : null;
+    // Exhausting the tactical tree at an unchecked position proves that every
+    // positive capture horizon has the same stand-pat value. A q0 visit alone
+    // cannot establish this: it only proves that some legal turn exists.
+    if (warmup?.noTacticalActions) {
+      ttHits++; qTtHits++;
+      return { score: fromTable(warmup.score, ply), pv: [] };
+    }
     let hasLegalAction = !!(entry?.hasLegalAction || warmup?.hasLegalAction);
     const cachedCheck = entry?.inCheck ?? warmup?.inCheck;
     const cachedStatic = entry?.staticScore ?? warmup?.staticScore;
     if (cachedCheck !== undefined) checkCache.set(pos, cachedCheck);
     if (cachedStatic !== undefined) evalCache.set(pos, cachedStatic);
     const searchAlpha = alpha, searchBeta = beta;
-    function finish(value, pv = [], exact = false) {
+    function finish(value, pv = [], exact = false, noTacticalActions = false) {
       const flag = exact ? 'exact' : value <= searchAlpha ? 'upper' : value >= searchBeta ? 'lower' : 'exact';
-      store(key, { depth: remaining, score: toTable(value, ply), flag, pv, hasLegalAction,
-        inCheck: checkCache.get(pos), staticScore: evalCache.get(pos) });
+      const result = { depth: remaining, score: toTable(value, ply), flag, pv, hasLegalAction,
+        inCheck: checkCache.get(pos), staticScore: evalCache.get(pos) };
+      if (noTacticalActions) {
+        // Keep this proof in the already-shared quiet entry, within the same
+        // memory budget, instead of duplicating it at every tactical horizon.
+        // Scores from searched captures remain horizon-specific.
+        tt.store(positionKey, { ...result, depth: 0, noTacticalActions: true }, 0);
+      } else tt.store(positionKey, result, remaining);
       return { score: value, pv };
     }
     const isCheck = remaining >= 0 && checked(pos);
@@ -289,14 +302,14 @@ export function createSearchSession(position, options = {}) {
     let iterator = actions(pos, entry?.pv[0], ply, { tacticalOnly, firstOnly, ordered });
     let next = iterator.next();
     if (next.done && tacticalOnly) {
-      if (hasLegalAction) return finish(best, [], true);
+      if (hasLegalAction) return finish(best, [], true, true);
       iterator = actions(pos, null, ply, { firstOnly: true, ordered: pos.board.length !== 1 });
       const witness = iterator.next();
       iterator.return?.();
       // No captures does not prove stalemate: quiet legal turns still count.
       if (witness.done) return finish(emptyResult(pos, ply, iterator).score, [], true);
       hasLegalAction = true;
-      return finish(best, [], true);
+      return finish(best, [], true, true);
     }
     // Prove at least one legal action before returning stand-pat: otherwise
     // stalemate or mate at the horizon could be mistaken for material gain.

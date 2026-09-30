@@ -11,12 +11,15 @@ export class SearchCache {
     this.maxEntries = maxEntries;
     this.maxBytes = maxBytes;
     this.entries = new Map();
+    this.namespaces = new Map();
     this.arraySizes = new WeakMap();
     this.memoryBytes = 0;
   }
 
   get size() { return this.entries.size; }
-  get(key) { return this.entries.get(key)?.entry; }
+  get(key, namespace) {
+    return (namespace === undefined ? this.entries : this.namespaces.get(namespace))?.get(key)?.entry;
+  }
 
   arrayBytes(array, limit) {
     if (!array) return 0;
@@ -34,11 +37,16 @@ export class SearchCache {
     return bytes;
   }
 
-  store(key, entry) {
+  store(key, entry, namespace) {
     if (!this.maxEntries || !this.maxBytes) return false;
-    const old = this.entries.get(key);
+    const index = namespace === undefined ? this.entries : this.namespaces.get(namespace);
+    const old = index?.get(key);
+    const identity = namespace === undefined ? key : old;
     if (old && entry.depth < old.entry.depth && entry.flag !== 'exact') return false;
-    let bytes = ENTRY_BYTES + key.length * 2;
+    // Tactical horizons index the same complete history string separately,
+    // without allocating and hashing a new prefixed history on every probe.
+    // Charge their extra index slot and fields within the shared byte budget.
+    let bytes = ENTRY_BYTES + key.length * 2 + (namespace === undefined ? 0 : 64);
     if (bytes > this.maxBytes) return false;
     bytes += this.arrayBytes(entry.pv, this.maxBytes - bytes);
     // Normal entries reference the first PV action twice, without retaining a
@@ -55,7 +63,7 @@ export class SearchCache {
     if (remainingBytes + bytes > this.maxBytes || remainingEntries >= this.maxEntries) {
       const evictions = [];
       for (const [oldKey, value] of this.entries) {
-        if (oldKey === key) continue;
+        if (oldKey === identity) continue;
         evictions.push(oldKey);
         remainingBytes -= value.bytes;
         remainingEntries--;
@@ -65,13 +73,28 @@ export class SearchCache {
         if (evictions.length === MAX_EVICTIONS) return false;
       }
       if (remainingBytes + bytes > this.maxBytes || remainingEntries >= this.maxEntries) return false;
-      for (const oldKey of evictions) this.entries.delete(oldKey);
+      for (const oldKey of evictions) {
+        const value = this.entries.get(oldKey);
+        if (value.namespace !== undefined) {
+          const table = this.namespaces.get(value.namespace);
+          table.delete(value.key);
+          if (!table.size) this.namespaces.delete(value.namespace);
+        }
+        this.entries.delete(oldKey);
+      }
     }
     if (old) {
       old.entry = entry;
       old.bytes = bytes;
     } else {
-      this.entries.set(key, { entry, bytes });
+      if (namespace === undefined) this.entries.set(key, { entry, bytes });
+      else {
+        let table = this.namespaces.get(namespace);
+        if (!table) this.namespaces.set(namespace, table = new Map());
+        const value = { entry, bytes, key, namespace };
+        table.set(key, value);
+        this.entries.set(value, value);
+      }
     }
     this.memoryBytes = remainingBytes + bytes;
     return true;

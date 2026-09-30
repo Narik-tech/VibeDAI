@@ -144,6 +144,8 @@ For longer diagnostics, set `BENCH_TIME_MS`, `SELFPLAY_TIME_MS`, or `SELFPLAY_PL
 
 Single-timeline turns now use direct action generation, static legality probes avoid unnecessary move ranking, and evaluation reuses spatial board facts. A local comparison reduced standard depth-five median time from 1.85 to 1.74 seconds. At 1.8 seconds, the updated engine reached depth five in two of five runs, versus none for the baseline. See [measurements and reproduction commands](docs/performance.md#direct-single-timeline-turns-and-cheaper-legality-proofs).
 
+Classical search now also reuses unchanged timeline evaluation data and proven quiet tactical leaves, generates pawn moves directly, and shares full-history strings between tactical cache indexes. In a local 1.8-second comparison, it completed depth five in five of five runs versus four for the preceding version. Fixed-depth gains were small and varied by position; see [the measurements](docs/performance.md#timeline-evaluation-and-tactical-cache-reuse).
+
 ## Design and limits
 
 - **Immutable history:** search shares unchanged past boards, but position keys include all history. Identical current boards with different pasts are different positions.
