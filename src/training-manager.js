@@ -204,7 +204,7 @@ export class TrainingManager {
     for (const [name, file, reason] of [
       ...(mode === 'fresh20m' ? [] : [['checkpoint', checkpoint, model === LEELA_ID
         ? 'Leela checkpoint missing. Train the imported LCZero model first, or set LEELA_CHECKPOINT to its trained checkpoint.'
-        : 'No trained checkpoint. Choose Fresh 20M to train a new model.']]),
+        : 'No trained checkpoint. Set up the 800k transformer from the Analysis page before starting self-play.']]),
       ['Python', python, 'Python environment missing. Run npm run transformer:setup.'],
       ['training suite', suite, 'The self-play starting-position suite is missing.'],
       ...(mode === 'fresh20m' ? [] : [['arena suite', arenaSuite, 'The evaluation starting-position suite is missing.']]),

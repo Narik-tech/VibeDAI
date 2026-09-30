@@ -18,17 +18,16 @@ let recommendationSignature = '', variationSignature = '', continuationAnimation
 const rankingTabs = new Map(), rankingRows = new Map();
 let boardSize = Number($('board-size').value);
 const searchSettingsKey = 'vibe-d-ai.search-settings.v1';
-const leelaName = 'Leela in a 5D Trenchcoat';
+const transformerName = 'Transformer · 800k';
 const resourceSettingIds = ['time-budget', 'search-depth', 'node-budget', 'cache-memory', 'search-threads'];
 const searchSettingIds = ['engine-select', ...resourceSettingIds];
 let refreshingEngines = false;
 let engines = {
   classical: {id:'classical', available:true},
   transformer: {id:'transformer', available:false, status:'checking'},
-  leela: {id:'leela', name:leelaName, available:false, status:'checking'},
 };
 function selectedEngine() { return $('engine-select').value; }
-function neuralEngine(id = selectedEngine()) { return id === 'transformer' || id === 'leela'; }
+function neuralEngine(id = selectedEngine()) { return id === 'transformer'; }
 function engineAvailable() { return engines[selectedEngine()]?.available === true; }
 function currentHeuristicsSignature() { return selectedEngine() === 'classical' ? heuristicsPanel?.signature() || '' : ''; }
 function searchMatchesPosition(current = search) {
@@ -41,12 +40,12 @@ function engineIdleStatus() {
 }
 
 function renderEngine() {
-  const neural = neuralEngine(), leela = selectedEngine() === 'leela';
+  const neural = neuralEngine();
   for (const option of $('search-depth').options) option.hidden = option.disabled = !neural && (Number(option.value) === 0 || Number(option.value) > 16);
   if (!neural && Number($('search-depth').value) === 0) $('search-depth').value = '4';
   if (!neural && Number($('search-depth').value) > 16) $('search-depth').value = '16';
   const info = engines[selectedEngine()] || {};
-  const name = leela ? leelaName : 'Transformer';
+  const name = transformerName;
   const device = typeof info.device === 'string' ? ` · ${info.device}` : '';
   $('engine-readiness').textContent = neural
     ? info.status === 'error' ? info.error || `${name} could not load; check setup`
@@ -55,13 +54,12 @@ function renderEngine() {
     : 'Classical search ready · CPU';
   $('engine-readiness').classList.toggle('unavailable', neural && !info.available);
   $('engine-description').textContent = neural
-    ? leela ? `${leelaName} transfers LCZero chess features into a model with timeline attention and 5D move and value heads. Playing strength is unmeasured; legal moves use the full rules.` : 'Experimental learned evaluation with bounded historical context and candidate turns. Playing strength is unmeasured; legal moves use the full rules.'
+    ? '800k transformer with learned evaluation, bounded historical context and candidate turns. Playing strength is unmeasured; legal moves use the full rules.'
     : 'Full-turn search with a handcrafted position evaluation.';
-  $('transformer-setup').hidden = !neural || leela || (info.available && info.status !== 'error') || info.status === 'checking';
-  $('leela-setup').hidden = !leela || (info.available && info.status !== 'error') || info.status === 'checking';
+  $('transformer-setup').hidden = !neural || (info.available && info.status !== 'error') || info.status === 'checking';
   $('engine-checkpoint').hidden = !neural || !info.checkpoint;
   $('engine-checkpoint').textContent = neural && info.checkpoint ? `Checkpoint: ${info.checkpoint}` : '';
-  $('opponent-engine').textContent = `Engine plays uses ${leela ? leelaName : neural ? 'Transformer' : 'Classical search'}.`;
+  $('opponent-engine').textContent = `Engine plays uses ${neural ? transformerName : 'Classical search'}.`;
   $('cache-memory-help').textContent = neural
     ? 'Neural engines use their own bounded model memory. Search cache (RAM) applies to Classical search only.'
     : 'Cache budget estimates RAM for saved search results; total RAM is higher. This CPU engine does not use GPU VRAM.';
@@ -80,7 +78,7 @@ async function refreshEngines() {
     const data = await api('/api/engines');
     for (const info of data.engines || []) if (Object.hasOwn(engines, info.id)) engines[info.id] = info;
   } catch (error) {
-    for (const id of ['transformer', 'leela']) engines[id] = {...engines[id], available:false, status:'error', error:`Availability check failed: ${error.message}`};
+    engines.transformer = {...engines.transformer, available:false, status:'error', error:`Availability check failed: ${error.message}`};
   } finally {
     refreshingEngines = false;
     renderEngine();
@@ -431,7 +429,7 @@ function renderResourceStats(result) {
   const usedMb = Number.isFinite(result?.cacheMemoryBytes) ? (result.cacheMemoryBytes / 1048576).toFixed(1) : null;
   $('stat-node-budget').textContent = `Max nodes: ${compactNumber(maxNodes)}`;
   if (neuralEngine(search?.engine || selectedEngine())) {
-    $('stat-cache').textContent = result?.model?.device ? `Model: ${result.model.device}` : (search?.engine || selectedEngine()) === 'leela' ? 'Model: LCZero transfer' : 'Model: transformer';
+    $('stat-cache').textContent = result?.model?.device ? `Model: ${result.model.device}` : 'Model: 800k transformer';
     $('stat-cache').title = 'Neural inference device. GPU memory is bounded by the model configuration.';
     return;
   }
@@ -469,7 +467,7 @@ function renderAnalysis() {
     note = result.bestAction ? 'A legal fallback is available; no root turn has a true evaluation yet. Allow more think time to compare continuations.' : 'No recommendation is available within the search limits.';
   }
   if (neuralEngine(search?.engine) && result) {
-    const name = search.engine === 'leela' ? leelaName : 'Transformer';
+    const name = transformerName;
     const candidateLimit = result.candidateLimit ?? result.limits?.candidateLimit;
     const innerCandidateLimit = result.innerCandidateLimit ?? result.limits?.innerCandidateLimit;
     const alphaBeta = result.searchPolicy === 'transformer-bounded-alpha-beta';

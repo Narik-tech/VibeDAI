@@ -3,7 +3,7 @@
 The runner repeatedly plays the current transformer against itself, adds value
 targets to a bounded replay buffer, trains a candidate on the local GPU, and
 tests it against the incumbent. Only a passing candidate replaces the selected
-checkpoint. The current analysis checkpoint is used by **Transformer · experimental**
+checkpoint. The current analysis checkpoint is used by **Transformer · 800k**
 in the UI. Classical search and the
 existing `npm run selfplay` diagnostic are separate.
 
@@ -13,20 +13,17 @@ existing `npm run selfplay` diagnostic are separate.
 
 Start the local server with `npm start` and open **Training** in the app header
 at `http://127.0.0.1:5173/training`. The local transformer Python environment
-is required to start training. Choose a run mode:
+is required to start training. **Self-play · 800k model** uses the existing
+analysis checkpoint at `artifacts/transformer/model.pt`.
 
-- **Fresh 20M model** generates new training data, initializes the 20M model from
-  scratch, and saves its checkpoint in a new run folder. It starts with 1,000
-  updates, batch size 1, a 512-token training context, 4,096 data samples, and
-  2,000 search nodes per sample. Each run keeps its data and checkpoint;
-  fresh training leaves the current analysis checkpoint in place.
-- **Self-play · 20M model** improves the latest completed fresh 20M checkpoint through
-  the self-play and promotion loop described below.
-- **Self-play · current model** runs self-play using the existing analysis checkpoint.
+Fresh 20M, 20M self-play, and Leela are archived and hidden from the UI.
+Existing local 20M runs are in `archive/models-20260930/fresh20m`, and LCZero
+artifacts are in `archive/models-20260930/lc0`. The archive's `manifest.json`
+records original paths and checkpoint hashes. CLI workflows remain available with
+explicit archived paths.
 
-The page runs one training job at a time across these modes. It shows saved
-fresh runs and self-play history; saved games can be reviewed without starting
-a model.
+The page runs one training job at a time. It shows the 800k model's self-play
+history; saved games can be reviewed without starting a model.
 
 Adjust the parameters before starting a run. Settings cover cycle count
 (`0` means continuous), self-play games, independent self-play and arena concurrency,
@@ -36,7 +33,7 @@ device, and the paired promotion gate. Changes apply to the next run.
 Browser preferences are saved locally; each cycle also records its exact
 settings in `iteration.json` and `report.json`.
 
-The run view shows its current phase, saved fresh runs, retained cycle reports,
+The run view shows its current phase, retained cycle reports,
 promotion decisions, and training log. **Stop run** cooperatively stops the
 active job and preserves saved artifacts and completed records. Closing a browser tab
 does not stop training; stopping the server requests cancellation. An external
@@ -55,7 +52,9 @@ command line in the default run directory. Retention still follows
 Run from the project directory in PowerShell. This workstation already has the
 CUDA environment and a trained checkpoint. For a fresh installation, first run
 `npm run transformer:setup`, `npm run transformer:data`, and
-`npm run transformer:train`. Self-play requires a trained model to start.
+`node scripts/transformer.js train --width 128 --heads 4 --layers 4 --feedforward 384`.
+Self-play requires a trained model to start; skip data generation and training
+when the active checkpoint already exists.
 
 One cycle with the default settings:
 
@@ -142,7 +141,7 @@ for a 20M checkpoint and measure memory before increasing either setting.
 `--max-tokens` accepts integers from 16 to 4096 and limits the board history
 encoded for each training example. Lower limits reduce training memory and
 discard more distant board history when a position exceeds the limit. The command-line
-default stays at 4096; the Training page's 20M settings use 512.
+default stays at 4096.
 Self-play resumes the saved
 architecture; first [train a fresh 20M checkpoint](transformer.md#training-the-20m-model)
 to use the larger model. Use `--device cpu` without CUDA.

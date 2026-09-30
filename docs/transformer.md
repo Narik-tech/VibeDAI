@@ -1,6 +1,6 @@
 # Transformer engine
 
-The UI's **Transformer · experimental** engine uses a separately trained neural
+The UI's **Transformer · 800k** engine uses a separately trained neural
 value evaluator and bounded search over complete legal turns. The existing
 classical engine remains available. Move generation and legality always use the
 complete 5D position, including its history; the neural model receives a bounded
@@ -18,12 +18,13 @@ From the project directory with Python 3.10+ installed:
 ```powershell
 npm run transformer:setup
 npm run transformer:data
-npm run transformer:train
+node scripts/transformer.js train --width 128 --heads 4 --layers 4 --feedforward 384
 npm run transformer:doctor
 npm start
 ```
 
-Then choose the Transformer engine in the analysis controls. Setup creates the
+Skip data generation and training if `artifacts/transformer/model.pt` already
+exists. Then choose **Transformer · 800k** in the analysis controls. Setup creates the
 project-local `.venv-transformer` environment and installs the tested PyTorch
 2.14.0 CUDA 12.6 wheel from the official PyTorch package index. The NVIDIA driver
 must support that CUDA runtime; a separate CUDA toolkit is unnecessary for the
@@ -278,13 +279,11 @@ or strength estimate. The bootstrap has no held-out validation claim.
 
 ### Training the 20M model
 
-The **Training** page can run this workflow directly. Select **Fresh 20M model**,
-adjust the data and learning settings, then select **Start fresh 20M**. The server
-generates policy-labeled teacher data and trains the full 20,000,257-parameter
-model in a separate run folder. Progress, loss, saved checkpoint paths, and stop
-controls are shown on the page. After completion, **Self-play · 20M model** uses
-the latest completed fresh model. Each model has its own self-play history;
-the current analysis checkpoint remains separately selectable.
+The 20M model is archived and hidden from the UI. Existing local fresh runs and
+their self-play history are in `archive/models-20260930/fresh20m`; the archive's
+`manifest.json` records original paths and checkpoint hashes. The **Training** page
+offers **Self-play · 800k model** for the active checkpoint. The CLI still
+supports the larger architecture and explicit archived checkpoint paths.
 
 New training runs use the 20M architecture by default (19.14M value-only;
 20.00M when policy labels enable the optional policy head). Existing checkpoints
@@ -301,7 +300,7 @@ The standard context budget remains 4,096; this example explicitly uses 512
 during training to reduce memory. Evaluate the candidate on held-out data before
 selecting it with `TRANSFORMER_CHECKPOINT`. Self-play can then resume that larger
 checkpoint. Its CLI defaults to a 4,096-token training budget; use `--max-tokens`
-to adjust it. The 20M UI starts at 512 tokens. Resuming the old checkpoint
+to adjust it. Resuming the old checkpoint
 continues training the old architecture.
 To create a model with the previous dimensions, pass
 `--width 128 --heads 4 --layers 4 --feedforward 384`.

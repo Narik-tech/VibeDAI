@@ -71,91 +71,124 @@ function readyTraining(app) {
       leelaModel:{available:true,checkpoint:'artifacts/lc0/best.pt'}, iterations:[]}; online = true;`);
 }
 
-test('Leela selection persists and uses neural depth and resource controls', () => {
+test('analysis offers only Classical and the 800k transformer, with archived settings falling back to Classical', () => {
   const app = ui('app');
+  assert.deepEqual(app.nodes.get('engine-select').options.map(option => option.value), ['classical','transformer']);
+  assert.match(app.nodes.get('engine-select').options[1].textContent, /800k/);
+  assert.equal(app.nodes.has('leela-setup'), false);
   app.storage.set('vibe-d-ai.search-settings.v1', JSON.stringify({'engine-select':'leela','search-depth':'0'}));
-  app.run(`restoreSearchSettings(); engines.leela = {available:true,status:'unloaded',checkpoint:'artifacts/lc0/best.pt'}; renderEngine(); saveSearchSettings();`);
-  assert.equal(app.nodes.get('engine-select').value, 'leela');
+  app.run(`restoreSearchSettings(); renderEngine(); saveSearchSettings();`);
+  assert.equal(app.nodes.get('engine-select').value, 'classical');
+  assert.equal(app.nodes.get('search-depth').value, '4');
+  assert.equal(app.nodes.get('cache-memory').disabled, false);
+  assert.equal(JSON.parse(app.storage.get('vibe-d-ai.search-settings.v1'))['engine-select'], 'classical');
+});
+
+test('800k selection persists and uses neural depth and resource controls', () => {
+  const app = ui('app');
+  app.storage.set('vibe-d-ai.search-settings.v1', JSON.stringify({'engine-select':'transformer','search-depth':'0'}));
+  app.run(`restoreSearchSettings(); engines.transformer = {available:true,status:'unloaded',checkpoint:'artifacts/transformer/model.pt'}; renderEngine(); saveSearchSettings();`);
+  assert.equal(app.nodes.get('engine-select').value, 'transformer');
   assert.equal(app.nodes.get('search-depth').value, '0');
   assert.equal(app.nodes.get('cache-memory').disabled, true);
   assert.equal(app.nodes.get('search-threads').disabled, true);
-  assert.match(app.nodes.get('engine-description').textContent, /Leela in a 5D Trenchcoat/);
-  assert.match(app.nodes.get('opponent-engine').textContent, /Leela in a 5D Trenchcoat/);
-  assert.match(app.nodes.get('engine-checkpoint').textContent, /artifacts\/lc0\/best.pt/);
-  assert.equal(JSON.parse(app.storage.get('vibe-d-ai.search-settings.v1'))['engine-select'], 'leela');
+  assert.match(app.nodes.get('engine-description').textContent, /800k transformer/);
+  assert.match(app.nodes.get('opponent-engine').textContent, /Transformer · 800k/);
+  assert.match(app.nodes.get('engine-checkpoint').textContent, /artifacts\/transformer\/model.pt/);
+  assert.equal(JSON.parse(app.storage.get('vibe-d-ai.search-settings.v1'))['engine-select'], 'transformer');
   app.run(`$('engine-select').value = 'classical'; renderEngine();`);
   assert.equal(app.nodes.get('search-depth').value, '4');
   assert.equal(app.nodes.get('cache-memory').disabled, false);
 });
 
-test('Leela availability is refreshed independently and reports its own setup', async () => {
+test('engine refresh ignores archived engines and preserves transformer availability and setup', async () => {
   const app = ui('app');
-  app.run(`$('engine-select').value = 'leela'; api = async () => ({engines:[{id:'leela',available:true,status:'unloaded'}]});`);
+  app.run(`$('engine-select').value = 'transformer'; api = async () => ({engines:[{id:'transformer',available:true,status:'unloaded'},{id:'leela',available:true,status:'unloaded'}]});`);
   await app.run('refreshEngines()');
   assert.equal(app.run('engineAvailable()'), true);
+  assert.equal(app.run("Object.hasOwn(engines, 'leela')"), false);
   app.run(`api = async () => { throw new Error('Disconnected'); };`);
   await app.run('refreshEngines()');
   assert.equal(app.run('engineAvailable()'), false);
-  assert.equal(app.nodes.get('leela-setup').hidden, false);
-  assert.equal(app.nodes.get('transformer-setup').hidden, true);
+  assert.equal(app.nodes.get('transformer-setup').hidden, false);
 });
 
-test('automatic opponent sends Leela identity with neural resource budgets', async () => {
+test('automatic opponent sends transformer identity with neural resource budgets', async () => {
   const app = ui('app');
-  app.run(`let request; api = async (path,body) => { request = {path,body}; return {jobId:'leela-job'}; }; renderAnalysis = () => {};
-    $('engine-select').value = 'leela'; $('ai-side').value = 'black'; engines.leela.available = true;
+  app.run(`let request; api = async (path,body) => { request = {path,body}; return {jobId:'transformer-job'}; }; renderAnalysis = () => {};
+    $('engine-select').value = 'transformer'; $('ai-side').value = 'black'; engines.transformer.available = true;
     game = {revision:5,position:{action:1},pending:[]}; scheduleOpponent();`);
   assert.equal(app.timers.length, 1);
   await app.timers[0]();
   const request = JSON.parse(app.run('JSON.stringify(request)'));
   assert.equal(request.path, '/api/analyze');
-  assert.equal(request.body.engine, 'leela');
+  assert.equal(request.body.engine, 'transformer');
   assert.equal(request.body.cacheMemoryMb, 0);
   assert.equal(request.body.threads, 1);
   assert.equal(app.run('search.autoPlay'), true);
 });
 
-test('Leela training has independent defaults, saved parameters and checkpoint readiness', () => {
+test('training offers only the 800k model and restores its saved parameters', () => {
   const app = ui('training'); readyTraining(app);
-  app.run(`selectMode('leela'); renderLeelaModel();`);
-  assert.equal(app.nodes.get('param-batchSize').value, '4');
-  assert.equal(app.nodes.get('start-training').disabled, false);
-  assert.match(app.nodes.get('model-summary').textContent, /Leela in a 5D Trenchcoat/);
-  assert.equal(app.nodes.get('leela-checkpoint').textContent, 'artifacts/lc0/best.pt');
-  app.run(`$('param-batchSize').value = '2'; saveParameters(); selectMode('current');`);
-  assert.equal(app.nodes.get('param-batchSize').value, '16');
+  assert.deepEqual(app.nodes.get('training-mode').options.map(option => option.value), ['current']);
+  assert.equal(app.nodes.has('leela-model-heading'), false);
+  assert.equal(app.nodes.has('fresh-model-heading'), false);
+  app.storage.set('vibe-d-ai.training-settings.v1', JSON.stringify({batchSize:8}));
+  app.storage.set('vibe-d-ai.training-leela-settings.v1', JSON.stringify({batchSize:2}));
+  app.storage.set('vibe-d-ai.training-20m-settings.v1', JSON.stringify({batchSize:1}));
   app.run(`selectMode('leela');`);
-  assert.equal(app.nodes.get('param-batchSize').value, '2');
-  app.run(`snapshot.leelaAvailability = {available:false,reason:'LCZero checkpoint missing'}; updateControls();`);
-  assert.equal(app.nodes.get('start-training').disabled, true);
-  assert.equal(app.nodes.get('run-hint').textContent, 'LCZero checkpoint missing');
-  app.run(`selectMode('fresh20m');`);
+  assert.equal(app.nodes.get('training-mode').value, 'current');
+  assert.equal(app.nodes.get('param-batchSize').value, '8');
   assert.equal(app.nodes.get('start-training').disabled, false);
+  app.run(`$('param-batchSize').value = '4'; saveParameters(); selectMode('fresh20m');`);
+  assert.equal(app.nodes.get('param-batchSize').value, '4');
+  assert.equal(app.nodes.get('training-mode').value, 'current');
+  assert.equal(JSON.parse(app.storage.get('vibe-d-ai.training-leela-settings.v1')).batchSize, 2);
+  app.run(`snapshot.availability = {available:false,reason:'800k checkpoint missing'}; updateControls();`);
+  assert.equal(app.nodes.get('start-training').disabled, true);
+  assert.equal(app.nodes.get('run-hint').textContent, '800k checkpoint missing');
 });
 
-test('Leela training submits a resume run while fresh mode retains its own endpoint', async () => {
+test('training submits only the current 800k model even after a retired mode is requested', async () => {
   const app = ui('training'); readyTraining(app);
   app.run(`let requests = []; api = async (path,body) => { requests.push({path,body}); return {}; }; refreshTraining = async () => {}; selectMode('leela');`);
   await app.nodes.get('training-form').listeners.get('submit')({preventDefault(){}});
-  let request = JSON.parse(app.run('JSON.stringify(requests.at(-1))'));
+  const request = JSON.parse(app.run('JSON.stringify(requests.at(-1))'));
   assert.equal(request.path, '/api/training/start');
-  assert.equal(request.body.options.model, 'leela');
-  assert.equal(request.body.options.batchSize, 4);
-  app.run(`selectMode('fresh20m');`);
-  await app.nodes.get('training-form').listeners.get('submit')({preventDefault(){}});
-  request = JSON.parse(app.run('JSON.stringify(requests.at(-1))'));
-  assert.equal(request.path, '/api/training/fresh/start');
-  assert.equal(request.body.options.model, undefined);
+  assert.equal(request.body.options.model, 'current');
+  assert.equal(request.body.options.batchSize, 16);
 });
 
-test('retained Leela iteration restores its model and displays its full name', () => {
+test('retained iteration choices omit archived models and parameter reuse stays on the 800k model', () => {
   const app = ui('training'); readyTraining(app);
-  app.run(`snapshot.iterations = [{id:'leela__iteration-00000001',model:'leela',iteration:1,status:'evaluated'}]; renderIterationChoices();
-    iterationData = {report:{options:{...snapshot.leelaDefaults,batchSize:2}}};`);
-  assert.match(app.nodes.get('iteration-select').options[0].textContent, /Leela in a 5D Trenchcoat/);
+  app.run(`snapshot.iterations = [
+    {id:'leela__iteration-00000003',model:'leela',iteration:3,status:'evaluated'},
+    {id:'fresh-test__iteration-00000002',model:'20m',iteration:2,status:'evaluated'},
+    {id:'iteration-00000001',model:'current',iteration:1,status:'evaluated'},
+    {id:'iteration-00000000',iteration:0,status:'evaluated'}];
+    selectedIteration = 'leela__iteration-00000003'; renderIterationChoices();
+    iterationData = {report:{options:{...defaults,model:'current',batchSize:2}}};`);
+  assert.deepEqual(app.nodes.get('iteration-select').options.map(option => option.value), ['iteration-00000001','iteration-00000000']);
+  assert.equal(app.run('selectedIteration'), 'iteration-00000001');
+  assert.match(app.nodes.get('iteration-select').options[0].textContent, /800k/);
   app.nodes.get('reuse-parameters').listeners.get('click')();
-  assert.equal(app.nodes.get('training-mode').value, 'leela');
+  assert.equal(app.nodes.get('training-mode').value, 'current');
   assert.equal(app.nodes.get('param-batchSize').value, '2');
-  app.run(`snapshot.status = {state:'running',mode:'selfplay',model:'leela',phase:'training'}; renderMonitor();`);
-  assert.match(app.nodes.get('run-title').textContent, /Leela in a 5D Trenchcoat/);
+  app.run(`snapshot.status = {state:'running',mode:'selfplay',model:'current',phase:'training'}; renderMonitor();`);
+  assert.match(app.nodes.get('run-title').textContent, /800k self-play/);
+});
+
+test('older archived run status keeps stop controls without being labeled as the 800k model', () => {
+  const app = ui('training'); readyTraining(app);
+  for (const status of [
+    {state:'running',mode:'selfplay',model:'leela'},
+    {state:'running',mode:'selfplay',model:'20m'},
+    {state:'running',mode:'fresh20m'},
+    {state:'running',mode:'selfplay',options:{model:'leela'}},
+  ]) {
+    app.run(`snapshot.status = ${JSON.stringify(status)}; renderMonitor(); updateControls();`);
+    assert.equal(app.nodes.get('run-title').textContent, 'Training · training in progress');
+    assert.equal(app.nodes.get('stop-training').disabled, false);
+    assert.equal(app.nodes.get('start-training').disabled, true);
+  }
 });

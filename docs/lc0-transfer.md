@@ -37,29 +37,24 @@ Use direct `node` invocation for flags in PowerShell. npm aliases are also
 available: `lc0:inspect`, `lc0:data`, `lc0:train`, `lc0:evaluate`, `lc0:smoke`,
 and `lc0:test`.
 
-To analyze/play with this checkpoint in the app:
+Leela is archived and hidden from the analysis and training menus. Existing local
+artifacts are stored in `archive/models-20260930/lc0`; the archive's
+`manifest.json` records original paths and checkpoint hashes. The commands above
+describe creating a new transfer model. To analyze with the archived checkpoint
+from the command line:
 
 ```powershell
-npm start
+$env:LEELA_CHECKPOINT = 'archive/models-20260930/lc0/best.pt'
+node src/cli.js --engine leela --time 3 --depth 3
 ```
 
-Choose **Leela in a 5D Trenchcoat** under **Analysis engine**. Set **Engine plays**
-to Black or White for a local opponent. The engine uses `artifacts/lc0/best.pt`
-and its own inference process. It requires a trained LCZero transfer checkpoint;
-the generic Transformer remains a separate choice.
+The CLI requires a trained LCZero transfer checkpoint and uses its own inference
+process. `LEELA_PYTHON` and `LEELA_DEVICE` select the Python environment and device;
+otherwise they follow `TRANSFORMER_PYTHON`/`TRANSFORMER_DEVICE`.
 
-In **Training**, choose **Leela in a 5D Trenchcoat** to continue self-play using
-the same checkpoint. Its default batch size is 4, its seed data is
-`artifacts/lc0/curriculum.jsonl`, and its starting suite excludes the curriculum
-validation families. Promotion updates the checkpoint used for analysis. Run
-history and game review use `artifacts/lc0/selfplay`, with separate iteration IDs.
-Training begins only when you select Start.
-
-Override these defaults with `LEELA_CHECKPOINT`, `LEELA_PYTHON`, `LEELA_DEVICE`,
-`LEELA_RUN_DIR`, `LEELA_SEED_DATA`, or `LEELA_SUITE`. For example, set
-`$env:LEELA_DEVICE = 'cpu'` before `npm start` for CPU use. Without a Leela-specific
-override, Python and device follow `TRANSFORMER_PYTHON`/`TRANSFORMER_DEVICE`.
-Restart a running server after changing environment variables.
+The archived self-play history retains its original checkpoint paths. To resume
+that run, restore the LCZero directory to the original location recorded in the
+manifest. For a separate experiment, copy the checkpoint and use a new run directory.
 
 ## What is transferred
 

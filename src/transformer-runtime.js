@@ -27,7 +27,7 @@ export class TransformerRuntime {
   }
 
   describe() {
-    const missing = !existsSync(this.checkpoint) ? 'No trained checkpoint. Run npm run transformer:data, then npm run transformer:train.'
+    const missing = !existsSync(this.checkpoint) ? 'No trained checkpoint. See docs/transformer.md to set up the 800k transformer.'
       : !existsSync(this.python) ? 'Python environment missing. Run npm run transformer:setup.' : null;
     return {
       id: 'transformer', name: 'Transformer', available: !missing && !this.closed,
@@ -195,11 +195,10 @@ export class TransformerRuntime {
   close() { this.closed = true; this.stopProcess(); }
 }
 
-export function listEngines(runtime, leelaRuntime) {
+export function listEngines(runtime) {
   return { engines: [
     { id: 'classical', name: 'Classical search', available: true, status: 'ready', description: 'CPU alpha-beta search with handcrafted evaluation.' },
     runtime.describe(),
-    ...(leelaRuntime ? [leelaRuntime.describe()] : []),
   ] };
 }
 

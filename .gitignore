@@ -2,6 +2,7 @@ node_modules/
 coverage/
 *.log
 artifacts/
+archive/models-*/
 .DS_Store
 .venv-transformer/
 __pycache__/

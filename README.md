@@ -4,7 +4,7 @@ A local analysis and play workbench, command-line engine, and JavaScript library
 
 The classical engine searches **complete submitted turns**, including turns that require moves on several timelines. Ordinary moves are considered only on boards currently required to advance the present; optional boards contribute only cross-board moves. It uses iterative deepening, principal variation alpha-beta search, full-turn move ordering, transposition caching in both normal and tactical search, capture/promotion quiescence, and a multiverse evaluation. The shared rules layer supports historical travel, branching, inactive timelines, castling, en passant, promotions, and the variant pieces supported by the pinned rules dependency.
 
-The UI offers **Classical search**, an experimental **Transformer**, and **Leela in a 5D Trenchcoat**, which uses the LCZero transfer model. The neural engines have separate checkpoints and training choices. These engines have no established Elo. Search budgets, depth, principal variation, and incomplete results are visible so behavior can be measured and improved.
+The UI offers **Classical search** and **Transformer · 800k**. The 20M transformer and LCZero transfer models are archived and hidden from the analysis and training menus. These engines have no established Elo. Search budgets, depth, principal variation, and incomplete results are visible so behavior can be measured and improved.
 
 The **Position heuristics** panel below the boards explains the displayed position's static evaluation, with signed centipawn contributions for individual features and timeline frontiers. Sliders and number inputs adjust component weights, positional terms, piece values, and search ordering. Changes refresh the breakdown and apply to subsequent classical analyses and automatic replies, including parallel searches. Settings persist in this browser; **Reset defaults** restores the shipped profile. Changing a setting invalidates the previous recommendation. The static total evaluates the displayed position (including a partial turn); the Engine score comes from searching continuations, so the two can differ. Neural engines use their own models and do not use these controls. Legal move rules and the present-spatial search policy remain fixed.
 
@@ -25,12 +25,12 @@ Choose the engine in the Engine panel. The selection and resource settings are s
 
 Classical search does not allocate GPU VRAM. Profiling found rule generation and history handling to dominate its runtime; its small, sequential evaluations do not provide enough batched work to justify GPU transfers. See [the classical engine performance and GPU assessment](docs/performance.md). The cache control caps estimated RAM retained for saved search results, including full position-history keys and move arrays; total process memory is higher. The selected amount is a budget, not an up-front allocation. Results display estimated cache usage against that budget. Choose Off to disable the cache.
 
-To prepare the transformer, run these commands from the project folder, then select **Transformer · experimental** and choose **Refresh** in the UI:
+To prepare the transformer on a fresh installation, run these commands from the project folder, then select **Transformer · 800k** and choose **Refresh** in the UI. Skip data generation and training if `artifacts/transformer/model.pt` already exists:
 
 ```sh
 npm run transformer:setup
 npm run transformer:data
-npm run transformer:train
+node scripts/transformer.js train --width 128 --heads 4 --layers 4 --feedforward 384
 npm run transformer:doctor
 ```
 
@@ -38,7 +38,7 @@ The transformer uses bounded historical context and candidate turns to keep trai
 
 To improve an existing transformer through self-play, run `node scripts/transformer-selfplay.js --iterations 0 --device cuda` and stop with Ctrl+C. The loop generates legal games, trains on a bounded replay buffer, and promotes a candidate only after passing paired matches against the incumbent. Use `--iterations 1` for one cycle. The shortcut `npm run transformer:selfplay:continuous` runs continuously and selects CUDA when available. Use direct `node` invocation when setting options: PowerShell's `npm.ps1` forwarding can strip flag names. See [self-play settings, promotion rules, logs and recovery](docs/transformer-selfplay.md).
 
-You can also open **Training** in the app header, or visit **http://127.0.0.1:5173/training**. Adjust the self-play, search, training, and promotion settings, then start or stop a run from the browser. The page shows progress, retained cycle reports, and training logs. Select a self-play or arena game to review its multiverse turn by turn, including recorded search scores and results. Review is read-only and leaves the analysis board untouched. Training requires the local Python environment and an existing checkpoint; the setup commands above prepare both.
+You can also open **Training** in the app header, or visit **http://127.0.0.1:5173/training**. **Self-play · 800k model** trains the current analysis checkpoint. Adjust the self-play, search, training, and promotion settings, then start or stop a run from the browser. The page shows progress, retained cycle reports, and training logs. Select a self-play or arena game to review its multiverse turn by turn, including recorded search scores and results. Review is read-only and leaves the analysis board untouched. Training requires the local Python environment and an existing checkpoint; the setup commands above prepare both.
 
 Select a piece on a playable board, then a highlighted destination on any board. A time-travel move can create a new timeline. Continue until the turn can be submitted, then choose **Submit turn**. **Analyze** recommends an entire remaining turn; **Play best** applies it and submits. The opponent selector enables automatic engine replies. Undo removes one pending move, or a whole submitted turn when no moves are pending.
 
@@ -54,12 +54,12 @@ result to the existing Transformer engine and self-play promotion loop. Use
 evaluation, and runtime verification. The short validation run confirms the
 pipeline works; it does not establish playing strength.
 
-Choose **Leela in a 5D Trenchcoat** under **Analysis engine** to analyze with the
-trained LCZero model. Set **Engine plays** to White or Black to use it as an
-opponent. In **Training**, choose the same name to resume its self-play training.
-Both use `artifacts/lc0/best.pt` by default; `LEELA_CHECKPOINT` selects another
-trained transfer checkpoint. Leela's training history is stored separately in
-`artifacts/lc0/selfplay`.
+Leela is archived and hidden from the UI. Existing local LCZero artifacts are
+stored in `archive/models-20260930/lc0`; fresh 20M runs are in
+`archive/models-20260930/fresh20m`. The archive's `manifest.json` records original
+paths and checkpoint hashes. The active 800k checkpoint remains at
+`artifacts/transformer/model.pt`. Legacy CLI workflows remain available with
+explicit archived checkpoint and data paths; see the transfer guide.
 
 ## Command line
 

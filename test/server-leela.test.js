@@ -62,15 +62,14 @@ async function fixture(t, overrides = {}) {
   return { request, wait, transformer, leela, server, training };
 }
 
-test('engine catalog lists Leela independently and does not load either neural model', async t => {
+test('engine catalog keeps classical and transformer visible without loading archived Leela', async t => {
   const { request, transformer, leela } = await fixture(t);
   transformer.available = false;
   const { data, status } = await request('/api/engines');
   assert.equal(status, 200);
-  assert.deepEqual(new Set(data.engines.map(engine => engine.id)), new Set(['classical', 'transformer', 'leela']));
-  assert.equal(data.engines.find(engine => engine.id === 'leela').name, NAME);
+  assert.deepEqual(data.engines.map(engine => engine.id), ['classical', 'transformer']);
+  assert.equal(data.engines.find(engine => engine.id === 'classical').available, true);
   assert.equal(data.engines.find(engine => engine.id === 'transformer').available, false);
-  assert.equal(data.engines.find(engine => engine.id === 'leela').available, true);
   assert.equal(transformer.starts, 0);
   assert.equal(leela.starts, 0);
 });

@@ -64,7 +64,7 @@ async function createHistory(root) {
   let available = true;
   const manager = new TrainingManager({ runDir, checkpoint: path.join(directory, 'model.pt'),
     python: path.join(directory, 'python'),
-    availability: async ({ mode }) => ({ available:mode === 'fresh20m' || available, reason:available ? undefined : 'Test environment needs a trained checkpoint.' }),
+    availability: async () => ({ available, reason:available ? undefined : 'Test environment needs a trained checkpoint.' }),
     workerFactory: args => {
       started.push(args.options);
       modes.push(args.mode);
@@ -77,9 +77,9 @@ async function createHistory(root) {
         }, 30);
       };
       worker.terminate = async () => { worker.emit('exit', 1); return 1; };
-      setTimeout(() => worker.emit('message', { type: 'event', event: args.mode === 'fresh20m' ? {
-        event:'data-progress',samples:8,total:64,
-      } : { event: 'selfplay-start', iteration: 2, device: 'cpu', trainedSteps: 16 } }), 20);
+      setTimeout(() => worker.emit('message', { type: 'event', event: {
+        event: 'selfplay-start', iteration: 2, device: 'cpu', trainedSteps: 16,
+      } }), 20);
       return worker;
     },
   });
@@ -102,72 +102,15 @@ async function createHistory(root) {
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(`${base}/training`);
     await page.getByRole('heading', { name: /training/i }).first().waitFor();
-    await page.locator('#param-samples').waitFor();
+    await page.locator('#param-games').waitFor();
     await page.waitForFunction(() => !document.getElementById('start-training').disabled);
-    assert.equal(await page.locator('#training-mode').inputValue(), 'fresh20m');
-    assert.equal(await page.locator('#param-batchSize').inputValue(), '1', 'Fresh defaults must ignore legacy self-play settings.');
-    assert.equal(await page.locator('#param-maxTokens').inputValue(), '512');
-    assert.equal(await page.locator('#param-samples').inputValue(), '4096');
-    assert.match(await page.locator('#model-summary').innerText(), /20,000,257/);
+    assert.equal(await page.locator('#training-mode').inputValue(), 'current');
+    assert.deepEqual(await page.locator('#training-mode option').evaluateAll(options => options.map(option => option.value)), ['current']);
+    assert.equal(await page.locator('#param-batchSize').inputValue(), '8', 'Current self-play must retain saved settings.');
+    assert.equal(await page.locator('#param-steps').inputValue(), '16');
+    assert.match(await page.locator('#model-summary').innerText(), /800k/i);
+    assert.equal(await page.locator('#fresh-model-heading, #leela-model-heading').count(), 0, 'Archived models must not have training panels.');
     assert.equal(started.length, 0, 'Opening the page must not start training.');
-    await page.locator('#training-mode').selectOption('selfplay20m');
-    assert.equal(await page.locator('#start-training').isDisabled(), true, '20M self-play needs a completed fresh model.');
-    await page.locator('#training-mode').selectOption('fresh20m');
-    await page.locator('#param-samples').fill('0');
-    await page.locator('#start-training').click();
-    assert.equal(started.length, 0, 'Invalid fresh settings must not start training.');
-    await page.locator('#param-samples').fill('64');
-    await page.locator('#param-steps').fill('3');
-    await page.locator('#param-steps').blur();
-    await page.reload();
-    await page.waitForFunction(() => !document.getElementById('start-training').disabled);
-    assert.equal(await page.locator('#param-samples').inputValue(), '64');
-    assert.equal(await page.locator('#param-steps').inputValue(), '3');
-    await page.locator('#start-training').click();
-    await page.waitForFunction(() => !document.getElementById('stop-training').disabled);
-    assert.equal(started.length, 1);
-    assert.equal(modes[0], 'fresh20m');
-    assert.equal(started[0].samples, 64);
-    assert.equal(started[0].batchSize, 1);
-    assert.equal(started[0].maxTokens, 512);
-    assert.equal(await page.locator('#training-mode').isDisabled(), true, 'One worker locks all run modes.');
-    await page.locator('#refresh-training').click();
-    await page.locator('#run-detail').filter({ hasText: /8.*positions/ }).waitFor();
-    workers[0].emit('message', { type:'event', event:{event:'training-progress',step:2,loss:.2345} });
-    await page.locator('#refresh-training').click();
-    await page.locator('#run-detail').filter({ hasText: /update 2.*loss 0\.2345/ }).waitFor();
-    assert.equal(await page.locator('#current-iteration').innerText(), '2');
-    assert.equal(await page.locator('.pipeline [data-phase="training"]').getAttribute('aria-current'), 'step');
-    await page.locator('#stop-training').click();
-    await page.locator('#run-state').filter({ hasText: /interrupted/i }).waitFor();
-    await page.waitForFunction(() => !document.getElementById('training-mode').disabled);
-    // Publish an isolated fake checkpoint to exercise selection without running Python.
-    await fs.mkdir(started[0].runDir, { recursive:true });
-    await Promise.all([
-      fs.writeFile(started[0].checkpoint, 'fake 20M checkpoint'),
-      fs.writeFile(path.join(started[0].runDir, 'training.jsonl'), '{}\n'),
-      fs.writeFile(path.join(started[0].runDir, 'report.json'), JSON.stringify({
-        id:started[0].runId,status:'complete',startedAt:new Date().toISOString(),finishedAt:new Date().toISOString(),
-        parameters:20000257,trainedSteps:3,loss:.12,
-      })),
-    ]);
-    await page.locator('#refresh-training').click();
-    await page.locator('#model20m-state').filter({ hasText: 'READY FOR SELF-PLAY' }).waitFor();
-    assert.match(await page.locator('#fresh-runs').innerText(), /20,000,257 parameters/);
-    assert.match(await page.locator('#fresh-runs').innerText(), /model\.pt/);
-    await page.locator('#training-mode').selectOption('selfplay20m');
-    assert.equal(await page.locator('#param-batchSize').inputValue(), '1');
-    assert.equal(await page.locator('#param-maxTokens').inputValue(), '512');
-    await page.locator('#start-training').click();
-    await page.waitForFunction(() => !document.getElementById('stop-training').disabled);
-    assert.equal(started.length, 2);
-    assert.equal(started[1].model, '20m');
-    assert.equal(started[1].checkpoint, started[0].checkpoint);
-    await page.locator('#stop-training').click();
-    await page.locator('#run-state').filter({ hasText: /interrupted/i }).waitFor();
-    await page.waitForFunction(() => !document.getElementById('training-mode').disabled);
-    await page.locator('#training-mode').selectOption('current');
-    assert.equal(await page.locator('#param-batchSize').inputValue(), '8');
     const previousRuns = started.length;
     await page.locator('.game-item').first().waitFor();
     await page.locator('.game-item[data-game-id="selfplay-001"]').click();
@@ -227,7 +170,7 @@ async function createHistory(root) {
     await fillParameter('learningRate', '0.0005');
     await page.reload();
     await page.waitForFunction(() => !document.getElementById('start-training').disabled);
-    await page.locator('#training-mode').selectOption('current');
+    assert.equal(await page.locator('#training-mode').inputValue(), 'current');
     assert.equal(await page.locator('#param-games').inputValue(), '3');
     assert.equal(await page.locator('#param-arenaConcurrency').inputValue(), '4');
     assert.equal(await page.locator('#param-steps').inputValue(), '17');
@@ -235,11 +178,22 @@ async function createHistory(root) {
     await page.locator('#start-training').click();
     await page.waitForFunction(() => !document.getElementById('stop-training').disabled);
     assert.equal(started.length, previousRuns + 1);
+    assert.equal(modes[previousRuns], 'selfplay');
+    assert.equal(started[previousRuns].model, 'current');
+    assert.equal(started[previousRuns].batchSize, 8);
     assert.equal(started[previousRuns].games, 3);
     assert.equal(started[previousRuns].arenaConcurrency, 4);
     assert.equal(started[previousRuns].steps, 17);
     assert.equal(started[previousRuns].learningRate, 0.0005);
     assert.equal(await page.locator('#start-training').isDisabled(), true);
+    assert.equal(await page.locator('#training-mode').isDisabled(), true);
+    await page.locator('#refresh-training').click();
+    await page.locator('#current-iteration').filter({ hasText: '2' }).waitFor();
+    assert.equal(await page.locator('.pipeline [data-phase="selfplay"]').getAttribute('aria-current'), 'step');
+    workers[previousRuns].emit('message', { type:'event', event:{event:'training-progress',iteration:2,step:2,loss:.2345} });
+    await page.locator('#refresh-training').click();
+    assert.equal(await page.locator('.pipeline [data-phase="training"]').getAttribute('aria-current'), 'step');
+    assert.match(await page.locator('#event-log').innerText(), /"loss":0\.2345/);
     await page.locator('#stop-training').click();
     await page.locator('#run-state').filter({ hasText: /interrupted/i }).waitFor();
     await page.waitForFunction(() => !document.getElementById('start-training').disabled);
@@ -249,23 +203,19 @@ async function createHistory(root) {
     assert.equal(started.length, previousRuns + 1, 'Reusing parameters must not start a run.');
     await page.locator('.game-item[data-game-id="selfplay-001"]').click();
     await page.locator('#review-content').waitFor({ state: 'visible' });
-    await page.locator('#training-mode').selectOption('fresh20m');
     await fs.mkdir('artifacts', { recursive: true });
     await page.screenshot({ path: 'artifacts/training-desktop.png', fullPage: true });
     await page.setViewportSize({ width: 390, height: 844 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, 'Training workspace must fit mobile width.');
     await page.screenshot({ path: 'artifacts/training-mobile.png', fullPage: true });
-    await page.locator('#training-mode').selectOption('current');
     available = false;
     await page.locator('#refresh-training').click();
     await page.locator('#run-hint').filter({ hasText: /trained checkpoint/i }).waitFor();
     assert.equal(await page.locator('#start-training').isDisabled(), true);
-    await page.locator('#training-mode').selectOption('fresh20m');
-    assert.equal(await page.locator('#start-training').isDisabled(), false, 'Fresh training must remain available without a current checkpoint.');
     assert.equal(game.moves.length, 2);
     assert.deepEqual(await (await fetch(`${base}/api/game`)).json(), liveGameBefore);
     assert.deepEqual(errors, []);
-    console.log('Training browser smoke passed: fresh 20M defaults, separate saved settings, validation, fresh start/stop and progress, checkpoint history and 20M selection, self-play/arena replay, filters, parameter reuse, availability, read-only review, 390px layout.');
+    console.log('Training browser smoke passed: 800k-only training, saved settings, validation, current self-play start/stop and progress, self-play/arena replay, filters, parameter reuse, availability, read-only review, 390px layout.');
     console.log('Screenshots: artifacts/training-desktop.png, artifacts/training-mobile.png');
   } finally {
     if (browser) await browser.close();

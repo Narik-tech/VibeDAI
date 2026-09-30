@@ -90,7 +90,7 @@ export function createApp({ transformerRuntime = new TransformerRuntime(), leela
       if (req.method === 'GET' && url.pathname === '/api/heuristics') {
         return send(res, 200, { settings: HEURISTIC_SETTINGS, defaults: DEFAULT_HEURISTICS });
       }
-      if (req.method === 'GET' && url.pathname === '/api/engines') return send(res, 200, listEngines(transformerRuntime, leelaRuntime));
+      if (req.method === 'GET' && url.pathname === '/api/engines') return send(res, 200, listEngines(transformerRuntime));
       if (req.method === 'GET' && url.pathname === '/api/training') return send(res, 200, await trainingManager.snapshot());
       const trainingGame = /^\/api\/training\/iterations\/([^/]+)\/games\/([^/]+)$/.exec(url.pathname);
       if (req.method === 'GET' && trainingGame) {
