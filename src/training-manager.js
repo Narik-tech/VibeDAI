@@ -20,6 +20,10 @@ const optionFlags = Object.freeze({ iterations: 'iterations', games: 'games', ga
 const runnerDefaults = getSelfPlayDefaults();
 const safeDefaults = { ...runnerDefaults, checkpoint: DEFAULT_CHECKPOINT, python: DEFAULT_PYTHON,
   device: ['auto', 'cpu', 'cuda'].includes(runnerDefaults.device) ? runnerDefaults.device : 'auto' };
+// Archived model APIs retain their previous preset; the RTX 3060 preset is for the current 800k model.
+const archivedModelDefaults = { ...safeDefaults, iterations: 1, games: 8, gameConcurrency: 1, maxPlies: 40,
+  maxDepth: 2, timeMs: 3000, terminalWork: 20000, batchSize: 16, maxTokens: 4096, replaySize: 8192,
+  arenaConcurrency: 1, device: ['auto', 'cpu', 'cuda'].includes(process.env.TRANSFORMER_DEVICE) ? process.env.TRANSFORMER_DEVICE : 'auto' };
 export const TRAINING_DEFAULTS = Object.freeze({ ...Object.fromEntries(Object.keys(optionFlags).map(key => [key, safeDefaults[key]])), model: 'current' });
 const ITERATION_ID = /^iteration-\d{8,12}$/;
 const FRESH_ID = /^fresh-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -30,10 +34,11 @@ const missing = error => error.code === 'ENOENT';
 const failure = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
 const clone = value => structuredClone(value);
 
-export function validateTrainingOptions(input = {}, initialOptions = safeDefaults) {
+export function validateTrainingOptions(input = {}, initialOptions) {
   if (!input || typeof input !== 'object' || Array.isArray(input) || ![Object.prototype, null].includes(Object.getPrototypeOf(input))) {
     throw failure('Training options must be a JSON object.');
   }
+  initialOptions ??= input.model === LEELA_ID || input.model === '20m' ? archivedModelDefaults : safeDefaults;
   const args = [];
   for (const [key, value] of Object.entries(input)) {
     if (key === 'model') {
@@ -105,7 +110,7 @@ export class TrainingManager {
     catch (error) {
       this.configurationError = `Invalid training configuration: ${error.message} Check TRANSFORMER_DEVICE, TRANSFORMER_CHECKPOINT and TRANSFORMER_PYTHON before starting.`;
     }
-    this.leelaOptions = { ...safeDefaults, ...resolveLeelaConfig(), ...leelaConfig, batchSize: 4,
+    this.leelaOptions = { ...archivedModelDefaults, ...resolveLeelaConfig(), ...leelaConfig, batchSize: 4,
       model: LEELA_ID, sharedRunDir: this.options.runDir };
     try { this.leelaOptions = parseArguments([], this.leelaOptions); }
     catch (error) {
@@ -247,7 +252,7 @@ export class TrainingManager {
   }
 
   async start(input = {}) {
-    return this.startRun('selfplay', validateTrainingOptions(input, input?.model === LEELA_ID ? this.leelaOptions : safeDefaults));
+    return this.startRun('selfplay', validateTrainingOptions(input, input?.model === LEELA_ID ? this.leelaOptions : undefined));
   }
 
   async startFresh(input = {}) {

@@ -100,16 +100,16 @@ test('training options supply defaults and allow continuous runs with adjusted l
   assert.equal(options.learningRate, 0.001);
   assert.equal(options.device, 'cpu');
   assert.equal(options.steps, TRAINING_DEFAULTS.steps);
-  assert.equal(TRAINING_DEFAULTS.iterations, 1, 'Validation does not mutate shared defaults.');
-  assert.equal(TRAINING_DEFAULTS.gameConcurrency, 1, 'Training is sequential unless concurrency is requested.');
-  assert.equal(TRAINING_DEFAULTS.arenaConcurrency, 1, 'Arena games are sequential unless concurrency is requested.');
-  assert.equal(validateTrainingOptions({ gameConcurrency: 4 }).arenaConcurrency, 1, 'Arena concurrency is independent of self-play.');
-  assert.equal(validateTrainingOptions({ arenaConcurrency: 4 }).gameConcurrency, 1, 'Arena concurrency does not alter self-play.');
+  assert.equal(TRAINING_DEFAULTS.iterations, 0, 'Validation does not mutate shared defaults.');
+  assert.equal(TRAINING_DEFAULTS.gameConcurrency, 3);
+  assert.equal(TRAINING_DEFAULTS.arenaConcurrency, 2);
+  assert.equal(validateTrainingOptions({ gameConcurrency: 4 }).arenaConcurrency, 2, 'Arena concurrency is independent of self-play.');
+  assert.equal(validateTrainingOptions({ arenaConcurrency: 4 }).gameConcurrency, 3, 'Arena concurrency does not alter self-play.');
   assert.equal(validateTrainingOptions({ maxDepth: 64 }).maxDepth, 64);
   assert.equal(validateTrainingOptions({ maxDepth: 0 }).maxDepth, 0);
   assert.equal(validateTrainingOptions({ terminalTimeMs: 9000, timeMs: 600 }).terminalTimeMs, 9000);
   assert.equal(validateTrainingOptions({ terminalTimeMs: 9000, timeMs: 600 }).timeMs, 600);
-  assert.equal(TRAINING_DEFAULTS.maxDepth, 2, 'Dynamic depth remains opt-in.');
+  assert.equal(TRAINING_DEFAULTS.maxDepth, 0, 'The 800k preset uses dynamic depth.');
 });
 
 test('training options reject malformed numbers, invalid ranges and inconsistent promotion thresholds', () => {
@@ -135,7 +135,7 @@ test('Leela training options use the smaller batch and retain editable self-play
   assert.equal(defaults.gameConcurrency, 1);
   assert.equal(validateTrainingOptions({ model: 'leela', batchSize: 2, maxTokens: 128 }).batchSize, 2);
   assert.equal(TRAINING_DEFAULTS.model, 'current');
-  assert.equal(TRAINING_DEFAULTS.batchSize, 16);
+  assert.equal(TRAINING_DEFAULTS.batchSize, 8);
 });
 
 test('training options reject arbitrary paths, executable settings and unknown or prototype fields', () => {

@@ -104,9 +104,9 @@ test('training HTTP flow applies editable parameters, reports progress and accep
   const initial = await request('/api/training');
   assert.equal(initial.status, 200);
   assert.equal(initial.data.availability.available, true);
-  assert.equal(initial.data.defaults.iterations, 1);
-  assert.equal(initial.data.defaults.gameConcurrency, 1);
-  assert.equal(initial.data.defaults.arenaConcurrency, 1);
+  assert.equal(initial.data.defaults.iterations, 0);
+  assert.equal(initial.data.defaults.gameConcurrency, 3);
+  assert.equal(initial.data.defaults.arenaConcurrency, 2);
   assert.deepEqual(initial.data.iterations, []);
   const started = await request('/api/training/start', { options: {
     iterations: 2, games: 3, gameConcurrency: 2, arenaConcurrency: 4, steps: 17, batchSize: 4, learningRate: 0.002, device: 'cpu', maxDepth: 0,

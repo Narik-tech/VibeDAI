@@ -18,11 +18,11 @@ import { atomicWrite, fileHash, acquireRunLock, updateReplay, promoteCheckpoint 
 import { recoverInterruptedIterations } from './transformer-selfplay-recovery.js';
 
 const defaults = {
-  iterations: 1, games: 8, gameConcurrency: 1, maxPlies: 40, maxNodes: 20000, maxDepth: 2, timeMs: 3000,
-  terminalWork: 20000, terminalTimeMs: 3000, exploration: .2, explorationPlies: 12, outcomeWeight: .5,
-  steps: 500, batchSize: 16, maxTokens: 4096, learningRate: .0001, replaySize: 8192, seed: 42,
-  arenaPairs: 8, arenaConcurrency: 1, minPairs: 4, arenaPlies: 80, promotionScore: .55, keepIterations: 5,
-  device: process.env.TRANSFORMER_DEVICE || 'auto',
+  iterations: 0, games: 12, gameConcurrency: 3, maxPlies: 60, maxNodes: 20000, maxDepth: 0, timeMs: 1000,
+  terminalWork: 150000, terminalTimeMs: 3000, exploration: .2, explorationPlies: 12, outcomeWeight: .5,
+  steps: 500, batchSize: 8, maxTokens: 2048, learningRate: .0001, replaySize: 16384, seed: 42,
+  arenaPairs: 8, arenaConcurrency: 2, minPairs: 4, arenaPlies: 80, promotionScore: .55, keepIterations: 5,
+  device: process.env.TRANSFORMER_DEVICE || 'cuda',
   checkpoint: process.env.TRANSFORMER_CHECKPOINT || DEFAULT_CHECKPOINT,
   python: process.env.TRANSFORMER_PYTHON || DEFAULT_PYTHON,
   runDir: path.join(PROJECT_ROOT, 'artifacts/transformer/selfplay'),
@@ -35,26 +35,26 @@ export const getSelfPlayDefaults = () => ({ ...defaults });
 
 export const help = `Usage: node scripts/transformer-selfplay.js [options]
 Continuous shortcut: npm run transformer:selfplay:continuous
-  --iterations N       Cycles this invocation; 0 = until Ctrl+C (default 1)
-  --games N            Self-play games/cycle (8)
-  --game-concurrency N Concurrent self-play games, 1..8; shared model (1)
-  --plies N            Self-play turn cap (40)
+  --iterations N       Cycles this invocation; 0 = until Ctrl+C (default 0)
+  --games N            Self-play games/cycle (12)
+  --game-concurrency N Concurrent self-play games, 1..8; shared model (3)
+  --plies N            Self-play turn cap (60)
   --nodes N            Per-turn search work (20000)
-  --depth N            Neural depth 1..64; 0 grows dynamically (default 2)
-  --time-ms N          Per-turn search safety cap (3000)
+  --depth N            Neural depth 1..64; 0 grows dynamically (default 0)
+  --time-ms N          Per-turn search safety cap (1000)
   --terminal-time-ms N Independent terminal verification time cap (3000)
-  --terminal-work N    Full-rules terminal verification budget (20000)
+  --terminal-work N    Full-rules terminal verification budget (150000)
   --exploration X      Random legal-turn probability in early play (0.2)
   --exploration-plies N Early turns eligible for exploration (12)
   --outcome-weight X   Finished-game outcome weight vs search target (0.5)
   --steps N            Additional training updates/cycle (500)
-  --batch-size N       Training batch (16)
-  --max-tokens N       Training context limit, 16..4096 (4096)
+  --batch-size N       Training batch (8)
+  --max-tokens N       Training context limit, 16..4096 (2048)
   --learning-rate X    AdamW learning rate (0.0001)
-  --replay-size N      Maximum unique replay positions (8192)
+  --replay-size N      Maximum unique replay positions (16384)
   --seed-data FILE     Initial replay JSONL; "none" starts from self-play only
   --arena-pairs N      Distinct starts, each played with colors swapped (8)
-  --arena-concurrency N Concurrent arena games, 1..8; shared models (1)
+  --arena-concurrency N Concurrent arena games, 1..8; shared models (2)
   --min-pairs N        Minimum completed distinct pairs for promotion (4)
   --arena-plies N      Arena game turn cap (80)
   --promotion-score X  Required candidate score, strictly above 0.5 (0.55)
@@ -63,7 +63,8 @@ Continuous shortcut: npm run transformer:selfplay:continuous
   --checkpoint FILE    Active/UI checkpoint to improve
   --run-dir DIR        Replay, logs, candidate versions (artifacts/transformer/selfplay)
   --keep-iterations N  Retain latest N cycle folders (5)
-  --device auto|cuda|cpu --python FILE --seed N
+  --device auto|cuda|cpu Device (CUDA unless TRANSFORMER_DEVICE is set)
+  --python FILE --seed N
   --help
 
 Existing trained checkpoint required. Only complete pairs score; invalid games or

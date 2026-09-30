@@ -1,5 +1,6 @@
 const $ = id => document.getElementById(id);
-const storageKey = 'vibe-d-ai.training-settings.v1';
+// Apply the RTX 3060 preset once; subsequent user adjustments still persist.
+const storageKey = 'vibe-d-ai.training-settings.v2';
 const fields = [
   { key:'iterations', label:'Iterations', min:0, max:1000000, help:'0 runs continuously', group:'Run length' },
   { key:'device', label:'Device', choices:[['auto','Automatic'],['cuda','CUDA / GPU'],['cpu','CPU']], group:'Run length' },

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
+import { TRAINING_DEFAULTS } from '../src/training-manager.js';
 
 // A small DOM harness exercises the shipped UI handlers without starting Python
 // or requiring a browser. Layout is checked separately in the live app.
@@ -63,8 +64,7 @@ function ui(page) {
 }
 
 function readyTraining(app) {
-  app.run(`defaults = Object.fromEntries(fields.map(field => [field.key, field.choices ? field.choices[0][0] : field.key === 'learningRate' ? .0001 : field.key === 'promotionScore' ? .55 : field.min || 1]));
-    defaults.batchSize = 16; defaults.maxTokens = 512;
+  app.run(`defaults = ${JSON.stringify(TRAINING_DEFAULTS)};
     snapshot = {defaults, status:{state:'idle'}, availability:{available:true}, freshAvailability:{available:true},
       freshDefaults:{samples:32,teacherNodes:100,teacherTimeMs:100,device:'auto',steps:8,batchSize:1,maxTokens:512,learningRate:.0001,seed:3},
       leelaDefaults:{...defaults,batchSize:4,model:'leela'}, leelaAvailability:{available:true},
@@ -128,12 +128,12 @@ test('automatic opponent sends transformer identity with neural resource budgets
   assert.equal(app.run('search.autoPlay'), true);
 });
 
-test('training offers only the 800k model and restores its saved parameters', () => {
+test('training offers only the 800k model, resets old settings and saves new parameters', () => {
   const app = ui('training'); readyTraining(app);
   assert.deepEqual(app.nodes.get('training-mode').options.map(option => option.value), ['current']);
   assert.equal(app.nodes.has('leela-model-heading'), false);
   assert.equal(app.nodes.has('fresh-model-heading'), false);
-  app.storage.set('vibe-d-ai.training-settings.v1', JSON.stringify({batchSize:8}));
+  app.storage.set('vibe-d-ai.training-settings.v1', JSON.stringify({batchSize:16}));
   app.storage.set('vibe-d-ai.training-leela-settings.v1', JSON.stringify({batchSize:2}));
   app.storage.set('vibe-d-ai.training-20m-settings.v1', JSON.stringify({batchSize:1}));
   app.run(`selectMode('leela');`);
@@ -142,6 +142,7 @@ test('training offers only the 800k model and restores its saved parameters', ()
   assert.equal(app.nodes.get('start-training').disabled, false);
   app.run(`$('param-batchSize').value = '4'; saveParameters(); selectMode('fresh20m');`);
   assert.equal(app.nodes.get('param-batchSize').value, '4');
+  assert.equal(JSON.parse(app.storage.get('vibe-d-ai.training-settings.v2')).batchSize, 4);
   assert.equal(app.nodes.get('training-mode').value, 'current');
   assert.equal(JSON.parse(app.storage.get('vibe-d-ai.training-leela-settings.v1')).batchSize, 2);
   app.run(`snapshot.availability = {available:false,reason:'800k checkpoint missing'}; updateControls();`);
@@ -156,7 +157,7 @@ test('training submits only the current 800k model even after a retired mode is 
   const request = JSON.parse(app.run('JSON.stringify(requests.at(-1))'));
   assert.equal(request.path, '/api/training/start');
   assert.equal(request.body.options.model, 'current');
-  assert.equal(request.body.options.batchSize, 16);
+  assert.equal(request.body.options.batchSize, 8);
 });
 
 test('retained iteration choices omit archived models and parameter reuse stays on the 800k model', () => {

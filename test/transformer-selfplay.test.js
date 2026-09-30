@@ -9,20 +9,29 @@ import { parseArguments, trainCandidate, workerAnalyzer } from '../scripts/trans
 import { evaluateCandidate } from '../scripts/transformer-selfplay-arena.js';
 import { createPosition } from '../src/rules.js';
 
-test('self-play CLI defaults to one bounded cycle and accepts continuous mode', () => {
+test('self-play CLI defaults to the continuous 800k preset and accepts overrides', () => {
   const defaults = parseArguments([]);
-  assert.equal(defaults.iterations, 1);
-  assert.equal(defaults.gameConcurrency, 1);
-  assert.equal(defaults.arenaConcurrency, 1);
-  assert.equal(defaults.maxDepth, 2);
-  assert.equal(defaults.maxTokens, 4096);
+  assert.equal(defaults.iterations, 0);
+  assert.equal(defaults.games, 12);
+  assert.equal(defaults.gameConcurrency, 3);
+  assert.equal(defaults.maxPlies, 60);
+  assert.equal(defaults.arenaConcurrency, 2);
+  assert.equal(defaults.maxDepth, 0);
+  assert.equal(defaults.maxNodes, 20000);
+  assert.equal(defaults.timeMs, 1000);
+  assert.equal(defaults.steps, 500);
+  assert.equal(defaults.batchSize, 8);
+  assert.equal(defaults.maxTokens, 2048);
+  assert.equal(defaults.learningRate, .0001);
+  assert.equal(defaults.replaySize, 16384);
+  assert.equal(defaults.terminalWork, 150000);
   assert.equal(defaults.terminalTimeMs, 3000);
   const budgets = parseArguments(['--time-ms', '600', '--terminal-time-ms', '9000']);
   assert.equal(budgets.timeMs, 600);
   assert.equal(budgets.terminalTimeMs, 9000);
   const { terminalTimeMs, ...legacy } = defaults;
   assert.equal(parseArguments(['--time-ms', '700'], legacy).terminalTimeMs, 700);
-  assert.equal(defaults.device, process.env.TRANSFORMER_DEVICE || 'auto');
+  assert.equal(defaults.device, process.env.TRANSFORMER_DEVICE || 'cuda');
   assert.ok(defaults.minPairs <= defaults.arenaPairs);
   const options = parseArguments(['--iterations', '0', '--seed-data', 'none', '--device', 'cpu', '--steps', '3', '--game-concurrency', '4', '--arena-concurrency', '3']);
   assert.equal(options.iterations, 0);
@@ -30,6 +39,7 @@ test('self-play CLI defaults to one bounded cycle and accepts continuous mode', 
   assert.equal(options.steps, 3);
   assert.equal(options.gameConcurrency, 4);
   assert.equal(options.arenaConcurrency, 3);
+  assert.equal(parseArguments(['--iterations', '1']).iterations, 1);
   assert.equal(parseArguments(['--depth', '64']).maxDepth, 64);
   assert.equal(parseArguments(['--depth', '0']).maxDepth, 0);
   assert.equal(parseArguments(['--max-tokens', '16']).maxTokens, 16);

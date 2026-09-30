@@ -96,7 +96,7 @@ async function createHistory(root) {
       ...(process.env.CHROME_PATH ? { executablePath: process.env.CHROME_PATH } : {}) });
     const page = await browser.newPage({ viewport: { width: 1440, height: 1050 } });
     await page.addInitScript(() => {
-      if (!localStorage.getItem('vibe-d-ai.training-settings.v1')) localStorage.setItem('vibe-d-ai.training-settings.v1',JSON.stringify({batchSize:8,steps:16}));
+      if (!localStorage.getItem('vibe-d-ai.training-settings.v1')) localStorage.setItem('vibe-d-ai.training-settings.v1',JSON.stringify({batchSize:16,steps:16}));
     });
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
@@ -106,8 +106,8 @@ async function createHistory(root) {
     await page.waitForFunction(() => !document.getElementById('start-training').disabled);
     assert.equal(await page.locator('#training-mode').inputValue(), 'current');
     assert.deepEqual(await page.locator('#training-mode option').evaluateAll(options => options.map(option => option.value)), ['current']);
-    assert.equal(await page.locator('#param-batchSize').inputValue(), '8', 'Current self-play must retain saved settings.');
-    assert.equal(await page.locator('#param-steps').inputValue(), '16');
+    assert.equal(await page.locator('#param-batchSize').inputValue(), '8', 'The 800k preset must replace old saved settings.');
+    assert.equal(await page.locator('#param-steps').inputValue(), '500');
     assert.match(await page.locator('#model-summary').innerText(), /800k/i);
     assert.equal(await page.locator('#fresh-model-heading, #leela-model-heading').count(), 0, 'Archived models must not have training panels.');
     assert.equal(started.length, 0, 'Opening the page must not start training.');
@@ -161,7 +161,7 @@ async function createHistory(root) {
     await page.locator('#start-training').click();
     assert.equal(started.length, previousRuns, 'Invalid configuration cannot start training.');
     await fillParameter('games', '3');
-    assert.equal(await page.locator('#param-arenaConcurrency').inputValue(), '1');
+    assert.equal(await page.locator('#param-arenaConcurrency').inputValue(), '2');
     await fillParameter('arenaConcurrency', '9');
     await page.locator('#start-training').click();
     assert.equal(started.length, previousRuns, 'Invalid arena concurrency cannot start training.');

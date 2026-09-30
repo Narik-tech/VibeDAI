@@ -15,6 +15,8 @@ Start the local server with `npm start` and open **Training** in the app header
 at `http://127.0.0.1:5173/training`. The local transformer Python environment
 is required to start training. **Self-play · 800k model** uses the existing
 analysis checkpoint at `artifacts/transformer/model.pt`.
+The defaults use the 800k model's RTX 3060 preset and run continuously until
+stopped. They request CUDA unless `TRANSFORMER_DEVICE` overrides the device.
 
 Fresh 20M, 20M self-play, and Leela are archived and hidden from the UI.
 Existing local 20M runs are in `archive/models-20260930/fresh20m`, and LCZero
@@ -56,16 +58,16 @@ CUDA environment and a trained checkpoint. For a fresh installation, first run
 Self-play requires a trained model to start; skip data generation and training
 when the active checkpoint already exists.
 
-One cycle with the default settings:
+One cycle with the default 800k settings:
 
 ```powershell
 node scripts/transformer-selfplay.js --iterations 1 --device cuda
 ```
 
-Continuous operation until **Ctrl+C**:
+Continuous operation until **Ctrl+C** is the default:
 
 ```powershell
-node scripts/transformer-selfplay.js --iterations 0 --device cuda
+node scripts/transformer-selfplay.js
 ```
 
 To play up to four self-play games concurrently:
@@ -75,7 +77,7 @@ node scripts/transformer-selfplay.js --iterations 0 --device cuda --game-concurr
 ```
 
 The Training page exposes the same **Concurrent games** setting. It accepts
-1–8 and defaults to 1; actual concurrency is capped by `--games`. Each active
+1–8 and defaults to 3; actual concurrency is capped by `--games`. Each active
 game searches in its own CPU worker, sharing one loaded inference model. The
 inference queue drops cancelled work before sending it to Python and keeps at
 most one request in flight. This avoids multiplying GPU model memory. Training
@@ -91,7 +93,7 @@ node scripts/transformer-selfplay.js --iterations 0 --device cuda --game-concurr
 ```
 
 The Training page exposes **Concurrent arena games** under **Arena & promotion**.
-`--arena-concurrency` accepts 1–8 and defaults to 1, independently of self-play
+`--arena-concurrency` accepts 1–8 and defaults to 2, independently of self-play
 concurrency. It limits active games, rather than pairs, and is capped by the
 number of scheduled arena games. Each active search uses a CPU worker. All
 arena games share one candidate inference runtime and one separate incumbent
@@ -101,7 +103,7 @@ in the same order at every concurrency setting. Saved game numbers and arena
 report order remain stable even if games finish out of order; live events also
 report `completedGames`.
 
-Start with 2 or 4 when CPU capacity permits. More workers use more CPU and
+The defaults use 3 self-play workers and 2 arena workers. More workers use more CPU and
 memory; speedup depends on the positions and inference load. In both phases, rules validation,
 exploration and terminal certification share the coordinator, and search time
 limits still use wall time, so contention can change cutoff timing and reduce
@@ -109,12 +111,16 @@ completed search depth. Arena pairing and equal per-move budgets are preserved,
 but results can vary when concurrent games compete for resources.
 Lower concurrency if timeouts increase.
 
-For continuous operation with automatic device selection (CUDA when available),
-the shortcut requires no forwarded arguments:
+The continuous shortcut uses the same CUDA default and requires no forwarded
+arguments:
 
 ```powershell
 npm run transformer:selfplay:continuous
 ```
+
+`TRANSFORMER_DEVICE=auto|cuda|cpu` overrides the default device; an explicit
+`--device` takes precedence. Use `--device auto` for CUDA when available with
+CPU fallback, or `--device cpu` for CPU training.
 
 Use the direct `node` commands when setting options. PowerShell's `npm.ps1`
 wrapper can strip forwarded flag names, leaving values such as `0 cuda` for
@@ -130,18 +136,19 @@ starts on the next invocation; partially completed training is not resumed.
 A longer run with more games and a larger acceptance sample:
 
 ```powershell
-node scripts/transformer-selfplay.js --iterations 0 --device cuda --games 16 --plies 64 --steps 1000 --batch-size 32 --nodes 40000 --time-ms 5000 --arena-pairs 12 --min-pairs 8 --arena-plies 128
+node scripts/transformer-selfplay.js --iterations 0 --device cuda --games 16 --plies 64 --steps 1000 --nodes 40000 --time-ms 5000 --arena-pairs 12 --min-pairs 8 --arena-plies 128
 ```
 
 These settings can take substantial time. Legal move generation runs on the
 CPU, so low GPU utilization during games is expected. Training uses the saved
-checkpoint's architecture and CUDA mixed precision. The batch-32 example above
-was intended for the previous small model. Start with `--batch-size 1 --max-tokens 512`
+checkpoint's architecture and CUDA mixed precision. The default batch of 8 and
+2,048-token training context are intended for the active 800k model.
+Start with `--batch-size 1 --max-tokens 512`
 for a 20M checkpoint and measure memory before increasing either setting.
 `--max-tokens` accepts integers from 16 to 4096 and limits the board history
 encoded for each training example. Lower limits reduce training memory and
-discard more distant board history when a position exceeds the limit. The command-line
-default stays at 4096.
+discard more distant board history when a position exceeds the limit. Both the
+self-play CLI and Training page default to 2,048 tokens; inference still uses 4,096.
 Self-play resumes the saved
 architecture; first [train a fresh 20M checkpoint](transformer.md#training-the-20m-model)
 to use the larger model. Use `--device cpu` without CUDA.
@@ -161,25 +168,29 @@ if you want to preserve an earlier check's copied checkpoint.
 
 ## Defaults and learning targets
 
+These defaults are a starting preset for the active 800k model on the local
+RTX 3060. They are separate from supervised training and 20M model settings.
+
 | Setting | Default |
 | --- | --- |
-| Cycles per invocation | 1; `--iterations 0` runs continuously |
-| Self-play | 8 games, 40 complete turns/game |
-| Concurrent self-play games | 1; `--game-concurrency` accepts 1–8 |
-| Search per turn | Depth 2, 20,000 work units, 3 seconds |
-| Terminal certification | Separate 3-second budget (`--terminal-time-ms`), plus `--terminal-work` |
+| Cycles per invocation | Continuous (`--iterations 0`); use `--iterations 1` for one cycle |
+| Device | CUDA; `TRANSFORMER_DEVICE` or `--device` can override it |
+| Self-play | 12 games, 60 complete turns/game |
+| Concurrent self-play games | 3; `--game-concurrency` accepts 1–8 |
+| Search per turn | Dynamic depth (`--depth 0`), 20,000 work units, 1 second |
+| Terminal certification | Separate 3-second budget (`--terminal-time-ms`), 150,000 work units (`--terminal-work`) |
 | Exploration | 20% probability during the first 12 turns |
-| Training | 500 additional updates, batch 16, learning rate 0.0001 |
-| Training context | 4,096 tokens; `--max-tokens` accepts 16–4,096 |
-| Replay | At most 8,192 unique full-history positions |
+| Training | 500 additional updates, batch 8, learning rate 0.0001 |
+| Training context | 2,048 tokens; `--max-tokens` accepts 16–4,096 |
+| Replay | At most 16,384 unique full-history positions |
 | Training weights | Equal total weight per self-play game represented in replay |
 | Arena | 8 distinct starts, 2 games/start with colors swapped, 80 turns/game |
-| Concurrent arena games | 1; `--arena-concurrency` accepts 1–8 independently of self-play |
+| Concurrent arena games | 2; `--arena-concurrency` accepts 1–8 independently of self-play |
 | Promotion | At least 4 completed distinct pairs; candidate score at least 55% |
 | Retention | Latest 5 iteration folders, replay, latest report and previous model |
 
 See all options with `node scripts/transformer-selfplay.js --help`.
-`--depth 0` enables dynamic depth for both self-play and arena games. Each search
+The default `--depth 0` enables dynamic depth for both self-play and arena games. Each search
 starts with a ceiling of one turn and raises it when leading contenders have
 selected evaluations, initial reply coverage, and continuations reaching the
 ceiling. The ceiling can grow to 64 under the same per-turn time and

@@ -296,11 +296,12 @@ memory budget:
 node scripts/transformer.js train --data artifacts/transformer/training.jsonl --output artifacts/transformer/model-20m.pt --batch-size 1 --max-tokens 512 --device cuda
 ```
 
-The standard context budget remains 4,096; this example explicitly uses 512
+The supervised training context budget remains 4,096; this example explicitly uses 512
 during training to reduce memory. Evaluate the candidate on held-out data before
 selecting it with `TRANSFORMER_CHECKPOINT`. Self-play can then resume that larger
-checkpoint. Its CLI defaults to a 4,096-token training budget; use `--max-tokens`
-to adjust it. Resuming the old checkpoint
+checkpoint. The self-play defaults target the active 800k model; explicitly use
+`--batch-size 1 --max-tokens 512` when starting self-play with a 20M checkpoint.
+Resuming the old checkpoint
 continues training the old architecture.
 To create a model with the previous dimensions, pass
 `--width 128 --heads 4 --layers 4 --feedforward 384`.
@@ -349,9 +350,15 @@ ordering until a trained policy checkpoint is selected.
 ### Value training and self-play
 
 For iterative training from the model's own games, see [continuous self-play](transformer-selfplay.md).
-Run `node scripts/transformer-selfplay.js --iterations 0 --device cuda` after creating
+Run `node scripts/transformer-selfplay.js` after creating
 a checkpoint; candidates are evaluated before they replace the UI's active model.
-The shortcut `npm run transformer:selfplay:continuous` selects CUDA when available
+Self-play defaults to continuous cycles on CUDA with the active 800k model's
+RTX 3060 preset: 12 games, 3 concurrent games, 500 updates, batch 8,
+2,048 training tokens, learning rate 0.0001, and 16,384 replay positions.
+Use `--iterations 1` for one cycle. `TRANSFORMER_DEVICE` overrides the default
+device, and `--device` overrides the environment; `--device auto` allows CPU
+fallback when CUDA is unavailable.
+The shortcut `npm run transformer:selfplay:continuous` uses the same defaults
 and requires no forwarded arguments. Use direct `node` invocation for options:
 PowerShell's `npm.ps1` wrapper can strip forwarded flag names.
 
@@ -368,7 +375,7 @@ npm run transformer:data -- --samples 4096 --nodes 2000 --seed 7
 npm run transformer:train -- --steps 5000 --batch-size 16 --device cuda
 ```
 
-Training defaults to 1,000 optimizer updates, learning rate 0.0003, weight decay
+Supervised training defaults to 1,000 optimizer updates, learning rate 0.0003, weight decay
 0.01, seed 42, dropout 0.1, and a shuffle buffer of 128 encoded positions. The
 JSONL file is streamed and repeated as needed; it is never loaded in full.
 Each line has this shape, with the raw rules-library position representation:
@@ -426,13 +433,14 @@ playing strength. Logs report elapsed time and truncation; completion reports
 peak CUDA allocator memory. An interrupted run can resume from the last saved
 checkpoint.
 
-For the 20M model, start with `--batch-size 1`; the default batch remains 16.
+For the 20M model, start with `--batch-size 1`; the supervised training default batch remains 16.
 Reduce `--max-tokens` as needed if long positions exceed available memory.
 `--width`, `--heads`, `--layers`, and `--feedforward` configure new models and
 cannot change an existing model via resume. Width accepts 32–512, heads accepts
 1, 2, 4, or 8 and must divide width, layers accepts 1–8, and feed-forward
 width accepts hidden width–2,048. `--max-tokens` accepts 16–4,096 and
-defaults to 4,096 for both new and resumed training. Training saves the effective
+defaults to 4,096 for both new and resumed supervised training. Self-play passes
+its own default of 2,048. Training saves the effective
 budget with the checkpoint. Inference and evaluation load existing weights with
 the current 4,096-token budget, including older checkpoints trained with smaller
 contexts; loading does not rewrite those files. Context length does not change
