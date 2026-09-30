@@ -4,6 +4,7 @@ import { createPosition, generateActions, positionKey, validateAction } from '..
 import { analyze } from '../src/search.js';
 import { analyze as analyzeTransformer } from '../src/transformer-search.js';
 import { decidePromotion, evaluateCandidate } from '../scripts/transformer-selfplay-arena.js';
+import { certifyTerminal, loadMatchSuite } from '../scripts/match.js';
 
 const tiny = () => createPosition({ pgn: '[Board "Custom"]\n[Size "4x4"]\n[2rk/4/4/KR2:0:1:w]' });
 const mating = () => createPosition({ pgn: '[Board "Custom"]\n[Size "4x4"]\n[Promotions "Q,R,B,N"]\n[3k/1P2/4/K3:0:1:w]' });
@@ -73,6 +74,93 @@ test('promotion requires a strict winning margin and enough distinct complete pl
   assert.equal(decidePromotion(duplicate).promote, false);
   const unplayed = syntheticPairs(Array(4).fill(['A_WIN', 'A_WIN']), { unplayed: true });
   assert.equal(decidePromotion(unplayed).eligiblePairs, 0);
+});
+
+test('strength estimates use distinct color-swapped pairs and stay inconclusive for a small all-win sample', () => {
+  const winning = syntheticPairs(Array(4).fill(['A_WIN', 'A_WIN']));
+  const decision = decidePromotion(winning);
+  assert.equal(decision.promote, true, 'the operational gate remains backwards compatible');
+  const assessment = decision.strengthAssessment;
+  assert.equal(assessment.status, 'inconclusive');
+  assert.equal(assessment.distinctPairs, 4);
+  assert(assessment.reasons.includes('insufficient-distinct-pairs'));
+  const interval = assessment.confidenceInterval;
+  assert.equal(interval.unit, 'distinct-color-swapped-pair');
+  assert.equal(interval.level, 0.95);
+  assert.equal(interval.estimate, 1);
+  assert.equal(interval.upper, 1);
+  assert(Math.abs(interval.lower - (1 - Math.sqrt(Math.log(40) / 8))) < 1e-12);
+  assert(interval.lower < 0.5, 'eight correlated games must not masquerade as eight independent pairs');
+  const duplicate = decidePromotion(syntheticPairs(Array(20).fill(['A_WIN', 'A_WIN']), { duplicate: true }));
+  assert.equal(duplicate.strengthAssessment.distinctPairs, 1);
+  assert.equal(duplicate.strengthAssessment.status, 'inconclusive');
+});
+
+test('larger paired reports distinguish advantage, equal scores and unfinished selection bias', () => {
+  for (const [outcomes, status] of [
+    [['A_WIN', 'A_WIN'], 'candidate-advantage'],
+    [['B_WIN', 'B_WIN'], 'incumbent-advantage'],
+    [['A_WIN', 'B_WIN'], 'inconclusive'],
+  ]) {
+    const report = decidePromotion(syntheticPairs(Array(20).fill(outcomes)));
+    assert.equal(report.strengthAssessment.status, status);
+  }
+  const unfinished = syntheticPairs(Array(21).fill(['A_WIN', 'A_WIN']));
+  Object.assign(unfinished.games.at(-1), { result: 'UNFINISHED', reason: 'ply-limit' });
+  const decision = decidePromotion(unfinished);
+  assert.equal(decision.promote, true);
+  const assessment = decision.strengthAssessment;
+  assert.equal(assessment.status, 'inconclusive');
+  assert(assessment.reasons.includes('unfinished-or-excluded-pairs'));
+  assert.equal(assessment.distinctPairs, 20);
+  assert.equal(assessment.unscoredPairs, 1);
+  assert.deepEqual(assessment.allPlannedPairScoreRange, { lower: 20 / 21, upper: 1 });
+  assert.equal(decidePromotion().strengthAssessment.confidenceInterval.lower, null);
+});
+
+test('arena terminal verification uses its independent budget without increasing the search budget', async () => {
+  const calls = [];
+  const engine = (position, options) => { calls.push(options); return firstLegal(position); };
+  const report = await evaluateCandidate({ candidate: engine, incumbent: engine,
+    suite: { cases: [{ id: 'tiny', position: tiny() }] }, pairs: 1, minPairs: 1,
+    ...limits, timeMs: 600, terminalTimeMs: 3000 });
+  assert.equal(report.limits.timeMs, 600);
+  assert.equal(report.limits.terminalTimeMs, 3000);
+  assert(calls.every(options => options.timeMs === 600 && options.terminalTimeMs === 3000));
+  assert(report.games.every(game => game.limits.terminalTimeMs === 3000));
+});
+
+test('arena and frozen final fixtures are distinct legal nonterminal histories with diverse positions', async () => {
+  const [training, arena, final] = await Promise.all(['training', 'validation', 'transformer-test']
+    .map(name => loadMatchSuite(new URL(`../examples/matches/${name}.json`, import.meta.url))));
+  assert.equal(arena.purpose, 'repeated-selection');
+  assert.equal(final.purpose, 'final-test');
+  assert.equal(final.frozen, true);
+  assert(arena.cases.length >= 20);
+  assert(final.cases.length >= 20);
+  const keys = new Set(training.cases.map(fixture => positionKey(fixture.position)));
+  for (const suite of [arena, final]) {
+    assert(new Set(suite.cases.map(fixture => fixture.category)).size >= 6);
+    assert(suite.cases.some(fixture => fixture.position.board.filter(Boolean).length > 1));
+    for (const fixture of suite.cases) {
+      const key = positionKey(fixture.position);
+      assert(!keys.has(key), `overlapping full-history start: ${fixture.id}`);
+      keys.add(key);
+      if (fixture.provenance) {
+        let replay = createPosition({ pgn: fixture.provenance.initialPgn });
+        assert(fixture.provenance.opening.length >= 3);
+        for (const action of fixture.provenance.opening) replay = validateAction(replay, action);
+        assert.equal(positionKey(replay), key, `invalid opening history: ${fixture.id}`);
+      } else assert(suite === arena, 'every frozen final fixture needs independently replayable provenance');
+      const certificate = certifyTerminal(fixture.position, { terminalWork: 50000, terminalTimeMs: 10000 });
+      assert.equal(certificate.verified, true, fixture.id);
+      assert.equal(certificate.terminal, false, fixture.id);
+      const witness = generateActions(fixture.position, { firstOnly: true });
+      try { assert.equal(positionKey(validateAction(fixture.position, witness.next().value.moves)),
+        positionKey(validateAction(fixture.position, firstLegal(fixture.position).bestAction))); }
+      finally { witness.return(); }
+    }
+  }
 });
 
 test('unfinished pairs never score and any invalid game vetoes otherwise winning promotion', () => {
@@ -467,6 +555,7 @@ test('engine cancellation and mutation are handled without forgiving invalid gam
 test('invalid arena configuration is rejected before play', async () => {
   const base = { candidate: firstLegal, incumbent: firstLegal, suite: { cases: [{ id: 'tiny', position: tiny() }] } };
   for (const patch of [{ pairs: 0 }, { minPairs: 0 }, { seed: -1 }, { promotionScore: 0.49 }, { timeMs: 0 }, { maxDepth: -1 }, { maxDepth: 65 },
+    { terminalTimeMs: 0 }, { terminalTimeMs: NaN },
     ...[0, 9, 1.5, NaN, '2'].map(gameConcurrency => ({ gameConcurrency }))]) {
     await assert.rejects(evaluateCandidate({ ...base, ...patch }));
   }

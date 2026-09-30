@@ -26,6 +26,21 @@ def moves():
 
 
 class DescriptorTests(unittest.TestCase):
+    def test_soft_targets_validate_and_preserve_legacy_records(self):
+        label = {"moves": moves(), "target": 1, "targetVersion": 1, "targetWeights": [3., 1.]}
+        example = encode_policy_records(position(), [label])[0]
+        self.assertEqual(example[3], [.75, .25])
+        self.assertEqual(len(encode_policy_records(position(), [{"moves": moves(), "target": 1}])[0]), 3)
+        for changes in ({"targetWeights": [0., 0.]}, {"targetWeights": [-1, 1]},
+                        {"targetWeights": [1]}, {"targetWeights": [math.nan, 1]},
+                        {"targetWeights": [True, 1]}, {"targetWeights": None},
+                        {"targetVersion": 2}, {"targetVersion": True}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                encode_policy_records(position(), [{**label, **changes}])
+        del label["targetVersion"]
+        with self.assertRaises(ValueError):
+            encode_policy_records(position(), [label])
+
     def test_temporal_coordinates_and_special_endpoints_do_not_alias(self):
         features = encode_moves(position(), moves())
         self.assertTrue(all(len(row) == MOVE_FEATURES for row in features))
@@ -87,6 +102,68 @@ class PolicyModelTests(unittest.TestCase):
         reversed_scores = predict_policy(model, position(), list(reversed(moves())), device)
         self.assertEqual(scores, list(reversed(reversed_scores)))
 
+    def test_soft_loss_never_penalizes_unobserved_candidates(self):
+        import torch
+        from neural.policy import policy_example_losses, policy_choice_count
+        logits = torch.tensor([[2., 1., 80.], [1., 80., -80.]], requires_grad=True)
+        examples = [(None, [None] * 3, 0, [.7, .3, 0.]),
+                    (None, [None] * 3, 0, [1., 0., 0.])]
+        mask = torch.zeros((2, 3), dtype=torch.bool)
+        loss = policy_example_losses(logits, mask, examples)
+        expected = -(torch.tensor([.7, .3]) * torch.tensor([2., 1.]).log_softmax(-1)).sum()
+        self.assertAlmostEqual(loss[0].item(), expected.item())
+        self.assertEqual(loss[1].item(), 0.)
+        loss.sum().backward()
+        self.assertTrue(torch.isfinite(logits.grad).all())
+        self.assertEqual(logits.grad[0, 2].item(), 0.)
+        self.assertEqual(logits.grad[1].abs().sum().item(), 0.)
+        self.assertEqual(policy_choice_count(examples[0]), 2)
+        self.assertEqual(policy_choice_count(examples[1]), 1)
+        self.assertEqual(policy_choice_count(examples[0][:3]), 3)
+
+    def test_policy_evaluation_measures_full_candidate_retention_excluding_forced_prefixes(self):
+        import torch
+        from types import SimpleNamespace
+        from neural.evaluate import evaluate_policy_examples
+
+        class RankedModel(torch.nn.Module):
+            config = SimpleNamespace(policy_head=True)
+            policy_trained_steps = 1
+
+            def encode(self, *batch):
+                return batch[0]
+
+            def score_moves(self, context, features, mask):
+                return torch.arange(features.shape[1], dtype=torch.float32).expand(features.shape[0], -1)
+
+        encoded = encode_position(position(), 64)
+        features = encode_moves(position(), moves() * 10)
+        model = RankedModel()
+        examples = [(encoded, features, 0, [.25] + [0.] * 18 + [.75]),
+                    (encoded, features, 12), (encoded, features, 19), (encoded, features[:1], 0)]
+        metrics = evaluate_policy_examples(model, iter(examples), torch.device("cpu"), batch_size=2)
+        self.assertTrue(model.training)
+        self.assertEqual(metrics["prefixes"], 4)
+        self.assertEqual(metrics["decisionPrefixes"], 3)
+        self.assertEqual(metrics["forcedPrefixes"], 1)
+        self.assertAlmostEqual(metrics["top1Accuracy"], 1 / 3)
+        self.assertAlmostEqual(metrics["top8Retention"], 2 / 3)
+        self.assertAlmostEqual(metrics["top16Retention"], 2 / 3)
+        self.assertTrue(math.isfinite(metrics["crossEntropy"]))
+        self.assertTrue(math.isfinite(metrics["supervisedLoss"]))
+        model.policy_trained_steps = 0
+        self.assertFalse(evaluate_policy_examples(model, examples, torch.device("cpu"))["available"])
+
+    def test_training_records_keep_soft_targets(self):
+        from neural.train import records
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory) / "soft.jsonl"
+            row = {"position": position(), "value": 0, "policy": [{"moves": moves(), "target": 0,
+                   "targetVersion": 1, "targetWeights": [.8, .2]}]}
+            data.write_text(json.dumps(row) + "\n")
+            example = next(records(data, 64, include_policy=True))[2][0]
+            self.assertEqual(example[3], [.8, .2])
+
     def test_legacy_and_initialized_heads_never_report_policy_support(self):
         import torch
         from neural.model import ARCHITECTURE, ModelConfig, TransformerValue, load_checkpoint, metadata, predict_policy
@@ -126,11 +203,22 @@ class PolicyModelTests(unittest.TestCase):
             row.update(policyVersion=POLICY_VERSION, policy=[{"moves": moves(), "target": 1}])
             data.write_text(json.dumps(row) + "\n", encoding="utf-8")
             for expected in (2, 4):
+                if expected == 4:
+                    row["policy"][0].update(targetVersion=1, targetWeights=[.1, .9])
+                    data.write_text(json.dumps(row) + "\n", encoding="utf-8")
                 trained = subprocess.run(command + ["--resume", str(output)], capture_output=True, text=True, cwd=ROOT, timeout=60)
                 self.assertEqual(trained.returncode, 0, trained.stderr)
                 self.assertEqual(json.loads(trained.stdout.splitlines()[-1])["policyTrainedSteps"], expected)
                 loaded, _ = load_checkpoint(output, torch.device("cpu"))
                 self.assertEqual(loaded.policy_trained_steps, expected)
+            evaluated = subprocess.run([sys.executable, "neural/evaluate.py", "--data", str(data),
+                                        "--checkpoints", str(output), "--device", "cpu"],
+                                       capture_output=True, text=True, cwd=ROOT, timeout=60)
+            self.assertEqual(evaluated.returncode, 0, evaluated.stderr)
+            metrics = json.loads(evaluated.stdout)["checkpoints"][0]["policy"]
+            self.assertEqual(metrics["softPrefixes"], 1)
+            self.assertEqual(metrics["top8Retention"], 1.)
+            self.assertEqual(metrics["top16Retention"], 1.)
             requests = [dict(id=1, type="policy", position=position(), moves=moves()),
                         dict(id=2, type="policy", position=position(), moves=[[]]),
                         dict(id=3, type="unknown", positions=[position()])]

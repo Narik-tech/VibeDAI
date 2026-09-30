@@ -1,4 +1,4 @@
-import { createPositionKeyCache, formatAction, generateActions, inCheck } from './rules.js';
+import { createLegalTurnProbe, createPositionKeyCache, formatAction, generateActions, inCheck } from './rules.js';
 import { createCandidateStream } from './transformer-candidates.js';
 import { createValueCache } from './transformer-value-cache.js';
 import { canDeepen, chooseWork, DYNAMIC_DEPTH_THRESHOLD, rankDepths } from './transformer-frontier.js';
@@ -9,7 +9,6 @@ const sign = position => position.action % 2 === 0 ? 1 : -1;
 const finite = (value, fallback, min, max) => Number.isFinite(Number(value))
   ? Math.max(min, Math.min(max, Number(value))) : fallback;
 class SearchInterrupted extends Error {}
-class TerminalProbeDeferred extends Error {}
 const PROGRESS_INTERVAL_MS = 100;
 const DISPLAY_RANK_LIMIT = 10;
 
@@ -40,12 +39,18 @@ export async function analyze(position, options = {}) {
   const keyPosition = createPositionKeyCache();
   const initialCandidates = Math.floor(finite(options.initialCandidates, 8, 1, 64));
   const componentBatchSize = Math.floor(finite(options.componentBatchSize, 16, 1, 128));
+  const candidateBranches = Math.floor(finite(options.candidateBranches, 4, 1, 8));
   const extensionDepth = Math.floor(finite(options.tacticalExtensionDepth ?? options.quiescenceDepth, 2, 0, 4));
   const extensionCandidateLimit = Math.floor(finite(options.extensionCandidateLimit, 4, 1, 32));
   const maxValueCacheEntries = Math.floor(finite(options.maxValueCacheEntries, 4096, 0, 131072));
   const valueCacheMemoryMb = finite(options.valueCacheMemoryMb, 32, 0, 1024);
   // Cache lifetime is exactly one analysis, and therefore one fixed model/encoding.
   const terminalCache = new WeakMap();
+  const terminalProbes = new Map();
+  const deferredEvaluations = new Set();
+  const selectedProbePositions = new WeakSet();
+  const terminalProbeWork = Math.floor(finite(options.terminalProbeWork, 256, 1, 4096));
+  let terminalProbeResumes = 0;
   const valueCache = createValueCache(keyPosition, { maxEntries: maxValueCacheEntries, maxBytes: valueCacheMemoryMb * 1024 * 1024 });
   const openStreams = new Set();
   const timings = { generationMs: 0, inferenceMs: 0, policyMs: 0, terminalMs: 0, schedulingMs: 0 };
@@ -99,14 +104,21 @@ export async function analyze(position, options = {}) {
       if (!terminalCache.has(pos)) {
         tick('search');
         selectiveDepth = Math.max(selectiveDepth, ply);
-        let work = 0;
-        const legal = generateActions(pos, { tick: () => {
-          if (work >= maxWork) throw new TerminalProbeDeferred();
-          work++; tick();
-        }, keyPosition, skipOptionalSpatial: false });
-        try { terminalCache.set(pos, legal.next().done); }
-        catch (error) { if (!(error instanceof TerminalProbeDeferred)) throw error; }
-        finally { legal.return?.(); }
+        let probe = terminalProbes.get(pos);
+        if (!probe) {
+          // Keep suspended traversal memory bounded even when construction
+          // touches many difficult states that are never selected for search.
+          if (terminalProbes.size >= 128) {
+            const oldest = [...terminalProbes.keys()].find(state => !selectedProbePositions.has(state));
+            terminalProbes.get(oldest).close(); terminalProbes.delete(oldest);
+          }
+          probe = createLegalTurnProbe(pos, { tick, keyPosition, skipOptionalSpatial: false });
+        } else { terminalProbeResumes++; terminalProbes.delete(pos); }
+        terminalProbes.set(pos, probe);
+        const result = probe.advance(maxWork);
+        if (result.done) {
+          terminalCache.set(pos, result.terminal); terminalProbes.delete(pos); selectedProbePositions.delete(pos);
+        }
       }
       return terminalCache.get(pos) ? terminalValue(pos, ply) : null;
     } finally { timings.terminalMs += performance.now() - probeStarted; }
@@ -197,7 +209,7 @@ export async function analyze(position, options = {}) {
       node.limit = node.depth === 0 ? candidateLimit : innerCandidateLimit;
       node.stream = createCandidateStream(node.position, {
         ply: node.depth, tick, keyPosition, infer, valueFor: pos => valueCache.get(pos),
-        probeTerminal, retainRootCandidate, componentBatchSize, scoreMoves,
+        probeTerminal, retainRootCandidate, componentBatchSize, scoreMoves, candidateBranches,
       });
       node.canWiden = true;
       openStreams.add(node.stream);
@@ -276,7 +288,14 @@ export async function analyze(position, options = {}) {
   async function evaluateCandidate(node) {
     searchingDepth = node.depth;
     tick('search');
-    const terminal = probeTerminal(node.position, node.depth);
+    selectedProbePositions.add(node.position);
+    const terminal = probeTerminal(node.position, node.depth, terminalProbeWork);
+    if (terminalCache.has(node.position)) selectedProbePositions.delete(node.position);
+    if (!terminalCache.has(node.position)) {
+      deferredEvaluations.add(node);
+      return;
+    }
+    deferredEvaluations.delete(node);
     // The final component often already evaluated this exact submitted state.
     // Reusing it avoids a duplicate model call without changing scheduling.
     if (!terminal && !valueCache.has(node.position)) await infer([node.position]);
@@ -355,19 +374,23 @@ export async function analyze(position, options = {}) {
       })),
       candidateCaps, candidateCacheEntries: 0, evaluations, inferenceBatches, policyLeaves: 0, effectiveQuiescenceDepth,
       wideningSteps, policyCalls, valueCacheHits: valueCache.hits,
+      terminalProbeResumes, pendingTerminalProbes: terminalProbes.size,
+      ...(options.collectPolicyAlternatives ? { policyAlternatives: (root.children ?? [])
+        .filter(node => node.trueScore !== null && Number.isFinite(node.value))
+        .map(node => ({ action: node.moves, score: node.value })) } : {}),
       timings: Object.fromEntries(Object.entries(timings).map(([key, value]) => [key, Math.round(value)])),
       optionalMovePolicy: 'temporal-only',
       mateProven, terminalProof: ['checkmate', 'stalemate'].includes(status) ? 'unrestricted-legal-exhaustion' : null,
       scoreType: score === null ? 'unavailable' : Math.abs(score) > MATE_THRESHOLD ? 'mate' : 'cp',
       mateIn: score !== null && Math.abs(score) > MATE_THRESHOLD ? Math.sign(whiteScore) * (MATE_SCORE - Math.abs(score)) : null,
       limits: { timeMs, maxDepth, maxNodes, candidateLimit, innerCandidateLimit, initialCandidates, componentBatchSize, quiescenceDepth: extensionDepth,
-        tacticalExtensionDepth: extensionDepth, extensionCandidateLimit, maxValueCacheEntries, valueCacheMemoryMb },
+        tacticalExtensionDepth: extensionDepth, extensionCandidateLimit, maxValueCacheEntries, valueCacheMemoryMb, terminalProbeWork, candidateBranches },
     };
   }
   try {
     // The playable fallback obeys the same optional-board policy as search.
     // Exhausting this restricted traversal never certifies a terminal root.
-    const legal = generateActions(position, { tick, keyPosition, skipOptionalSpatial: true });
+    const legal = generateActions(position, { tick, keyPosition, skipOptionalSpatial: true, firstOnly: true });
     try {
       const first = legal.next();
       if (!first.done) { terminalCache.set(position, false); bestAction = first.value.moves; pv = [bestAction]; }
@@ -399,7 +422,19 @@ export async function analyze(position, options = {}) {
           reportProgress(true);
           check();
         }
-        const work = chooseWork(rankings, { maxDepth: currentMaxDepth, root, rootSign, canExpand });
+        let work;
+        // Give deferred proofs one operation in four, in FIFO order. Other
+        // contenders remain eligible while an expensive proof is unfinished.
+        if (!deferredEvaluations.size || root.visits % 4 !== 3) {
+          work = chooseWork(rankings, { maxDepth: currentMaxDepth, root, rootSign, canExpand,
+            canEvaluate: node => !deferredEvaluations.has(node)
+              && (deferredEvaluations.size < 32 || terminalCache.has(node.position)) });
+        }
+        if (!work && deferredEvaluations.size) {
+          const node = deferredEvaluations.values().next().value;
+          deferredEvaluations.delete(node);
+          work = { kind: 'evaluate', node };
+        }
         timings.schedulingMs += performance.now() - schedulingStarted;
         if (!work) { stoppedReason = depth >= currentMaxDepth ? 'depth' : 'frontier'; break; }
         if (work.kind === 'expand' || work.kind === 'widen') await expand(work.node);
@@ -418,7 +453,11 @@ export async function analyze(position, options = {}) {
       mateProven = Math.abs(score) > MATE_THRESHOLD && Boolean(rootFallback.mateProven);
     }
   } finally {
-    for (const stream of openStreams) await stream.return();
+    try { for (const stream of openStreams) await stream.return(); }
+    finally {
+      for (const probe of terminalProbes.values()) probe.close();
+      terminalProbes.clear();
+    }
   }
   return snapshot();
 }

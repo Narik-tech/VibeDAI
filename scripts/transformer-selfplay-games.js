@@ -1,8 +1,9 @@
 import { isDeepStrictEqual } from 'node:util';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { certifyTerminal } from './match.js';
-import { formatAction, generateActions, positionKey, validateAction } from '../src/rules.js';
-import { COMPONENT_POLICY_VERSION, componentPolicyTargets } from '../src/transformer-policy.js';
+import { formatAction, positionKey, validateAction } from '../src/rules.js';
+import { COMPONENT_POLICY_VERSION, policyTargetsFromSearch } from '../src/transformer-policy.js';
+import { sampleExploration, emptyCoverage, actionCoverage, addCoverage } from './transformer-exploration.js';
 
 class Interrupted extends Error {
   constructor(reason) { super(reason); this.reason = reason; }
@@ -13,14 +14,15 @@ const isScore = value => typeof value === 'number' && Number.isFinite(value);
 function settings(options) {
   const limits = { games: 8, gameConcurrency: 1, seed: 5, maxPlies: 40, timeMs: 1000, maxNodes: 20000, maxDepth: 2,
     terminalWork: 20000, exploration: 0.15, explorationPlies: 8, outcomeWeight: 0.5, ...options };
+  limits.terminalTimeMs ??= limits.timeMs;
   for (const [name, low, high] of [['games', 1, 10000], ['gameConcurrency', 1, 8], ['seed', 0, 0xffffffff], ['maxPlies', 0, 10000],
-    ['timeMs', 1, 60000], ['maxNodes', 0, 1e9], ['maxDepth', 0, 64], ['terminalWork', 0, 1e9], ['explorationPlies', 0, 10000]]) {
+    ['timeMs', 1, 60000], ['terminalTimeMs', 1, 60000], ['maxNodes', 0, 1e9], ['maxDepth', 0, 64], ['terminalWork', 0, 1e9], ['explorationPlies', 0, 10000]]) {
     if (!Number.isInteger(limits[name]) || limits[name] < low || limits[name] > high) throw new Error(`Invalid ${name}.`);
   }
   for (const name of ['exploration', 'outcomeWeight']) {
     if (typeof limits[name] !== 'number' || !Number.isFinite(limits[name]) || limits[name] < 0 || limits[name] > 1) throw new Error(`Invalid ${name}.`);
   }
-  return Object.fromEntries(['games', 'gameConcurrency', 'seed', 'maxPlies', 'timeMs', 'maxNodes', 'maxDepth', 'terminalWork', 'exploration', 'explorationPlies', 'outcomeWeight'].map(name => [name, limits[name]]));
+  return Object.fromEntries(['games', 'gameConcurrency', 'seed', 'maxPlies', 'timeMs', 'terminalTimeMs', 'maxNodes', 'maxDepth', 'terminalWork', 'exploration', 'explorationPlies', 'outcomeWeight'].map(name => [name, limits[name]]));
 }
 
 /**
@@ -57,7 +59,7 @@ export async function generateSelfPlayGames(options = {}) {
     // match.js is the sole authority for finished game results. Its generator
     // ticks bound work and wall time; cancellation is checked before and after
     // this synchronous, bounded operation, never accepted as a terminal proof.
-    const certificate = certifyTerminal(position, { terminalWork: limits.terminalWork, timeMs: limits.timeMs });
+    const certificate = certifyTerminal(position, { terminalWork: limits.terminalWork, terminalTimeMs: limits.terminalTimeMs, timeMs: limits.timeMs });
     check();
     return certificate;
   }
@@ -81,36 +83,13 @@ export async function generateSelfPlayGames(options = {}) {
       return await Promise.race([
         Promise.resolve().then(() => analyzePosition(position, {
           timeMs: limits.timeMs, maxNodes: limits.maxNodes, maxDepth: limits.maxDepth,
+          collectPolicyAlternatives: true,
           shouldStop: () => localStop || stopped(),
         })), interrupted,
       ]);
     } finally { clearTimeout(timer); }
   }
-  function explore(position, random) {
-    const deadline = performance.now() + limits.timeMs;
-    const choices = [];
-    let work = 0, reason = null, exhaustive = false;
-    const legal = generateActions(position, { skipOptionalSpatial: false, pruneUnsafe: false, cacheMoves: false, tick() {
-      check();
-      if (work >= limits.maxNodes) throw new Interrupted('exploration-work-limit');
-      if (performance.now() >= deadline) throw new Interrupted('exploration-time-limit');
-      work++;
-    } });
-    try {
-      while (choices.length < 32) {
-        const next = legal.next();
-        if (next.done) { exhaustive = true; break; }
-        choices.push(next.value.moves);
-      }
-      if (!exhaustive) reason = 'candidate-limit';
-    } catch (error) {
-      if (!(error instanceof Interrupted) || error.reason === 'cancelled') throw error;
-      reason = error.reason;
-    } finally { legal.return?.(); }
-    check();
-    return { action: choices.length ? choices[Math.floor(random() * choices.length)] : null,
-      candidates: choices.length, work, exhaustive, stoppedReason: reason };
-  }
+  const explore = (position, random) => sampleExploration(position, random, { ...limits, check });
 
   async function playGame(index) {
     // Derive an independent stream from the cycle seed and stable game index,
@@ -206,7 +185,8 @@ export async function generateSelfPlayGames(options = {}) {
             catch (error) { finish('illegal-exploration-action', { valid: false, error: error.message }); break; }
           }
           explorationInfo = { attempted: true, explored: Boolean(exploration.action), candidates: exploration.candidates,
-            work: exploration.work, exhaustive: exploration.exhaustive, stoppedReason: exploration.stoppedReason };
+            work: exploration.work, exhaustive: exploration.exhaustive, stoppedReason: exploration.stoppedReason,
+            sampling: exploration.sampling, coverage: exploration.coverage, selectedCoverage: exploration.selectedCoverage };
         }
         check();
         let notation;
@@ -218,7 +198,8 @@ export async function generateSelfPlayGames(options = {}) {
           exploration: clone(explorationInfo), provenance: { ...clone(provenance), seed: limits.seed, startId: start.id },
         });
         game.moves.push({ ply, color: current.action % 2, beforeKey: positionKey(current), afterKey: positionKey(next),
-          action: clone(action), searchedAction: clone(result.bestAction), notation, exploration: explorationInfo, search: recorded });
+          action: clone(action), searchedAction: clone(result.bestAction), notation, exploration: explorationInfo,
+          coverage: actionCoverage(current, action, next), search: recorded });
         current = next;
       }
     } catch (error) {
@@ -232,7 +213,7 @@ export async function generateSelfPlayGames(options = {}) {
     const gameSamples = game.valid ? pending.map(row => {
       // Only completed searches from accepted games teach the policy. An
       // exploratory played action must never replace the searched target.
-      const policy = componentPolicyTargets(row.position, row.searchedAction);
+      const policy = policyTargetsFromSearch(row.position, row.search);
       const normalizedSearchValue = Math.tanh(row.searchScoreWhiteCp / 1000);
       const unclampedNormalizedTarget = finished ? (1 - limits.outcomeWeight) * normalizedSearchValue + limits.outcomeWeight * game.outcomeWhite : normalizedSearchValue;
       const normalizedTarget = finished ? Math.max(-0.999, Math.min(0.999, unclampedNormalizedTarget)) : unclampedNormalizedTarget;
@@ -244,6 +225,7 @@ export async function generateSelfPlayGames(options = {}) {
         targetProvenance: finished ? 'certified-full-rules-outcome-and-completed-root-search' : 'completed-root-search-only-unfinished-game' };
     }) : [];
     game.samples = gameSamples.length;
+    game.coverage = game.moves.reduce((total, move) => addCoverage(total, move.coverage), emptyCoverage());
     game.discardedSamples = game.valid ? 0 : pending.length;
     return { game, samples: gameSamples };
   }
@@ -282,6 +264,7 @@ export async function generateSelfPlayGames(options = {}) {
     draws: records.filter(game => game.result === 'DRAW').length, plies: records.reduce((sum, game) => sum + game.plies, 0),
     samples: samples.length, outcomeSamples: samples.filter(row => row.targetType === 'outcome-blend').length,
     bootstrapSamples: samples.filter(row => row.targetType === 'search-bootstrap').length,
+    coverage: records.reduce((total, game) => addCoverage(total, game.coverage), emptyCoverage()),
     discardedSamples: records.reduce((sum, game) => sum + game.discardedSamples, 0), cancelled, seed: limits.seed,
     unfinishedReasons: Object.fromEntries([...new Set(records.filter(game => game.result === 'UNFINISHED').map(game => game.reason))]
       .map(reason => [reason, records.filter(game => game.result === 'UNFINISHED' && game.reason === reason).length])),

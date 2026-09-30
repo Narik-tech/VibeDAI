@@ -107,6 +107,8 @@ test('training options supply defaults and allow continuous runs with adjusted l
   assert.equal(validateTrainingOptions({ arenaConcurrency: 4 }).gameConcurrency, 1, 'Arena concurrency does not alter self-play.');
   assert.equal(validateTrainingOptions({ maxDepth: 64 }).maxDepth, 64);
   assert.equal(validateTrainingOptions({ maxDepth: 0 }).maxDepth, 0);
+  assert.equal(validateTrainingOptions({ terminalTimeMs: 9000, timeMs: 600 }).terminalTimeMs, 9000);
+  assert.equal(validateTrainingOptions({ terminalTimeMs: 9000, timeMs: 600 }).timeMs, 600);
   assert.equal(TRAINING_DEFAULTS.maxDepth, 2, 'Dynamic depth remains opt-in.');
 });
 
@@ -118,7 +120,7 @@ test('training options reject malformed numbers, invalid ranges and inconsistent
   }
   for (const options of [
     { games: 0 }, { gameConcurrency: 0 }, { gameConcurrency: 9 }, { arenaConcurrency: 0 }, { arenaConcurrency: 9 },
-    { iterations: -1 }, { batchSize: 129 }, { maxDepth: -1 }, { maxDepth: 65 },
+    { iterations: -1 }, { batchSize: 129 }, { maxDepth: -1 }, { maxDepth: 65 }, { terminalTimeMs: 0 }, { terminalTimeMs: 60001 },
     { learningRate: 0 }, { learningRate: 0.11 }, { exploration: -0.01 }, { outcomeWeight: 1.01 },
     { promotionScore: 0.5 }, { promotionScore: 1.01 }, { arenaPairs: 1, minPairs: 2 }, { device: 'shell' },
   ]) assert.throws(() => validateTrainingOptions(options), undefined, JSON.stringify(options));

@@ -80,6 +80,12 @@ orders the supplied components from one encoding of that prefix. Without one,
 a deterministic order spreads the batch across source pieces and favors tactical
 and temporal components. Values then order the components within each batch.
 This is selective ordering: a small cap can omit a strong move in a later batch.
+For batches of at least four components, approximately one quarter of slots
+sample later ranks, including the tail, without increasing the batch size.
+On turns with multiple required boards, up to four first-component traversals
+alternate their complete-turn admissions. They share root policy/value batches
+and deduplicate complete histories. `candidateBranches: 1` disables this
+interleaving; required/optional admission quotas remain the same.
 
 Required-board-only turns receive three of every four admission slots while both
 families are available. The fourth slot explores a turn using an **optional
@@ -139,8 +145,12 @@ to the normal reply cap.
 
 Preliminary terminal probes during construction are limited to 64 generation
 work nodes. An unfinished probe leaves status unknown and permits a neural
-ordering value. A selected True evaluation runs its full legal terminal check
-under the remaining search budget. Terminal probes remain **unrestricted**,
+ordering value. Selected evaluations resume their legal traversal in slices of
+256 work nodes by default (`terminalProbeWork`). Deferred proofs alternate with
+other search work and do not become True evaluations until resolved. At most
+128 unresolved traversals are retained. Up to 32 selected proofs are pinned;
+eviction closes the oldest unselected construction traversal.
+Single-timeline checks use the direct legal-existence path. Terminal probes remain **unrestricted**,
 including optional same-board moves: excluding such moves from search cannot
 manufacture mate or stalemate.
 
@@ -183,7 +193,7 @@ Interruption retains the latest backed result. Before any root True evaluation,
 accepted neural batches can improve the legal scored fallback, but partial turns
 and expired batches never become playable recommendations.
 
-Advanced analyze callers can set initialCandidates, componentBatchSize,
+Advanced analyze callers can set initialCandidates, componentBatchSize, candidateBranches, terminalProbeWork,
 tacticalExtensionDepth (or quiescenceDepth), extensionCandidateLimit,
 maxValueCacheEntries, and valueCacheMemoryMb. The usual timeMs, maxNodes,
 candidateLimit, innerCandidateLimit, cancellation, and fixed/dynamic depth limits
@@ -308,7 +318,11 @@ not produce policy labels.
 The optional policy head shares the transformer encoder and scores move
 descriptors against the encoded prefix. Timeline/time coordinates, piece flags,
 promotions, castling, and en-passant endpoints remain distinguishable. Padded
-candidate lists are masked for cross-entropy training. One prefix is sampled
+candidate lists are masked for cross-entropy training. Self-play also records
+soft targets from evaluated complete-turn alternatives sharing the exact prefix.
+Scores are mover-relative with a 250 cp softmax temperature; only observed
+choices participate in this conditional loss. Unsearched choices receive no
+negative supervision. Old single-target datasets remain supported. One prefix is sampled
 uniformly per value row during training to bound shuffle-buffer memory; existing
 sample/game weighting is retained.
 
@@ -395,7 +409,11 @@ npm run transformer:evaluate -- --data artifacts/transformer/validation.jsonl --
 
 The evaluator streams every validation row and reports normalized value MSE,
 centipawn MAE with both targets and predictions clipped to the model's output
-range, and context truncation counts. This measures agreement with the teacher;
+range, and context truncation counts. For a trained policy it also reports
+top-1 accuracy, top-8/top-16 target retention, full-list cross-entropy, and the
+conditional supervised loss on non-forced prefixes. Best-checkpoint selection
+continues to use value MSE; use policy metrics and the paired arena to assess
+the resulting search. This measures agreement with the teacher;
 it does not by itself measure playing strength. Keep exact duplicate positions
 out of both training and validation, and use separate games or starting histories
 where possible.

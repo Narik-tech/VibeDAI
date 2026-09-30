@@ -3,6 +3,8 @@ import { createPosition, positionKey } from '../src/rules.js';
 import { certifyTerminal, runGame, summarizeGames, summarizePairs } from './match.js';
 
 const FINISHED = new Set(['A_WIN', 'B_WIN', 'DRAW']);
+const STRENGTH_MIN_PAIRS = 20;
+const CONFIDENCE_LEVEL = 0.95;
 
 function integer(name, value, minimum, maximum) {
   if (!Number.isInteger(value) || value < minimum || value > maximum) throw new Error(`Invalid ${name}.`);
@@ -61,6 +63,33 @@ function pairDetails(pair, games) {
   return { complete: true, eligible: true, reason: null, summary };
 }
 
+function assessStrength(score, pairs, { invalidGames, excludedPairs }) {
+  const count = score.pairs, estimate = score.aScore;
+  // Each observation is the mean score of BOTH color assignments, in [0, 1].
+  // A bounded-mean interval avoids treating correlated games as independent,
+  // and remains wide for a tiny all-wins sample instead of reporting zero error.
+  const radius = count ? Math.sqrt(Math.log(2 / (1 - CONFIDENCE_LEVEL)) / (2 * count)) : null;
+  const lower = count ? Math.max(0, estimate - radius) : null;
+  const upper = count ? Math.min(1, estimate + radius) : null;
+  const planned = new Set(pairs.map((pair, index) => pair.initialKey || `invalid-pair-${index}`)).size;
+  const unscored = Math.max(0, planned - count);
+  const reasons = [];
+  if (invalidGames) reasons.push('invalid-games');
+  if (count < STRENGTH_MIN_PAIRS) reasons.push('insufficient-distinct-pairs');
+  if (excludedPairs || unscored) reasons.push('unfinished-or-excluded-pairs');
+  if (count && lower <= 0.5 && upper >= 0.5) reasons.push('interval-includes-equal-score');
+  const status = reasons.length ? 'inconclusive' : lower > 0.5 ? 'candidate-advantage' : 'incumbent-advantage';
+  return { status, reasons, minimumPairs: STRENGTH_MIN_PAIRS, distinctPairs: count,
+    confidenceInterval: { level: CONFIDENCE_LEVEL, method: 'hoeffding-bounded-pair-means',
+      unit: 'distinct-color-swapped-pair', estimate, lower, upper },
+    unscoredPairs: unscored,
+    // Sensitivity range, not an adjudication: assign every missing pair either
+    // zero or one candidate point per game to expose completion selection bias.
+    allPlannedPairScoreRange: planned ? { lower: (estimate ?? 0) * count / planned,
+      upper: ((estimate ?? 0) * count + unscored) / planned } : null,
+    limitation: 'The 95% interval assumes independent representative starting-position pairs. Deterministic selection, related histories and repeated model selection do not establish that assumption. This assessment describes this arena; a frozen final suite is required for independent evaluation. Unfinished pairs receive no result.' };
+}
+
 /** A small acceptance gate, not an Elo estimate or a statistical strength proof. */
 export function decidePromotion({ pairs = [], games = [], minPairs = 4, promotionScore = 0.55 } = {}) {
   thresholds(minPairs, promotionScore);
@@ -90,13 +119,14 @@ export function decidePromotion({ pairs = [], games = [], minPairs = 4, promotio
   else if (score.aScore <= 0.5) reason = 'no-winning-margin';
   else if (score.aScore < promotionScore) reason = 'below-promotion-score';
   else reason = 'promotion-threshold-met';
+  const strengthAssessment = assessStrength(score, pairs, { invalidGames, excludedPairs });
   return { promote: reason === 'promotion-threshold-met', reason, minPairs, promotionScore,
     candidate: 'A', incumbent: 'B', candidateScore: score.aScore,
     candidatePoints: score.aPoints, incumbentPoints: score.bPoints,
     eligiblePairs: score.pairs, eligibleGames: score.pairs * 2, invalidGames, excludedPairs, duplicatePairs,
-    completion,
+    completion, strengthAssessment,
     requirement: 'At least minPairs distinct starting positions, two valid certified games with played turns per pair, and candidate score above 50% and at least promotionScore. Any invalid game vetoes promotion.',
-    limitation: 'This small deterministic paired arena is an operational acceptance gate, not independent statistical evidence of general strength or an Elo estimate.' };
+    limitation: 'Promotion retains the operational acceptance gate. strengthAssessment is separate and may remain inconclusive even when promotion passes. This repeatedly used deterministic arena is not independent evidence of general strength or an Elo estimate.' };
 }
 
 /**
@@ -106,7 +136,7 @@ export function decidePromotion({ pairs = [], games = [], minPairs = 4, promotio
  * is awaited in completion order, with no overlapping callbacks.
  */
 export async function evaluateCandidate({ candidate, incumbent, suite, pairs: requestedPairs = 4, seed = 1,
-  maxPlies = 80, maxNodes = 20000, maxDepth = 2, timeMs = 3000, terminalWork = 20000,
+  maxPlies = 80, maxNodes = 20000, maxDepth = 2, timeMs = 3000, terminalTimeMs = timeMs, terminalWork = 20000,
   minPairs = 4, promotionScore = 0.55, gameConcurrency = 1, shouldStop, onGame } = {}) {
   if (typeof candidate !== 'function' || typeof incumbent !== 'function') throw new Error('candidate and incumbent must be analyze callbacks.');
   if (!suite || !Array.isArray(suite.cases) || !suite.cases.length) throw new Error('suite needs nonempty cases.');
@@ -118,9 +148,9 @@ export async function evaluateCandidate({ candidate, incumbent, suite, pairs: re
   integer('seed', seed, 0, 0xffffffff);
   for (const [name, value, minimum, maximum] of [
     ['maxPlies', maxPlies, 0, 10000], ['maxNodes', maxNodes, 0, 1e9], ['maxDepth', maxDepth, 0, 64],
-    ['timeMs', timeMs, 1, 3600000], ['terminalWork', terminalWork, 0, 1e9],
+    ['timeMs', timeMs, 1, 3600000], ['terminalTimeMs', terminalTimeMs, 1, 3600000], ['terminalWork', terminalWork, 0, 1e9],
   ]) integer(name, value, minimum, maximum);
-  const limits = { engine: 'transformer', maxPlies, maxNodes, maxDepth, timeMs, terminalWork, quiescenceDepth: 0, playOnTimeLimit: true };
+  const limits = { engine: 'transformer', maxPlies, maxNodes, maxDepth, timeMs, terminalTimeMs, terminalWork, quiescenceDepth: 0, playOnTimeLimit: true };
   let cancellation = null, failed = false, failure;
   function fail(error) {
     if (!failed) { failed = true; failure = error; }
@@ -229,7 +259,7 @@ export async function evaluateCandidate({ candidate, incumbent, suite, pairs: re
     games, pairs: paired, summary: { ...summarizeGames(games), totalPairs: paired.length,
       completePairs: paired.filter(pair => pair.complete).length,
       eligiblePairs: decision.eligiblePairs, uniqueStartingPositions: new Set(paired.map(pair => pair.initialKey)).size,
-      completion: decision.completion,
+      completion: decision.completion, strengthAssessment: decision.strengthAssessment,
       completedPairScore: summarizePairs(paired.map(pair => ({ ...pair, complete: pair.eligible }))) }, decision,
     methodology: 'Deterministic case rotation by seed; distinct full-history starting positions only. Candidate A and incumbent B use equal limits and swapped colors. Validated legal actions may play after a search time limit, including incomplete fallbacks; search interruption remains recorded. Time limits without an action leave games unfinished. Only independently certified checkmate or stalemate finishes games. Unfinished games are not draws and neither evaluation scores nor ply limits adjudicate results. Only complete, valid, played pairs enter promotion scoring; any invalid game blocks promotion. Repeated arena selection can overfit this suite; no statistical strength guarantee.' };
 }

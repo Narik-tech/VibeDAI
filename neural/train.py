@@ -3,9 +3,12 @@
 Values are white-relative centipawns, transformed to tanh(value / 1000). This is
 supervised value learning; heuristic labels bootstrap a model but prove no
 playing strength. Supply independent validation data to measure generalization.
-Optional positive weights default to one and are normalized by the dataset mean
+Optional positive weights default to one (0.1 for legacy incomplete teacher rows)
+and are normalized by the dataset mean
 for training; validation metrics remain unweighted.
 Optional component-prefix labels add masked cross-entropy policy supervision.
+Soft targetWeights supervise only evaluated alternatives; zero weights are
+unobserved candidates and receive no policy gradient.
 One uniformly sampled prefix per row bounds memory and gives compound turns
 the same total policy weight as single-component turns.
 """
@@ -48,7 +51,9 @@ def _rows(path, include_policy=False):
                 value = row["value"]
                 if type(value) not in (int, float) or not math.isfinite(value):
                     raise ValueError("value must be finite white-relative centipawns")
-                weight = row.get("weight", 1)
+                teacher = row.get("teacher")
+                fallback_weight = 0.1 if isinstance(teacher, dict) and teacher.get("completed") is False else 1
+                weight = row.get("weight", fallback_weight)
                 if type(weight) not in (int, float) or not math.isfinite(weight) or weight <= 0:
                     raise ValueError("weight must be positive and finite")
                 if row.get("policy") is not None and row.get("policyVersion", 1) != 1:
@@ -77,7 +82,7 @@ def records(path, max_tokens, include_weight=False, include_policy=False, policy
             # additional encoded position per value row, regardless of turn size.
             if labels and policy_rng is not None:
                 labels = [policy_rng.choice(labels)]
-            examples = [(encoder(prefix), features, index) for prefix, features, index in labels]
+            examples = [(encoder(label[0]), *label[1:]) for label in labels]
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"{path}:{line_number}: {error}") from error
         # Evaluators retain their existing unweighted pair interface.
@@ -173,13 +178,15 @@ def save_checkpoint(path, model, optimizer, steps, examples, args, loss, validat
 
 def validation_loss(model, path, device, batch_size, max_batches):
     try:
-        from .evaluate import evaluate_records
+        from .evaluate import evaluate_records, evaluate_policy_file
         from .model import encode_for_model
     except ImportError:
-        from evaluate import evaluate_records
+        from evaluate import evaluate_records, evaluate_policy_file
         from model import encode_for_model
     rows = records(path, model.config.max_tokens, encoder=lambda position: encode_for_model(model, position))
     metrics = evaluate_records(model, rows, device, batch_size, max_batches)
+    metrics["policy"] = evaluate_policy_file(model, path, device, batch_size,
+                                             max_rows=batch_size * max_batches if max_batches else None)
     metrics["mse"] = metrics.pop("normalizedMse")
     return {**metrics, "data": str(Path(path).resolve())}
 
@@ -228,10 +235,10 @@ def main():
             del resumed
         try:
             from .model import ModelConfig, TransformerValue, choose_device, collate, load_checkpoint
-            from .policy import policy_loss
+            from .policy import policy_loss, policy_choice_count
         except ImportError:
             from model import ModelConfig, TransformerValue, choose_device, collate, load_checkpoint
-            from policy import policy_loss
+            from policy import policy_loss, policy_choice_count
         if args.steps < 1 or not 1 <= args.batch_size <= 128 or not 1 <= args.shuffle_buffer <= 4096:
             raise ValueError("steps must be positive, batch-size 1–128, shuffle-buffer 1–4096")
         if not 1 <= args.threads <= 32 or min(args.save_every, args.log_every, args.validation_batches) < 1:
@@ -347,7 +354,7 @@ def main():
             if scaler.get_scale() < previous_scale:
                 continue
             updates += 1
-            if any(len(example[1]) > 1 for example in policy_examples):
+            if any(policy_choice_count(example) > 1 for example in policy_examples):
                 model.policy_trained_steps += 1
             examples += args.batch_size
             truncated += sum(row[0].context["truncated"] for row in rows)

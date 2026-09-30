@@ -5,6 +5,8 @@ to each supplied list. Four endpoints preserve castling and en-passant details,
 and signed timeline/time coordinates distinguish spatially identical jumps.
 """
 
+import math
+
 try:
     from .encoding import _integer, _timeline_coordinate, _validate
 except ImportError:
@@ -13,6 +15,7 @@ except ImportError:
 POLICY_VERSION = 1
 MOVE_FEATURES = 38
 MAX_POLICY_MOVES = 16384
+SOFT_POLICY_TARGET_VERSION = 1
 
 
 def encode_moves(position, moves):
@@ -62,7 +65,21 @@ def encode_policy_records(position, policy):
         target = item.get("target")
         if not _integer(target) or not 0 <= target < len(features):
             raise ValueError("policy target must index a supplied legal candidate")
-        result.append((prefix, features, target))
+        weights = item.get("targetWeights")
+        if "targetWeights" in item or "targetVersion" in item:
+            if type(item.get("targetVersion")) is not int or item["targetVersion"] != SOFT_POLICY_TARGET_VERSION:
+                raise ValueError("unsupported soft policy target version")
+            if (not isinstance(weights, list) or len(weights) != len(features)
+                    or any(type(weight) not in (int, float) or not math.isfinite(weight) or weight < 0 for weight in weights)
+                    or not any(weight > 0 for weight in weights)):
+                raise ValueError("targetWeights must contain one finite nonnegative weight per candidate and positive mass")
+            # Scale before summing to avoid overflow from individually finite weights.
+            maximum = max(weights)
+            scaled = [weight / maximum for weight in weights]
+            total = sum(scaled)
+            result.append((prefix, features, target, [weight / total for weight in scaled]))
+        else:
+            result.append((prefix, features, target))
     return result
 
 
@@ -88,8 +105,30 @@ def policy_loss(model, examples, device, weights=None):
     batch = collate_for_model(model, [item[0] for item in examples], device)
     features, mask = collate_moves([item[1] for item in examples], device)
     logits = model.score_moves(model.encode(*batch), features, mask)
-    targets = torch.tensor([item[2] for item in examples], dtype=torch.long, device=device)
-    losses = torch.nn.functional.cross_entropy(logits.float(), targets, reduction="none")
+    losses = policy_example_losses(logits, mask, examples)
     if weights is not None:
         losses = losses * torch.tensor(weights, dtype=torch.float32, device=device)
     return losses.mean()
+
+
+def policy_example_losses(logits, padding_mask, examples):
+    """Hard-label CE or conditional soft CE over evaluated alternatives only."""
+    import torch
+    logits = logits.float().masked_fill(padding_mask, -torch.inf)
+    targets = torch.tensor([item[2] for item in examples], dtype=torch.long, device=logits.device)
+    losses = torch.nn.functional.cross_entropy(logits, targets, reduction="none")
+    soft_rows = [index for index, item in enumerate(examples) if len(item) > 3]
+    if soft_rows:
+        mass = torch.zeros((len(soft_rows), logits.shape[1]), device=logits.device)
+        for row, index in enumerate(soft_rows):
+            mass[row, :len(examples[index][3])] = torch.tensor(examples[index][3], device=logits.device)
+        observed = mass > 0
+        conditional = logits[soft_rows].masked_fill(~observed, -torch.inf).log_softmax(-1)
+        # Replacing the masked log values avoids 0 * -inf and its NaN gradient.
+        losses[soft_rows] = -(mass * conditional.masked_fill(~observed, 0)).sum(-1)
+    return losses
+
+
+def policy_choice_count(example):
+    """Only decisions between supervised choices train a policy head."""
+    return sum(weight > 0 for weight in example[3]) if len(example) > 3 else len(example[1])

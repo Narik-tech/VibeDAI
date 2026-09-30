@@ -730,9 +730,47 @@ export async function* generateActionsAsync(position, options = {}) {
   }
 }
 
+/** A bounded, resumable full-rule legal-turn existence check.
+ * Work events pause before a tick, so exhausting a slice never unwinds the
+ * traversal. Unknown is distinct from an exhausted (terminal) position.
+ */
+export function createLegalTurnProbe(position, options = {}) {
+  const steps = generateActionSteps(position, { ...options, firstOnly: true, yieldWork: true });
+  let step, result, closed = false;
+  return {
+    advance(maxWork = 64) {
+      if (!(maxWork === Infinity || Number.isSafeInteger(maxWork) && maxWork > 0)) throw new Error('Probe work must be a positive integer.');
+      if (result) return { ...result, work: 0 };
+      if (closed) throw new Error('Legal-turn probe is closed.');
+      let work = 0;
+      try {
+        step ??= steps.next();
+        while (!step.done) {
+          if (step.value.work) {
+            if (work >= maxWork) return { done: false, work };
+            work++;
+            step = steps.next();
+          } else if (step.value.candidate) {
+            result = { done: true, terminal: false, action: step.value.candidate.moves };
+            steps.return(); closed = true;
+            return { ...result, work };
+          } else {
+            const { current, moves, prefix } = step.value;
+            step = steps.next(options.orderMoves ? options.orderMoves(current, moves, prefix.slice()) : moves);
+          }
+        }
+        result = { done: true, terminal: true };
+        closed = true;
+        return { ...result, work };
+      } catch (error) { steps.return(); closed = true; throw error; }
+    },
+    close() { steps.return(); closed = true; },
+  };
+}
+
 // Both drivers share every legality, deduplication and pruning decision. The
 // traversal pauses only to request move ordering or expose a legal submission.
-function* generateActionSteps(position, { tick = () => {}, preferredAction = null, pruneUnsafe = true, tacticalOnly = false, firstOnly = false, cacheMoves = true, cacheUnsafeMoves = true, keyPosition = positionKey, generateMoves = pseudoMoves, skipOptionalSpatial = false, onSkipOptionalSpatial, royalSafety: searchRoyalSafety } = {}) {
+function* generateActionSteps(position, { tick = () => {}, preferredAction = null, pruneUnsafe = true, tacticalOnly = false, firstOnly = false, cacheMoves = true, cacheUnsafeMoves = true, keyPosition = positionKey, generateMoves = pseudoMoves, skipOptionalSpatial = false, onSkipOptionalSpatial, royalSafety: searchRoyalSafety, yieldWork = false } = {}) {
   const { attackedByNextPlayer } = searchRoyalSafety ?? royalSafety.createCached();
   const timeline = position.board.length === 1 ? position.board[0] : null;
   if (firstOnly && !tacticalOnly && !Array.isArray(preferredAction)
@@ -741,6 +779,7 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
     // creates opponent-color frontiers, even when it branches into the past.
     // Thus royal safety alone proves submission after a move. An existence
     // probe needs no partial-state traversal or history serialization here.
+    if (yieldWork) yield { work: true };
     tick();
     const moves = generateMoves(position);
     let ordered = yield { current: position, moves, prefix: [] };
@@ -750,8 +789,10 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
       for (const move of batch) {
         const spatial = move[0][0] === move[1][0] && move[0][1] === move[1][1];
         if (pruneUnsafe && spatial && unsafe.size && unsafe.has(JSON.stringify(move))) continue;
+        if (yieldWork) yield { work: true };
         tick();
         const current = applyMove(position, move);
+        if (yieldWork) yield { work: true };
         tick();
         if (!attackedByNextPlayer(current)) {
           yield { candidate: { moves: [move], position: { ...current, action: current.action + 1 } } };
@@ -781,16 +822,19 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
     let moves, preferredKey;
     const initialMoves = () => moves ??= generateMoves(position);
     if (Array.isArray(preferredAction)) {
+      if (yieldWork) yield { work: true };
       tick();
       let current = position, legal = true, tactical = false;
       const replay = [];
       for (const preferred of preferredAction) {
+        if (yieldWork) yield { work: true };
         tick();
         const move = replay.length ? undefined : initialMoves().find(candidate => equalMove(candidate, preferred));
         if (!move) { legal = false; break; }
         tactical = isTacticalMove(current, move);
         replay.push(move);
         current = applyMove(current, move);
+        if (yieldWork) yield { work: true };
         tick();
       }
       if (legal && replay.length && (!tacticalOnly || tactical) && !attackedByNextPlayer(current)) {
@@ -798,6 +842,7 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
         yield { candidate: { moves: replay, position: { ...current, action: current.action + 1 } } };
       }
     }
+    if (yieldWork) yield { work: true };
     tick();
     const initiallyAttacked = attackedByNextPlayer(position);
     if (pruneUnsafe && initiallyAttacked) return;
@@ -808,8 +853,10 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
       const batch = Object.hasOwn(ordered, 'more') ? ordered.moves : ordered;
       for (const move of batch) {
         if (pruneUnsafe && unsafe.size && spatial(move) && unsafe.has(moveKey(move))) continue;
+        if (yieldWork) yield { work: true };
         tick();
         const current = applyMove(position, move);
+        if (yieldWork) yield { work: true };
         tick();
         const attacked = attackedByNextPlayer(current);
         if (pruneUnsafe && attacked) {
@@ -838,7 +885,7 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
     return moveKeys.get(move);
   };
   const knownUnsafe = move => unsafeSpatialMoves.size > 0 && spatial(move) && unsafeSpatialMoves.has(moveKey(move));
-  function learnUnsafeMove() {
+  function* learnUnsafeMove() {
     const move = path.at(-1);
     if (!cacheUnsafeMoves || !move || !spatial(move)) return;
     const key = moveKey(move);
@@ -852,6 +899,7 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
     // so their outcomes must never be rejected using this spatial-move cache.
     if (path.length === 1) unsafeSpatialMoves.add(key);
     else {
+      if (yieldWork) yield { work: true };
       tick();
       if (attackedByNextPlayer(applyMove(position, move))) unsafeSpatialMoves.add(key);
     }
@@ -901,16 +949,19 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
   // orders (which can create different branches). Validate it against current
   // geometry so a stale/illegal hint never becomes a playable action.
   if (Array.isArray(preferredAction)) {
+    if (yieldWork) yield { work: true };
     tick();
     let current = position, legal = true, tactical = false;
     const moves = [];
     for (const preferred of preferredAction) {
+      if (yieldWork) yield { work: true };
       tick();
       const move = availableMoves(current).find(candidate => equalMove(candidate, preferred));
       if (!move) { legal = false; break; }
       tactical ||= isTacticalMove(current, move);
       moves.push(move);
       current = applyMove(current, move);
+      if (yieldWork) yield { work: true };
       tick();
     }
     if (legal && (!tacticalOnly || tactical) && presentTimelines(current).length === 0 && !attackedByNextPlayer(current)) {
@@ -919,6 +970,7 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
     }
   }
   function* visit(current, hasTacticalMove = false) {
+    if (yieldWork) yield { work: true };
     tick();
     // Moves in this action originate and land on mover-color boards. An attack
     // from an opponent-color latest board onto an opponent-color royal square
@@ -927,7 +979,7 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
     // component moves can still resolve.
     // Check before serializing history: dead partial turns need no state key.
     const unsafe = attackedByNextPlayer(current);
-    if (pruneUnsafe && unsafe) { learnUnsafeMove(); return; }
+    if (pruneUnsafe && unsafe) { yield* learnUnsafeMove(); return; }
     const stateKey = keyState(current);
     const key = (tacticalOnly && hasTacticalMove ? 't:' : '') + stateKey;
     if (visited.has(key)) return;
@@ -959,6 +1011,7 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
       const batch = Object.hasOwn(ordered, 'more') ? ordered.moves : ordered;
       for (const move of batch) {
         if (pruneUnsafe && knownUnsafe(move)) continue;
+        if (yieldWork) yield { work: true };
         tick();
         path.push(move);
         yield* visit(applyMove(current, move), tacticalOnly && (hasTacticalMove || isTacticalMove(current, move)));

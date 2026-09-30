@@ -118,6 +118,25 @@ class TrainingDataTests(unittest.TestCase):
             with patch("neural.encoding.encode_position", side_effect=AssertionError("must not encode during weight scan")):
                 self.assertEqual(dataset_weight_mean(data), 2)
 
+    def test_legacy_incomplete_teacher_confidence_respects_explicit_weights(self):
+        from neural.train import dataset_weight_mean, records
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory) / "train.jsonl"
+            metadata = [
+                {"teacher": {"completed": False}},
+                {"teacher": {"completed": True}},
+                {"teacher": {"completed": False}, "weight": 2},
+                {"teacher": {"completed": 0}},
+                {"teacher": None},
+                {"source": "transformer-selfplay"},
+            ]
+            data.write_text("\n".join(json.dumps({"position": position(), "value": 400, **extra})
+                                       for extra in metadata), encoding="utf-8")
+            weighted = list(records(data, 64, include_weight=True))
+            self.assertEqual([row[2] for row in weighted], [0.1, 1, 2, 1, 1, 1])
+            self.assertAlmostEqual(dataset_weight_mean(data), 6.1 / 6)
+            self.assertEqual([row[:2] for row in weighted], list(records(data, 64)))
+
     def test_invalid_weights_fail_with_file_and_line(self):
         from neural.train import dataset_weight_mean, records
         with tempfile.TemporaryDirectory() as directory:

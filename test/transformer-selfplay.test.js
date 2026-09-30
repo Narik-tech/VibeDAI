@@ -16,6 +16,12 @@ test('self-play CLI defaults to one bounded cycle and accepts continuous mode', 
   assert.equal(defaults.arenaConcurrency, 1);
   assert.equal(defaults.maxDepth, 2);
   assert.equal(defaults.maxTokens, 4096);
+  assert.equal(defaults.terminalTimeMs, 3000);
+  const budgets = parseArguments(['--time-ms', '600', '--terminal-time-ms', '9000']);
+  assert.equal(budgets.timeMs, 600);
+  assert.equal(budgets.terminalTimeMs, 9000);
+  const { terminalTimeMs, ...legacy } = defaults;
+  assert.equal(parseArguments(['--time-ms', '700'], legacy).terminalTimeMs, 700);
   assert.equal(defaults.device, process.env.TRANSFORMER_DEVICE || 'auto');
   assert.ok(defaults.minPairs <= defaults.arenaPairs);
   const options = parseArguments(['--iterations', '0', '--seed-data', 'none', '--device', 'cpu', '--steps', '3', '--game-concurrency', '4', '--arena-concurrency', '3']);
@@ -36,6 +42,7 @@ test('self-play CLI rejects malformed limits and unsafe promotion thresholds', (
     ['--game-concurrency', '0'], ['--game-concurrency', '9'], ['--game-concurrency', '1.5'], ['--game-concurrency', 'NaN'],
     ['--arena-concurrency', '0'], ['--arena-concurrency', '9'], ['--arena-concurrency', '1.5'], ['--arena-concurrency', 'NaN'],
     ['--max-tokens', '15'], ['--max-tokens', '4097'], ['--max-tokens', '512.5'], ['--max-tokens', 'NaN'],
+    ['--terminal-time-ms', '0'], ['--terminal-time-ms', '60001'], ['--terminal-time-ms', '1.5'],
     ['--exploration', '1.1'], ['--outcome-weight', '-.1'], ['--promotion-score', '.5'], ['--depth', '-1'], ['--depth', '65'],
     ['--arena-pairs', '2', '--min-pairs', '3'], ['--batch-size', '129'], ['--device', 'bogus'], ['--steps'], ['--bogus', '1'] ]) {
     assert.throws(() => parseArguments(args), undefined, args.join(' '));

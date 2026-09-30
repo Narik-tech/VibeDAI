@@ -19,7 +19,7 @@ import { recoverInterruptedIterations } from './transformer-selfplay-recovery.js
 
 const defaults = {
   iterations: 1, games: 8, gameConcurrency: 1, maxPlies: 40, maxNodes: 20000, maxDepth: 2, timeMs: 3000,
-  terminalWork: 20000, exploration: .2, explorationPlies: 12, outcomeWeight: .5,
+  terminalWork: 20000, terminalTimeMs: 3000, exploration: .2, explorationPlies: 12, outcomeWeight: .5,
   steps: 500, batchSize: 16, maxTokens: 4096, learningRate: .0001, replaySize: 8192, seed: 42,
   arenaPairs: 8, arenaConcurrency: 1, minPairs: 4, arenaPlies: 80, promotionScore: .55, keepIterations: 5,
   device: process.env.TRANSFORMER_DEVICE || 'auto',
@@ -41,7 +41,8 @@ Continuous shortcut: npm run transformer:selfplay:continuous
   --plies N            Self-play turn cap (40)
   --nodes N            Per-turn search work (20000)
   --depth N            Neural depth 1..64; 0 grows dynamically (default 2)
-  --time-ms N          Per-turn search/terminal safety cap (3000)
+  --time-ms N          Per-turn search safety cap (3000)
+  --terminal-time-ms N Independent terminal verification time cap (3000)
   --terminal-work N    Full-rules terminal verification budget (20000)
   --exploration X      Random legal-turn probability in early play (0.2)
   --exploration-plies N Early turns eligible for exploration (12)
@@ -72,7 +73,7 @@ with persisted replay and the active model. Incomplete cycles are not promoted.`
 export function parseArguments(args, initialOptions = defaults) {
   const options = { ...initialOptions };
   const names = { iterations: 'iterations', games: 'games', 'game-concurrency': 'gameConcurrency', plies: 'maxPlies', nodes: 'maxNodes', depth: 'maxDepth',
-    'time-ms': 'timeMs', 'terminal-work': 'terminalWork', exploration: 'exploration', 'exploration-plies': 'explorationPlies',
+    'time-ms': 'timeMs', 'terminal-time-ms': 'terminalTimeMs', 'terminal-work': 'terminalWork', exploration: 'exploration', 'exploration-plies': 'explorationPlies',
     'outcome-weight': 'outcomeWeight', steps: 'steps', 'batch-size': 'batchSize', 'max-tokens': 'maxTokens', 'learning-rate': 'learningRate',
     'replay-size': 'replaySize', seed: 'seed', 'arena-pairs': 'arenaPairs', 'arena-concurrency': 'arenaConcurrency', 'min-pairs': 'minPairs',
     'arena-plies': 'arenaPlies', 'promotion-score': 'promotionScore', 'keep-iterations': 'keepIterations' };
@@ -89,9 +90,11 @@ export function parseArguments(args, initialOptions = defaults) {
     else if (flag === 'device') options.device = value;
     else throw new Error(`Unknown option --${flag}.`);
   }
+  // Programmatic callers may supply an older saved options object.
+  options.terminalTimeMs ??= options.timeMs;
   for (const [name, min, max] of [
     ['iterations', 0, 1000000], ['games', 1, 128], ['gameConcurrency', 1, 8], ['maxPlies', 1, 256], ['maxNodes', 1, 10000000],
-    ['maxDepth', 0, 64], ['timeMs', 1, 60000], ['terminalWork', 1, 10000000], ['explorationPlies', 0, 256],
+    ['maxDepth', 0, 64], ['timeMs', 1, 60000], ['terminalTimeMs', 1, 60000], ['terminalWork', 1, 10000000], ['explorationPlies', 0, 256],
     ['steps', 1, 1000000], ['batchSize', 1, 128], ['maxTokens', 16, 4096], ['replaySize', 1, 100000], ['seed', 0, 0xffffffff],
     ['arenaPairs', 1, 128], ['arenaConcurrency', 1, 8], ['minPairs', 1, 128], ['arenaPlies', 1, 256], ['keepIterations', 1, 100],
   ]) if (!Number.isSafeInteger(options[name]) || options[name] < min || options[name] > max) throw new Error(`Invalid ${name}: expected integer ${min}..${max}.`);
@@ -154,7 +157,8 @@ export function workerAnalyzer(runtime, shouldStop = () => false, maxConcurrency
     try {
       worker = new Worker(new URL('../src/worker.js', import.meta.url), { workerData: {
         position, cancelBuffer, model: info.model,
-        options: { engine: 'transformer', timeMs: options.timeMs, maxNodes: options.maxNodes, maxDepth: options.maxDepth },
+        options: { engine: 'transformer', timeMs: options.timeMs, maxNodes: options.maxNodes, maxDepth: options.maxDepth,
+          collectPolicyAlternatives: options.collectPolicyAlternatives === true },
       } });
       return await new Promise((resolve, reject) => {
         let finished = false;
@@ -324,9 +328,15 @@ export async function runSelfPlay(options, { shouldStop = () => false, onRuntime
     if (run && run.checkpoint !== options.checkpoint) throw new Error('This run directory belongs to another checkpoint. Choose a new --run-dir.');
     run ??= { version: 1, runId: randomUUID(), checkpoint: options.checkpoint, createdAt: new Date().toISOString(), nextIteration: 1 };
     await atomicWrite(marker, json(run));
-    const [trainingSuite, arenaSuite] = await Promise.all([loadMatchSuite(options.suite), loadMatchSuite(options.arenaSuite)]);
+    const [trainingSuite, arenaSuite, testSuite] = await Promise.all([loadMatchSuite(options.suite), loadMatchSuite(options.arenaSuite),
+      loadMatchSuite(path.join(PROJECT_ROOT, 'examples/matches/transformer-test.json'))]);
     const arenaKeys = new Set(arenaSuite.cases.map(item => positionKey(item.position)));
     if (trainingSuite.cases.some(item => arenaKeys.has(positionKey(item.position)))) throw new Error('Self-play and arena starting positions overlap. Use separate suites.');
+    const testKeys = new Set(testSuite.cases.map(item => positionKey(item.position)));
+    if ([...trainingSuite.cases, ...arenaSuite.cases].some(item => testKeys.has(positionKey(item.position)))) {
+      throw new Error('Training or promotion starts overlap the frozen Transformer test suite. Use separate suites.');
+    }
+    const excludedKeys = new Set([...arenaKeys, ...testKeys]);
     const replay = path.join(options.runDir, 'replay.jsonl');
     const reports = [];
     for (let count = 0; options.iterations === 0 || count < options.iterations; count++) {
@@ -372,7 +382,7 @@ export async function runSelfPlay(options, { shouldStop = () => false, onRuntime
         if (play.games.some(game => !game.valid)) throw new Error('Invalid self-play game; candidate training skipped. See game records.');
         if (!play.samples.length) throw new Error('No completed finite search targets. Increase --nodes/--time-ms or change --suite.');
         report.replay = await updateReplay({ replayPath: replay, newSamples: play.samples, seedData: options.seedData,
-          maxSamples: options.replaySize, seed, excludePositionKeys: arenaKeys });
+          maxSamples: options.replaySize, seed, excludePositionKeys: excludedKeys });
         onEvent('training-start', { iteration, replay: report.replay, steps: options.steps, batchSize: options.batchSize, maxTokens: options.maxTokens });
         await saveReport();
         await trainCandidate(options, files, seed, shouldStop, onEvent);
@@ -386,7 +396,7 @@ export async function runSelfPlay(options, { shouldStop = () => false, onRuntime
         const arena = await evaluateCandidate({ candidate: openAnalyzer(candidate, arenaConcurrency),
           incumbent: openAnalyzer(incumbent, arenaConcurrency), gameConcurrency: arenaConcurrency,
           suite: arenaSuite, pairs: options.arenaPairs, seed, maxPlies: options.arenaPlies, maxNodes: options.maxNodes,
-          maxDepth: options.maxDepth, timeMs: options.timeMs, terminalWork: options.terminalWork,
+          maxDepth: options.maxDepth, timeMs: options.timeMs, terminalTimeMs: options.terminalTimeMs, terminalWork: options.terminalWork,
           minPairs: options.minPairs, promotionScore: options.promotionScore, shouldStop,
           onGame: async (game, { index, completed, total }) => {
             await atomicWrite(path.join(folder, `arena-${String(index + 1).padStart(3, '0')}.json`), json(game));

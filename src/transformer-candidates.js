@@ -22,6 +22,24 @@ function diverseOrder(current, entries) {
   return ordered;
 }
 
+// Keep the policy leaders while sampling the rest of its ranking at regular
+// intervals. The tail slot includes the final rank, so a small batch does not
+// repeatedly exclude the same source pieces. Every entry still appears once.
+function spreadBatches(entries, size) {
+  if (size < 4 || entries.length <= size) return entries;
+  const remaining = entries.slice(), ordered = [];
+  const exploration = Math.max(1, Math.floor(size / 4));
+  while (remaining.length > size) {
+    ordered.push(...remaining.splice(0, size - exploration));
+    const indices = Array.from({ length: exploration }, (_, i) =>
+      Math.floor((i + 1) * remaining.length / exploration) - 1);
+    const sampled = indices.map(index => remaining[index]);
+    for (const index of indices.toReversed()) remaining.splice(index, 1);
+    ordered.push(...sampled);
+  }
+  return [...ordered, ...remaining];
+}
+
 /**
  * A resumable stream of distinct legal complete turns. Ordinary optional-board
  * moves are omitted, but temporal optional moves receive one of every four
@@ -35,7 +53,7 @@ function diverseOrder(current, entries) {
 export function createCandidateStream(position, {
   ply = 0, tick = () => {}, keyPosition, infer, valueFor,
   probeTerminal = () => null, retainRootCandidate = () => {},
-  componentBatchSize = 16, scoreMoves,
+  componentBatchSize = 16, scoreMoves, candidateBranches = 4,
 }) {
   const batchSize = Math.max(1, Math.floor(componentBatchSize));
   const partials = new Map(), generated = new Set();
@@ -59,6 +77,7 @@ export function createCandidateStream(position, {
       eligible.forEach((entry, index) => { entry.policy = policy[index]; });
       eligible.sort((a, b) => b.policy - a.policy || a.index - b.index);
     } else eligible = diverseOrder(current, eligible);
+    eligible = spreadBatches(eligible, batchSize);
     if (!requiredOnly) {
       // Starting with the optional jump prevents a required-only DFS subtree
       // from using every reserved temporal slot before a jump is considered.
@@ -119,19 +138,59 @@ export function createCandidateStream(position, {
   }
 
   async function* family(requiredOnly) {
-    const usedOptional = new Map([[prefixKey([]), false]]);
-    const legal = generateActionsAsync(position, { ...options,
-      orderMoves: (current, moves, prefix) => moveBatches(current, moves, prefix, requiredOnly, usedOptional),
+    // Multiple required boards create large subtrees below each first move.
+    // Partition the root's ordered components into a few independent lanes;
+    // one complete turn per lane keeps an early subtree from filling the cap.
+    // The lanes share lazily scored root batches, so widening does not multiply
+    // root inference. All deeper prefixes still use the common rules traversal.
+    const count = raw.boardFuncs.present(position.board, position.action).length > 1
+      ? Math.max(1, Math.min(8, Math.floor(candidateBranches))) : 1;
+    const shared = [], rootOptional = new Map([[prefixKey([]), false]]);
+    let rootBatches, rootDone = false;
+    async function batchAt(index, current, moves) {
+      rootBatches ??= moveBatches(current, moves, [], requiredOnly, rootOptional);
+      while (shared.length <= index && !rootDone) {
+        const next = await rootBatches.next();
+        if (next.done) rootDone = true;
+        else shared.push(next.value);
+      }
+      return shared[index];
+    }
+    const lanes = Array.from({ length: count }, (_, lane) => {
+      const usedOptional = new Map([[prefixKey([]), false]]);
+      const legal = generateActionsAsync(position, { ...options,
+        orderMoves: async function* (current, moves, prefix) {
+          if (prefix.length) { yield* moveBatches(current, moves, prefix, requiredOnly, usedOptional); return; }
+          let offset = 0;
+          for (let index = 0; ; index++) {
+            const batch = await batchAt(index, current, moves);
+            if (!batch) return;
+            const selected = batch.filter((_move, i) => (offset + i) % count === lane);
+            offset += batch.length;
+            for (const move of selected) usedOptional.set(prefixKey([move]), rootOptional.get(prefixKey([move])));
+            if (selected.length) yield selected;
+          }
+        },
+      });
+      return { legal, usedOptional, done: false };
     });
     try {
-      for await (const candidate of legal) {
-        if (!requiredOnly && !usedOptional.get(prefixKey(candidate.moves))) continue;
+      while (lanes.some(lane => !lane.done)) for (const lane of lanes) {
+        if (lane.done) continue;
+        const next = await lane.legal.next();
+        if (next.done) { lane.done = true; continue; }
+        const candidate = next.value;
+        if (!requiredOnly && !lane.usedOptional.get(prefixKey(candidate.moves))) continue;
         const key = keyPosition(candidate.position);
-        if (generated.has(key)) continue;
-        generated.add(key);
-        yield await scoreCandidate(candidate);
+        if (!generated.has(key)) {
+          generated.add(key);
+          yield await scoreCandidate(candidate);
+        }
       }
-    } finally { await legal.return?.(); }
+    } finally {
+      for (const lane of lanes) await lane.legal.return?.();
+      await rootBatches?.return?.();
+    }
   }
 
   async function* stream() {

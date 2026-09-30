@@ -168,6 +168,7 @@ if you want to preserve an earlier check's copied checkpoint.
 | Self-play | 8 games, 40 complete turns/game |
 | Concurrent self-play games | 1; `--game-concurrency` accepts 1–8 |
 | Search per turn | Depth 2, 20,000 work units, 3 seconds |
+| Terminal certification | Separate 3-second budget (`--terminal-time-ms`), plus `--terminal-work` |
 | Exploration | 20% probability during the first 12 turns |
 | Training | 500 additional updates, batch 16, learning rate 0.0001 |
 | Training context | 4,096 tokens; `--max-tokens` accepts 16–4,096 |
@@ -180,14 +181,16 @@ if you want to preserve an earlier check's copied checkpoint.
 
 See all options with `node scripts/transformer-selfplay.js --help`.
 `--depth 0` enables dynamic depth for both self-play and arena games. Each search
-starts with a ceiling of one turn and raises it by one when every searched
-depth's leading 20 entries are True Evaluations, or all entries are True when
-fewer than 20 exist. The ceiling can grow to 64 under the same per-turn time and
+starts with a ceiling of one turn and raises it when leading contenders have
+selected evaluations, initial reply coverage, and continuations reaching the
+ceiling. The ceiling can grow to 64 under the same per-turn time and
 work limits. The training screen's **Search depth** setting also accepts zero.
 
 `--plies` counts submitted full player turns, including turns requiring moves
-on multiple boards. Exploration samples from a bounded prefix of up to 32 legal
-complete turns; it is not uniform over the entire 5D action space. Seeds control
+on multiple boards. Exploration shuffles component order with the game's seeded
+random stream, then samples from up to 32 legal complete turns. It is not uniform
+over the entire 5D action space. Coverage reports count actual temporal,
+compound, and timeline-creating turns. Seeds control
 case rotation and exploration. Each game's exploration has its own random
 stream derived from the cycle seed and game index, independent of completion
 order; this changes the old shared random stream for later games. Wall-clock
@@ -220,8 +223,15 @@ Use `--seed-data FILE` for another seed dataset, or `--seed-data none` to learn
 only from self-play. Later cycles read existing replay instead. New unique
 positions reserve up to half the buffer; historical positions fill the other
 share, and spare capacity is filled when one source is small. Deduplication
-includes side to move, promotions and the full multiverse history. New labels
-replace old labels for duplicated positions. JSONL is streamed with a 4 MiB
+includes side to move, promotions and the full multiverse history. Duplicate
+positions retain up to 64 distinct certified game outcomes separately from the
+latest search and policy labels. Outcomes are deduplicated by game provenance,
+then averaged using their recorded outcome weights and blended with the latest
+search value. An unfinished game cannot erase retained outcome evidence.
+Bootstrap teacher labels from incomplete searches receive weight 0.1; completed
+teacher searches receive weight 1. The trainer applies the same 0.1 fallback to
+older teacher rows marked `completed: false` without an explicit weight; explicit
+weights are preserved. JSONL is streamed with a 4 MiB
 per-record limit; malformed examples fail the update without partial replacement.
 
 After deduplication, arena exclusions and buffer trimming, the replay assigns
@@ -236,8 +246,9 @@ Weights are rebuilt on every replay update, including old replay files whose
 self-play rows already have `gameId` (scoped by run and iteration provenance).
 Legacy rows without a recoverable game ID
 keep their existing weight (default 1); the report counts these as
-`replay.weighting.ungroupedSamples`. Teacher rows also retain their existing
-weight or default to 1. Explicit weights must be finite and positive.
+`replay.weighting.ungroupedSamples`. Teacher rows retain their existing weights;
+when absent, the trainer uses the confidence defaults described above.
+Explicit weights must be finite and positive.
 The trainer uses weighted squared error, normalized by the mean weight across
 the whole dataset, so weighting still works with batch size 1. Validation
 metrics remain unweighted per-position measurements. No unfinished result is
@@ -246,9 +257,13 @@ converted to a draw or loss by this balancing.
 ## Acceptance and the UI
 
 Default self-play starts come from `examples/matches/training.json`; arena starts
-come from `examples/matches/validation.json`. Exact overlapping starts are rejected
-between suites, and exact arena-start positions are excluded from seed, existing
-and newly generated replay. Use `--suite` and `--arena-suite` for custom JSON
+come from `examples/matches/validation.json`, now containing 25 distinct starts.
+The separate frozen `examples/matches/transformer-test.json` contains 24 starts
+across six fixture families for final evaluation; it is never used for repeated
+promotion. Exact overlapping starts are rejected between training, promotion
+and final-test suites. Exact arena/test positions are excluded from bootstrap
+generation, seed, existing and newly generated replay. These checks cannot remove
+similar histories or undo exposure in an older checkpoint. Use `--suite` and `--arena-suite` for custom JSON
 files in the same fixture format.
 
 Candidate and incumbent play identical arena starts with colors swapped and
@@ -257,6 +272,15 @@ results and meaningful play. Duplicate or already-terminal starts do not count.
 An unfinished game excludes its whole pair; any invalid game vetoes promotion.
 The candidate must exceed 50% and meet `--promotion-score`, after at least
 `--min-pairs` complete distinct pairs. The default threshold is 55%.
+
+`decision.strengthAssessment` is reported separately from promotion. It uses
+distinct color-swapped pair means and a conservative 95% bounded-mean interval,
+requires at least 20 pairs, and remains inconclusive when pairs are unfinished,
+excluded or invalid, or the interval contains 50%. Its independence and
+representative-start assumptions are not guaranteed by a deterministic fixture
+suite or repeated candidate selection. It also reports the score range obtained
+if every unscored pair favored either engine; this is a sensitivity calculation,
+not an adjudicated result.
 
 Arena reports include `summary.completion` and `decision.completion`, also
 saved in `latest.json` under `arena`. These show certified game completion,
@@ -268,7 +292,8 @@ separately. Completion rates describe the joint match, not which engine caused
 a game to stop. They are diagnostic metrics and do not change the promotion gate.
 
 If too few pairs finish, inspect the recorded reasons and increase `--arena-plies`,
-`--nodes` or `--time-ms`, or supply suitable nonterminal miniature starts. A legal
+`--nodes`, `--time-ms`, or `--terminal-time-ms` according to the recorded limit,
+or supply suitable nonterminal miniature starts. A legal
 move retained when an arena search reaches its time or node budget still plays,
 including an unscored fallback from an incomplete iteration. Its search record
 preserves the cutoff reason and completion status. If no move is available, the

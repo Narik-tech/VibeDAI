@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { analyze, MATE_SCORE } from '../src/transformer-search.js';
-import { createPosition, generateActions, inCheck, parseMove, positionKey, validateAction } from '../src/rules.js';
+import { createLegalTurnProbe, createPosition, generateActions, inCheck, parseMove, positionKey, validateAction } from '../src/rules.js';
 
 function deferredMate() {
   // A partial Black turn reached from the locked-king position. Only +1 still
@@ -47,6 +47,52 @@ test('a selected candidate resumes an unknown shallow terminal probe and certifi
   assert.equal(result.mateIn, -1);
   assert.equal(result.mateProven, true, 'unknown terminal status must not become a cached nonterminal');
   assert.deepEqual(result.pv, [fixture.action]);
+  assert(result.terminalProbeResumes > 1, 'a long proof must be resumed across bounded slices');
+});
+
+test('probe slices retain traversal progress and do exactly the same work as an uninterrupted proof', () => {
+  const { next } = deferredMate();
+  let wholeWork = 0, slicedWork = 0;
+  const whole = createLegalTurnProbe(next, { tick() { wholeWork++; } });
+  const expected = whole.advance(Infinity);
+  assert.equal(expected.terminal, true);
+  const sliced = createLegalTurnProbe(next, { tick() { slicedWork++; } });
+  let result, slices = 0;
+  do {
+    result = sliced.advance(17); slices++;
+    assert(result.work <= 17);
+    if (!result.done) assert.equal(result.terminal, undefined);
+  } while (!result.done);
+  assert(slices > 2);
+  assert.equal(result.terminal, true);
+  assert.equal(slicedWork, wholeWork, 'slicing must not repeat any generation ticks');
+  assert.equal(sliced.advance(17).work, 0, 'resolved probes do no further work');
+  whole.close(); sliced.close();
+});
+
+test('terminal work is shared between root contenders while their proofs remain unknown', async () => {
+  const fixture = deferredMate();
+  const result = await analyze(fixture.position, { ...limits, candidateLimit: 4, initialCandidates: 4,
+    maxNodes: 2000, unlimitedTime: true, evaluateBatch: fixture.evaluateBatch });
+  const roots = result.rankings[0].entries;
+  assert(roots.filter(node => node.visits > 0).length > 1, 'a difficult leading proof must not monopolize all work');
+  assert.equal(result.mateProven, false);
+  assert.equal(result.pendingTerminalProbes, 0, 'search cleanup releases all suspended probes');
+  validateAction(fixture.position, result.bestAction);
+});
+
+test('existence probes use the single-timeline fast path and close safely', () => {
+  const start = createPosition();
+  const probe = createLegalTurnProbe(start, { keyPosition() { throw new Error('unnecessary history encoding'); } });
+  const result = probe.advance(3);
+  assert.equal(result.done, true);
+  assert.equal(result.terminal, false);
+  validateAction(start, result.action);
+  probe.close();
+  const paused = createLegalTurnProbe(start);
+  assert.equal(paused.advance(1).done, false);
+  paused.close();
+  assert.throws(() => paused.advance(1), /closed/);
 });
 
 test('interrupting a resumed terminal proof retains a legal heuristic fallback without a mate claim', async () => {

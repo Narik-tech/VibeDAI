@@ -92,6 +92,40 @@ test('history-cached values are reused and the trained policy selects the first 
   await stream.return();
 });
 
+test('a bounded first batch includes later policy ranks without extra inference', async () => {
+  const start = createPosition(), moves = pseudoMoves(start);
+  const last = moves.at(-1), favorite = positionKey(validateAction(start, [last]));
+  const { stream, batches } = harness(start, { componentBatchSize: 8,
+    scoreMoves: async (_state, candidates) => candidates.map((_move, index) => -index),
+    evaluate: state => positionKey(state) === favorite ? 500 : 0,
+  });
+  const first = await stream.next();
+  assert.deepEqual(first.value.moves, [last], 'a misranked strong tail move must reach the admitted candidates');
+  assert.equal(batches.flat().length, 8, 'diversity does not enlarge the inference batch');
+  await stream.return();
+});
+
+test('multi-board admission alternates first-move branches and retains exhaustive legal coverage', async () => {
+  const start = position([[square()], null, [square()]]);
+  for (const branches of [1, 4]) {
+    let rootPolicyCalls = 0;
+    const { stream, batches } = harness(start, { componentBatchSize: 4, candidateBranches: branches,
+      scoreMoves: async (_state, moves) => {
+        if (_state === start) rootPolicyCalls++;
+        return moves.map(() => 0);
+      },
+    });
+    const actual = [];
+    for await (const candidate of stream) actual.push(candidate);
+    assert.deepEqual(keys(actual), keys([...generateActions(start, { skipOptionalSpatial: true })]));
+    assert.equal(new Set(keys(actual)).size, actual.length);
+    if (branches === 4) assert(new Set(actual.slice(0, 4).map(item => JSON.stringify(item.moves[0]))).size > 1);
+    assert.equal(rootPolicyCalls, 1, 'lanes share the root policy and component batches');
+    const evaluated = batches.flat().map(positionKey);
+    assert.equal(new Set(evaluated).size, evaluated.length, 'lanes reuse exact-history neural values');
+  }
+});
+
 test('async move batches preserve shared legal traversal and close nested generators on cancellation', async () => {
   const start = position([[square()], null, [square()]]);
   let opened = 0, closed = 0;

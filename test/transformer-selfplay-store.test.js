@@ -212,6 +212,75 @@ test('new-only initialization fills capacity, supports async input, and cap one 
   assert.equal((await recordsAt(file('single.jsonl')))[0].value, 1);
 });
 
+const certifiedSample = (gameId, outcomeWhite, searchScoreWhiteCp = 200) => ({
+  ...gameSample(1, gameId, outcomeWhite === 1 ? 'WHITE_WIN' : outcomeWhite === -1 ? 'BLACK_WIN' : 'DRAW'),
+  searchScoreWhiteCp, normalizedSearchValue: Math.tanh(searchScoreWhiteCp / 1000),
+  outcomeWhite, outcomeWeight: 0.5, targetType: 'outcome-blend',
+  targetProvenance: 'certified-full-rules-outcome-and-completed-root-search',
+  provenance: { runId: 'test', iteration: 1 },
+});
+
+test('fresh bootstrap values retain certified outcomes and repeated ingestion is idempotent', async t => {
+  const file = await fixture(t), replayPath = file('replay.jsonl');
+  const win = certifiedSample('win', 1);
+  await updateReplay({ replayPath, newSamples: [win], maxSamples: 10 });
+  const bootstrap = { ...gameSample(1, 'unfinished'), value: -400, searchScoreWhiteCp: -400,
+    normalizedSearchValue: Math.tanh(-0.4), targetType: 'search-bootstrap', outcomeWhite: null, outcomeWeight: 0,
+    targetProvenance: 'completed-root-search-only-unfinished-game' };
+  await updateReplay({ replayPath, newSamples: [bootstrap], maxSamples: 10 });
+  let [row] = await recordsAt(replayPath);
+  assert.equal(row.gameResult, 'UNFINISHED', 'latest trajectory metadata remains honest');
+  assert.equal(row.searchScoreWhiteCp, -400);
+  assert.equal(row.normalizedSearchValue, Math.tanh(-0.4));
+  assert.equal(row.targetType, 'outcome-blend');
+  assert.equal(row.outcomeEvidence.observations.length, 1);
+  assert.equal(row.value, 1000 * Math.atanh(0.5 * Math.tanh(-0.4) + 0.5));
+  await updateReplay({ replayPath, newSamples: [win, win, bootstrap], maxSamples: 10 });
+  assert.deepEqual((await recordsAt(replayPath))[0], row);
+  await updateReplay({ replayPath, maxSamples: 10 });
+  assert.deepEqual((await recordsAt(replayPath))[0], row, 'resuming does not reblend the old target');
+});
+
+test('conflicting certified games aggregate separately from newest search and policy evidence', async t => {
+  const file = await fixture(t), replayPath = file('replay.jsonl');
+  const first = certifiedSample('win', 1), second = certifiedSample('loss', -1, -300);
+  second.policy = [{ moves: ['a', 'b'], target: 0, targetVersion: 1, targetWeights: [0.2, 0.8] }];
+  await updateReplay({ replayPath, newSamples: [first, second, first, second], maxSamples: 10 });
+  const [row] = await recordsAt(replayPath);
+  assert.equal(row.outcomeEvidence.observations.length, 2);
+  assert.equal(row.outcomeWhite, 0);
+  assert.equal(row.searchScoreWhiteCp, -300);
+  assert.deepEqual(row.policy, second.policy);
+  assert.equal(row.value, 1000 * Math.atanh(0.5 * Math.tanh(-0.3)));
+  assert.equal(row.weight, 1, 'deduplicated position retains equal-game weighting');
+});
+
+test('certified outcome evidence stays bounded and rejects malformed persisted evidence atomically', async t => {
+  const file = await fixture(t), replayPath = file('replay.jsonl');
+  await updateReplay({ replayPath, newSamples: Array.from({ length: 80 }, (_, index) => certifiedSample(`game-${index}`, index % 2 ? 1 : -1)) });
+  const [row] = await recordsAt(replayPath), before = await fileHash(replayPath);
+  assert.equal(row.outcomeEvidence.observations.length, 64);
+  for (const outcomeEvidence of [{ version: 2, observations: [] }, { version: 1, observations: [{ id: 'bad', outcomeWhite: 1, weight: 0.5 }] }]) {
+    await assert.rejects(updateReplay({ replayPath, newSamples: [{ ...row, outcomeEvidence }] }), /invalid outcome evidence/);
+    assert.equal(await fileHash(replayPath), before);
+  }
+  for (const targetWeights of [[0, 0], [-1, 2], [1], [NaN, 1]]) {
+    await assert.rejects(updateReplay({ replayPath, newSamples: [{ ...sample(2), policy: [{ moves: [0, 1], targetVersion: 1, targetWeights }] }] }), /policy target weights/);
+  }
+});
+
+test('outcomes retain their recorded mixture weights when run settings differ', async t => {
+  const file = await fixture(t), replayPath = file('replay.jsonl');
+  const first = { ...certifiedSample('light-win', 1), outcomeWeight: 0.2 };
+  const second = { ...certifiedSample('heavy-loss', -1, 0), outcomeWeight: 0.8 };
+  await updateReplay({ replayPath, newSamples: [first, second] });
+  const [row] = await recordsAt(replayPath);
+  assert.equal(row.outcomeWeight, 0.5);
+  assert(Math.abs(row.outcomeWhite + 0.6) < 1e-12);
+  assert(Math.abs(row.normalizedTarget + 0.3) < 1e-12);
+  assert.equal(row.normalizedTarget, (1 - row.outcomeWeight) * row.normalizedSearchValue + row.outcomeWeight * row.outcomeWhite);
+});
+
 test('arena exclusions remove seeded and incoming samples while preserving the other side and source counts', async t => {
   const file = await fixture(t), seedData = file('seed.jsonl'), replayPath = file('replay.jsonl');
   const excluded = sample(1);

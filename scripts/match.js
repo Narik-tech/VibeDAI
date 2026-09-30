@@ -9,13 +9,13 @@ const defaultSuite = new URL('../examples/matches/suite.json', import.meta.url);
 const defaults = { maxNodes: 10000, maxPlies: 40, maxDepth: 3, quiescenceDepth: 1, timeMs: 30000, terminalWork: 20000 };
 
 /** Exhaust all legal submitted turns, without the search's pruning or policy. */
-export function certifyTerminal(position, { terminalWork = defaults.terminalWork, timeMs = defaults.timeMs } = {}) {
+export function certifyTerminal(position, { terminalWork = defaults.terminalWork, timeMs = defaults.timeMs, terminalTimeMs = timeMs } = {}) {
   let work = 0;
   const exhausted = new Error('Terminal verification limit.');
-  const deadline = performance.now() + timeMs;
+  const deadline = performance.now() + terminalTimeMs;
   let reason = 'terminal-work-limit';
   const iterator = generateActions(position, {
-    pruneUnsafe: false, cacheMoves: false, skipOptionalSpatial: false,
+    pruneUnsafe: false, cacheMoves: false, skipOptionalSpatial: false, firstOnly: true,
     tick() {
       if (++work > terminalWork) throw exhausted;
       if (performance.now() >= deadline) { reason = 'terminal-time-limit'; throw exhausted; }
@@ -34,14 +34,15 @@ export function certifyTerminal(position, { terminalWork = defaults.terminalWork
 
 function limitsFor(options) {
   const limits = { ...defaults, ...options };
+  limits.terminalTimeMs = options.terminalTimeMs ?? limits.timeMs;
   // Zero is the transformer's dynamic horizon. Classical match callers keep
   // the normal positive-depth contract unless they explicitly select that engine.
   const minimumDepth = options.engine === 'transformer' ? 0 : 1;
   for (const [name, min, max] of [
     ['maxNodes', 0, 1e9], ['maxPlies', 0, 10000], ['maxDepth', minimumDepth, 64],
-    ['quiescenceDepth', 0, 8], ['timeMs', 1, 3600000], ['terminalWork', 0, 1e9],
+    ['quiescenceDepth', 0, 8], ['timeMs', 1, 3600000], ['terminalTimeMs', 1, 3600000], ['terminalWork', 0, 1e9],
   ]) if (!Number.isInteger(limits[name]) || limits[name] < min || limits[name] > max) throw new Error(`Invalid ${name}.`);
-  return { ...Object.fromEntries(Object.keys(defaults).map(key => [key, limits[key]])),
+  return { ...Object.fromEntries(Object.keys(defaults).map(key => [key, limits[key]])), terminalTimeMs: limits.terminalTimeMs,
     ...(options.engine === 'transformer' ? { engine: 'transformer' } : {}) };
 }
 
@@ -251,7 +252,8 @@ const help = `Usage: node scripts/match.js [options]
   --plies N         Maximum played turns per game (default 40)
   --depth N         Search depth (default 3)
   --qdepth N        Quiescence depth (default 1)
-  --time-ms N       Safety cap for each search/terminal check (default 30000)
+  --time-ms N       Safety cap for each search (default 30000)
+  --terminal-time-ms N Independent terminal-check time cap (defaults to --time-ms)
   --terminal-work N Independent legal-turn verification cap (default 20000)
   --output FILE     Write full JSON report including move traces
   --json            Print full JSON report
@@ -260,7 +262,7 @@ const help = `Usage: node scripts/match.js [options]
 export function parseArguments(args) {
   const parsed = { options: {}, engineAPath: 'src/search.js', engineBPath: 'src/search.js' };
   const names = { '--nodes': 'maxNodes', '--plies': 'maxPlies', '--depth': 'maxDepth', '--qdepth': 'quiescenceDepth',
-    '--time-ms': 'timeMs', '--terminal-work': 'terminalWork', '--opening-plies': 'openingPlies' };
+    '--time-ms': 'timeMs', '--terminal-time-ms': 'terminalTimeMs', '--terminal-work': 'terminalWork', '--opening-plies': 'openingPlies' };
   for (let i = 0; i < args.length; i++) {
     const flag = args[i];
     if (flag === '--help') parsed.help = true;

@@ -312,6 +312,20 @@ test('terminal verification safety timeout remains unclassified', () => {
   assert.equal(result.reason, 'terminal-time-limit');
 });
 
+test('terminal verification time budget is independent and falls back to the search cap for old callers', t => {
+  let clock = 0;
+  t.mock.method(performance, 'now', () => clock++);
+  const inherited = certifyTerminal(tiny(), { timeMs: 1 });
+  assert.equal(inherited.verified, false);
+  assert.equal(inherited.reason, 'terminal-time-limit');
+  const extended = certifyTerminal(tiny(), { timeMs: 1, terminalTimeMs: 100 });
+  assert.equal(extended.verified, true);
+  assert.equal(extended.terminal, false);
+  const independent = certifyTerminal(tiny(), { timeMs: 100, terminalTimeMs: 1 });
+  assert.equal(independent.verified, false);
+  assert.equal(independent.reason, 'terminal-time-limit');
+});
+
 test('seeded opening variations replay legally and preserve paired starts', async () => {
   const args = { engineA: firstLegal, engineB: firstLegal, suite: { cases: [{ id: 'mini', position: tiny() }] },
     ...options, seeds: [1, 7], openingPlies: 2, maxPlies: 0 };
@@ -327,10 +341,13 @@ test('seeded opening variations replay legally and preserve paired starts', asyn
 });
 
 test('case selection and CLI values reject mistakes before running trials', async () => {
+  assert.deepEqual(parseArguments(['--time-ms', '600', '--terminal-time-ms', '3000']).options,
+    { timeMs: 600, terminalTimeMs: 3000 });
   assert.deepEqual(parseArguments(['--nodes', '42', '--case', 'one,two', '--seed', '2,3', '--engine-a', 'old.js']).options,
     { maxNodes: 42, caseIds: ['one', 'two'], seeds: [2, 3] });
   assert.throws(() => parseArguments(['--nodes', '-2']));
   assert.throws(() => parseArguments(['--seed', '1,no']));
   await assert.rejects(runMatchSuite({ suite: { cases: [{ id: 'mini', position: tiny() }] }, caseIds: ['absent'] }));
   await assert.rejects(runMatchSuite({ maxNodes: -1 }));
+  await assert.rejects(runMatchSuite({ terminalTimeMs: 0 }));
 });

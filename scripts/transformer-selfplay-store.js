@@ -203,10 +203,72 @@ export async function acquireRunLock(runDir, {token = randomUUID()} = {}) {
   };
 }
 
+const MAX_OUTCOME_OBSERVATIONS = 64;
+const certifiedTarget = 'certified-full-rules-outcome-and-completed-root-search';
+
+// Retain independent certified outcomes separately from the latest search and
+// policy. Bounded game IDs make repeated ingestion idempotent while keeping each
+// replay row bounded. These are the most recent 64 distinct game observations,
+// not a claim to count every game ever played.
+function outcomeObservations(record) {
+  const observations = new Map((record?.outcomeEvidence?.observations ?? []).map(item => [item.id, item]));
+  const expected = { WHITE_WIN: 1, BLACK_WIN: -1, DRAW: 0 };
+  if (record?.targetProvenance === certifiedTarget && record.targetType === 'outcome-blend'
+      && typeof record.gameId === 'string' && record.gameId
+      && Object.hasOwn(expected, record.gameResult) && record.outcomeWhite === expected[record.gameResult]
+      && Number.isFinite(record.outcomeWeight) && record.outcomeWeight >= 0 && record.outcomeWeight <= 1) {
+    const id = hash(JSON.stringify([record.provenance?.runId ?? null, record.provenance?.iteration ?? null, record.gameId]));
+    observations.set(id, { id, outcomeWhite: record.outcomeWhite, weight: record.outcomeWeight });
+  }
+  return observations;
+}
+
+function mergeTargets(previous, incoming) {
+  const outcomes = outcomeObservations(previous);
+  for (const [id, observation] of outcomeObservations(incoming)) {
+    outcomes.delete(id); outcomes.set(id, observation);
+  }
+  if (!outcomes.size) return incoming;
+  const observations = [...outcomes.values()].slice(-MAX_OUTCOME_OBSERVATIONS);
+  // Self-play records already carry the unblended search value. Legacy teacher
+  // rows use their ordinary scalar target. Never feed a previous blend back in
+  // as fresh search evidence.
+  const normalizedSearchValue = Number.isFinite(incoming.normalizedSearchValue)
+    ? incoming.normalizedSearchValue : Math.tanh((incoming.searchScoreWhiteCp ?? incoming.value) / 1000);
+  const outcomeWeight = observations.reduce((sum, item) => sum + item.weight, 0) / observations.length;
+  const outcomeContribution = observations.reduce((sum, item) => sum + item.weight * item.outcomeWhite, 0) / observations.length;
+  const outcomeWhite = outcomeWeight > 0 ? outcomeContribution / outcomeWeight
+    : observations.reduce((sum, item) => sum + item.outcomeWhite, 0) / observations.length;
+  const unclampedNormalizedTarget = (1 - outcomeWeight) * normalizedSearchValue + outcomeContribution;
+  const normalizedTarget = Math.max(-0.999, Math.min(0.999, unclampedNormalizedTarget));
+  return { ...incoming, normalizedSearchValue, outcomeWhite, outcomeWeight, normalizedTarget, unclampedNormalizedTarget,
+    value: 1000 * Math.atanh(normalizedTarget), targetType: 'outcome-blend',
+    targetProvenance: 'retained-certified-outcomes-and-latest-search',
+    outcomeEvidence: { version: 1, observations } };
+}
+
 function validateSample(record, label) {
   const fail = detail => { throw new Error(`Invalid replay sample (${label}): ${detail}.`); };
   if (!record || typeof record !== 'object' || Array.isArray(record) || !Number.isFinite(record.value)) fail('value must be finite');
   if (Object.hasOwn(record, 'weight') && (!Number.isFinite(record.weight) || record.weight <= 0)) fail('weight must be finite and positive');
+  if (record.outcomeEvidence !== undefined) {
+    const evidence = record.outcomeEvidence;
+    if (!evidence || evidence.version !== 1 || !Array.isArray(evidence.observations)
+        || !evidence.observations.length || evidence.observations.length > MAX_OUTCOME_OBSERVATIONS
+        || evidence.observations.some(item => !item || typeof item.id !== 'string' || !/^[0-9a-f]{64}$/.test(item.id)
+          || ![-1, 0, 1].includes(item.outcomeWhite) || !Number.isFinite(item.weight) || item.weight < 0 || item.weight > 1)
+        || new Set(evidence.observations.map(item => item.id)).size !== evidence.observations.length) fail('invalid outcome evidence');
+  }
+  if (record.normalizedSearchValue !== undefined && (!Number.isFinite(record.normalizedSearchValue)
+      || Math.abs(record.normalizedSearchValue) > 1)) fail('normalized search value must be within [-1,1]');
+  if (record.searchScoreWhiteCp !== undefined && !Number.isFinite(record.searchScoreWhiteCp)) fail('search score must be finite');
+  if (Array.isArray(record.policy)) for (const prefix of record.policy) {
+    if (prefix?.targetWeights === undefined) continue;
+    if (prefix.targetVersion !== 1 || !Array.isArray(prefix.moves) || !Array.isArray(prefix.targetWeights)
+        || prefix.targetWeights.length !== prefix.moves.length
+        || prefix.targetWeights.some(value => !Number.isFinite(value) || value < 0)
+        || !prefix.targetWeights.some(value => value > 0)) fail('invalid policy target weights');
+  }
   const position = record.position;
   if (!position || typeof position !== 'object' || Array.isArray(position)
     || !Number.isInteger(position.action) || position.action < 0 || position.action > 1_000_000
@@ -232,7 +294,7 @@ function validateSample(record, label) {
   let text;
   try { text = JSON.stringify(record); } catch { fail('sample is not JSON serializable'); }
   if (Buffer.byteLength(text) > MAX_REPLAY_LINE_BYTES) fail('sample exceeds the 4 MiB line limit');
-  return {record:JSON.parse(text), key:hash(positionKey(position))};
+  return {record:mergeTargets(null, JSON.parse(text)), key:hash(positionKey(position))};
 }
 
 // Balance the rows that actually survive replay selection, not original game
@@ -296,13 +358,13 @@ async function* jsonLines(file) {
 }
 
 // A bounded hash-priority reservoir samples unique position keys without an
-// unbounded set of every key ever seen. Repeated positions keep their last label
-// and do not gain extra sampling weight. The heap's root is its largest priority.
+// unbounded set of every key ever seen. Repeated positions keep fresh search
+// labels and retained outcome evidence without extra sampling weight.
 class Reservoir {
   constructor(capacity, seed) { this.capacity = capacity; this.seed = seed; this.heap = []; this.byKey = new Map(); }
   add(item) {
     const existing = this.byKey.get(item.key);
-    if (existing) { existing.record = item.record; return; }
+    if (existing) { existing.record = mergeTargets(existing.record, item.record); return; }
     const entry = {...item, priority:hash(`${this.seed}:${item.key}`)};
     const heap = this.heap;
     if (heap.length === this.capacity) {
@@ -374,6 +436,7 @@ export async function updateReplay({replayPath, newSamples = [], seedData, maxSa
     const item = validateSample(record, label);
     if (shouldExclude(item)) continue;
     const existing = reservoir.byKey.get(item.key);
+    item.record = mergeTargets(recent.get(item.key)?.record ?? existing?.record, item.record);
     if (existing) existing.record = item.record;
     recent.delete(item.key); recent.set(item.key, item);
     if (recent.size > maxSamples) recent.delete(recent.keys().next().value);

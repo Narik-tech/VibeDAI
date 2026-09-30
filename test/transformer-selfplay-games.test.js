@@ -54,6 +54,18 @@ test('dynamic depth passes unchanged to self-play searches and saved game limits
   assert.equal(result.games[0].valid, true);
 });
 
+test('self-play requests evaluated policy alternatives and keeps terminal time independent', async () => {
+  const seen = [];
+  const result = await generateSelfPlayGames({ ...limits, positions: starts(), maxPlies: 1, terminalTimeMs: 9000,
+    analyzePosition(position, options) { seen.push(options); return firstLegal(position); },
+  });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].collectPolicyAlternatives, true);
+  assert.equal(seen[0].timeMs, limits.timeMs);
+  assert.equal(result.games[0].limits.terminalTimeMs, 9000);
+  assert.deepEqual(result.summary.coverage, { actions: 1, temporal: 0, compound: 0, branching: 0 });
+});
+
 test('concurrent games bound overlapping searches, stream completion order and return stable indices', async () => {
   const firstGame = deferred(), seen = [];
   let launched = 0, active = 0, peak = 0, writing = 0, peakWriting = 0;
