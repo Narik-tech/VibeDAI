@@ -587,6 +587,66 @@ node --expose-gc scripts/benchmark-classical.js --baseline artifacts/classical-d
 node --test --test-concurrency=2
 ```
 
+## Direct single-timeline turns and cheaper legality proofs
+
+When exactly one timeline has a playable frontier, each move consumes the
+only source board. Action generation now enumerates those complete turns
+directly, including travel into the past. It retains preferred-turn replay,
+result-history deduplication, royal safety, asynchronous ordering batches,
+and generation work ticks, while avoiding recursive partial-turn traversal
+and empty ordering callbacks after submission.
+
+At an unchecked single-timeline static boundary, search only needs evidence
+that a legal move exists. These internal probes use the generated move order
+without scoring every move. Root recommendations, searched continuations,
+multiboard probes, and checked-horizon probes keep their normal ordering.
+The static probe can try a different number of moves; its result never enters
+the principal variation or updates move-ordering history.
+
+Evaluation also reuses board-local material, activity, and royal shelter
+within each search. Piece facts use numeric triples, and king descriptors
+are shared with historical target scans. Timeline coordinates, active weights,
+historical corridors, and temporal attacks remain outside that cache. Public
+evaluation calls still observe caller edits. Empty ordering lists and repeated
+WeakMap lookups in search were also removed.
+
+A local comparison used Node 22.15.1, baseline revision
+`c186f21ee54ccbb8133459e879fc22e3fb4b2259`, five alternating pairs, three
+warm-up rounds, and garbage collection before each measured search:
+
+| Position | Depth / quiescence | Baseline median | Updated median |
+| --- | --- | ---: | ---: |
+| Standard | 4 / 2 | 200 ms | 166 ms |
+| Opening | 2 / 2 | 53 ms | 40 ms |
+| Two timelines | 2 / 1 | 336 ms | 337 ms |
+| Temporal | 2 / 1 | 139 ms | 124 ms |
+| Standard | 5 / 2 | 1,854 ms | 1,741 ms |
+
+At an equal 1.8-second budget, the updated engine completed depth five in
+two of five runs; the baseline completed depth four in all five. Standard
+depth-five median time fell 6.1%; total measured time across the four smaller
+fixtures fell 8.0%. Timing varied between runs, and the two-timeline fixture
+was effectively unchanged. Depth gains depend on the position and machine.
+
+All fixed-depth benchmark pairs retained identical scores and work counts.
+Every returned principal variation passed legality checks, inputs stayed
+unchanged, and work counters balanced. All 592 regression tests passed,
+including direct-versus-general action traversal, castling, en passant,
+promotion, duplicate outcomes, and async cancellation. All 12 tactical cases
+passed twice at 50,000 work nodes. A separate comparison on 15 positions
+matched baseline scores, PVs, search-node counts, cutoffs, and table statistics.
+
+Raw reports are `artifacts/classical-faster-final-depth.json` and
+`artifacts/classical-faster-final-standard.json`. Reproduce with:
+
+```sh
+node scripts/snapshot-engine.js c186f21ee54ccbb8133459e879fc22e3fb4b2259 artifacts/classical-faster-baseline-20260930
+node --expose-gc scripts/benchmark-classical.js --baseline artifacts/classical-faster-baseline-20260930/search.js --mode depth --depth-time-ms 15000 --repeat 5 --warmup 3 --json
+node --expose-gc scripts/benchmark-classical.js --baseline artifacts/classical-faster-baseline-20260930/search.js --case standard --mode both --depth 5 --time-ms 1800 --depth-time-ms 15000 --repeat 5 --warmup 3 --json
+node --test --test-concurrency=2
+node scripts/strength.js --nodes 50000 --repeat 2 --strict
+```
+
 ## Parallel CPU search
 
 Classical analysis supports a configurable root-search pool through the app's

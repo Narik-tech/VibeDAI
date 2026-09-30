@@ -673,6 +673,70 @@ function* generateActionSteps(position, { tick = () => {}, preferredAction = nul
     }
     return;
   }
+  if (timeline?.at(-1) && (timeline.length - 1) % 2 === position.action % 2) {
+    // Every move consumes the only playable source, including a branch into
+    // its past. Enumerate these complete turns directly: there can be no
+    // further component, optional spatial move, or present-board obligation.
+    // Keep result keys because distinct moves and ordering batches can reach
+    // the same history, and preferred turns must still appear only once.
+    const keyState = keyPosition.forAction?.(position) ?? keyPosition;
+    const visited = new Set(), unsafe = new Set(), moveKeys = new WeakMap();
+    const spatial = move => move[0][0] === move[1][0] && move[0][1] === move[1][1];
+    const moveKey = move => {
+      let key = moveKeys.get(move);
+      if (key === undefined) { key = JSON.stringify(move); moveKeys.set(move, key); }
+      return key;
+    };
+    let moves, preferredKey;
+    const initialMoves = () => moves ??= generateMoves(position);
+    if (Array.isArray(preferredAction)) {
+      tick();
+      let current = position, legal = true, tactical = false;
+      const replay = [];
+      for (const preferred of preferredAction) {
+        tick();
+        const move = replay.length ? undefined : initialMoves().find(candidate => equalMove(candidate, preferred));
+        if (!move) { legal = false; break; }
+        tactical = isTacticalMove(current, move);
+        replay.push(move);
+        current = applyMove(current, move);
+        tick();
+      }
+      if (legal && replay.length && (!tacticalOnly || tactical) && !attackedByNextPlayer(current)) {
+        if (!firstOnly) preferredKey = keyState(current);
+        yield { candidate: { moves: replay, position: { ...current, action: current.action + 1 } } };
+      }
+    }
+    tick();
+    const initiallyAttacked = attackedByNextPlayer(position);
+    if (pruneUnsafe && initiallyAttacked) return;
+    visited.add('' + keyState(position));
+    if (tacticalOnly && !initialMoves().some(move => isTacticalMove(position, move))) return;
+    let ordered = yield { current: position, moves: initialMoves(), prefix: [] };
+    while (ordered) {
+      const batch = Object.hasOwn(ordered, 'more') ? ordered.moves : ordered;
+      for (const move of batch) {
+        if (pruneUnsafe && unsafe.size && spatial(move) && unsafe.has(moveKey(move))) continue;
+        tick();
+        const current = applyMove(position, move);
+        tick();
+        const attacked = attackedByNextPlayer(current);
+        if (pruneUnsafe && attacked) {
+          if (cacheUnsafeMoves && spatial(move)) unsafe.add(moveKey(move));
+          continue;
+        }
+        const stateKey = keyState(current);
+        const key = (tacticalOnly && isTacticalMove(position, move) ? 't:' : '') + stateKey;
+        if (visited.has(key)) continue;
+        visited.add(key);
+        if (stateKey === preferredKey || attacked || (tacticalOnly && !isTacticalMove(position, move))) continue;
+        yield { candidate: { moves: [move], position: { ...current, action: current.action + 1 } } };
+      }
+      if (!ordered.more) break;
+      ordered = yield { nextBatch: ordered.more };
+    }
+    return;
+  }
   const keyState = keyPosition.forAction?.(position) ?? keyPosition;
   const visited = new Set();
   const path = [];

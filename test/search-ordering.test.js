@@ -52,7 +52,9 @@ test('compact quiet history preserves the baseline search on 16 by 16 boards', (
   assert.equal(result.depth, 3);
   assert.equal(result.stoppedReason, 'depth');
   assert.equal(result.score, 482);
-  assert.equal(result.nodes, 1915);
+  // The searched order stays identical; unordered single-timeline legality
+  // witnesses perform one additional rejected move probe (two work ticks).
+  assert.equal(result.nodes, 1917);
   assert.deepEqual(result.pv, [
     [[[0, 0, 1, 14], [0, 0, 14, 1]]],
     [[[0, 1, 14, 10], [0, 1, 13, 10]]],

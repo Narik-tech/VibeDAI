@@ -142,6 +142,8 @@ The locked-king puzzle in `examples/locked-king.5dpgn` is a performance regressi
 
 For longer diagnostics, set `BENCH_TIME_MS`, `SELFPLAY_TIME_MS`, or `SELFPLAY_PLIES` in your shell. Increase think time before increasing depth: requested depth is only a ceiling, and the full-turn branching factor can grow rapidly.
 
+Single-timeline turns now use direct action generation, static legality probes avoid unnecessary move ranking, and evaluation reuses spatial board facts. A local comparison reduced standard depth-five median time from 1.85 to 1.74 seconds. At 1.8 seconds, the updated engine reached depth five in two of five runs, versus none for the baseline. See [measurements and reproduction commands](docs/performance.md#direct-single-timeline-turns-and-cheaper-legality-proofs).
+
 ## Design and limits
 
 - **Immutable history:** search shares unchanged past boards, but position keys include all history. Identical current boards with different pasts are different positions.

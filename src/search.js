@@ -6,6 +6,7 @@ import { SearchCache } from './search-cache.js';
 export const MATE_SCORE = 100_000;
 const MATE_THRESHOLD = MATE_SCORE - 1000;
 const INF = 1_000_000;
+const NO_MOVES = Object.freeze([]);
 class SearchInterrupted extends Error {}
 const actionKey = action => JSON.stringify(action);
 const moveKey = move => JSON.stringify(move);
@@ -112,14 +113,23 @@ export function createSearchSession(position, options = {}) {
     }
   }
   function staticScore(pos) {
-    if (!evalCache.has(pos)) evalCache.set(pos, Math.max(-MATE_THRESHOLD + 1, Math.min(MATE_THRESHOLD - 1, evaluate(pos) * colorSign(pos))));
-    return evalCache.get(pos);
+    let value = evalCache.get(pos);
+    if (value === undefined) {
+      value = Math.max(-MATE_THRESHOLD + 1, Math.min(MATE_THRESHOLD - 1, evaluate(pos) * colorSign(pos)));
+      evalCache.set(pos, value);
+    }
+    return value;
   }
   function checked(pos) {
-    if (!checkCache.has(pos)) checkCache.set(pos, royalSafety.inCheck(pos));
-    return checkCache.get(pos);
+    let value = checkCache.get(pos);
+    if (value === undefined) {
+      value = royalSafety.inCheck(pos);
+      checkCache.set(pos, value);
+    }
+    return value;
   }
   function* orderMoves(pos, moves, favorites, killerMoves, spatialFirst = false) {
+    if (!moves.length) return;
     // Keep only the numeric priorities for this visit. Retaining a feature
     // object and weak-cache entry for every generated move costs more than
     // recomputing these few scalars, especially when most moves get cut off.
@@ -149,7 +159,6 @@ export function createSearchSession(position, options = {}) {
       priorities[index] = priority;
       if (priority > priorities[first]) first = index;
     }
-    if (!moves.length) return;
     yield moves[first];
     // A beta cutoff often needs only the best component. Defer sorting and
     // allocating its remaining indices until another component is requested.
@@ -160,7 +169,7 @@ export function createSearchSession(position, options = {}) {
     ordered.sort((a, b) => priorities[b] - priorities[a]);
     for (const index of ordered) yield moves[index];
   }
-  function actions(pos, preferred, ply, { spatialFirst = true, tacticalOnly = false, restricted = true, firstOnly = false } = {}) {
+  function actions(pos, preferred, ply, { spatialFirst = true, tacticalOnly = false, restricted = true, firstOnly = false, ordered = true } = {}) {
     // A checked multiverse can have a one-move escape even when several boards
     // are required: a temporal arrival can advance two boards, or a branch can
     // move the present into the past. Find that reply before the depth-first
@@ -188,9 +197,9 @@ export function createSearchSession(position, options = {}) {
     const iterator = generateActions(pos, {
       tick: () => tick(), tacticalOnly, firstOnly, preferredAction: preferred, keyPosition, generateMoves, royalSafety, skipOptionalSpatial: restricted,
       onSkipOptionalSpatial: () => policyPruned.add(iterator),
-      orderMoves: (current, moves) => orderMoves(current, moves,
-        favorites ??= orderingLookup(preferred || []),
-        killerMoves ??= orderingLookup((killers.get(ply) || []).flat()), spatialFirst),
+      orderMoves: ordered ? (current, moves) => orderMoves(current, moves,
+        favorites ??= orderingLookup(preferred || NO_MOVES),
+        killerMoves ??= orderingLookup(killers.get(ply)?.flat() || NO_MOVES), spatialFirst) : undefined,
     });
     return iterator;
   }
@@ -272,11 +281,16 @@ export function createSearchSession(position, options = {}) {
     // legal turn first, which is costly when several boards must be played.
     const tacticalOnly = remaining > 0 && !isCheck && best < beta;
     const firstOnly = remaining < 0 || (!isCheck && (best >= beta || remaining === 0));
-    let iterator = actions(pos, entry?.pv[0], ply, { tacticalOnly, firstOnly });
+    // An unchecked single-timeline static boundary only needs one legal move.
+    // Its witness never enters the PV or updates ordering history. Avoid full
+    // ranking here; keep it for multiboard combinations and checked boundaries,
+    // where a poor first component can make the existence probe expensive.
+    const ordered = !firstOnly || pos.board.length !== 1 || remaining < 0;
+    let iterator = actions(pos, entry?.pv[0], ply, { tacticalOnly, firstOnly, ordered });
     let next = iterator.next();
     if (next.done && tacticalOnly) {
       if (hasLegalAction) return finish(best, [], true);
-      iterator = actions(pos, null, ply, { firstOnly: true });
+      iterator = actions(pos, null, ply, { firstOnly: true, ordered: pos.board.length !== 1 });
       const witness = iterator.next();
       iterator.return?.();
       // No captures does not prove stalemate: quiet legal turns still count.

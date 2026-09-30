@@ -45,6 +45,40 @@ test('public evaluation and fresh search caches see caller mutations', () => {
   assert.equal(inspectEvaluation(position).total, after);
 });
 
+test('shared spatial frontiers keep historical corridors separate from current royal danger', () => {
+  const empty = () => Array.from({ length: 8 }, () => Array(8).fill(0));
+  const first = empty();
+  first[0][4] = 12;
+  first[1][5] = 2;
+  first[7][4] = 11;
+  first[6][3] = 1;
+  const sealed = empty();
+  for (let f = 0; f < 8; f++) { sealed[1][f] = 2; sealed[2][f] = 2; }
+  const frontier = empty();
+  frontier[7][4] = 11;
+  frontier[4][5] = 10;
+  frontier[4][1] = 9;
+  // White's royal has left this frontier. Its old corridor still affects
+  // averaged shelter, but cannot become the worst current white royal.
+  // The two positions share their exact latest squares with different paths
+  // through history, so only spatial contributions can share a cached value.
+  const positions = [empty(), sealed].map(middle => ({
+    board: [[first, empty(), middle, empty(), frontier]], action: 0,
+  }));
+  const expected = [
+    { material: 0, activity: -3, kingSafety: 46, temporal: 0, timelines: 0, travel: 140, total: 183 },
+    { material: 0, activity: -3, kingSafety: 98, temporal: 0, timelines: 0, travel: 140, total: 235 },
+  ];
+  const cached = createEvaluator();
+  for (const index of [0, 1, 0, 1]) {
+    assert.deepEqual(evaluateDetailed(positions[index]), expected[index]);
+    assert.equal(cached(positions[index]), expected[index].total);
+    const inspected = inspectEvaluation(positions[index]);
+    const worstKing = inspected.features.find(feature => feature.key === 'worstKingWeight').value;
+    assert(Math.abs(worstKing - 30.51) < 1e-9);
+  }
+});
+
 test('temporal target groups preserve mixed parity, projected travel, and weighted maxima', () => {
   const history = Array.from({ length: 19 }, (_, t) => {
     const squares = Array.from({ length: 8 }, () => Array(8).fill(0));
