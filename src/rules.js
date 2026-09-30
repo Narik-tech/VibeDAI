@@ -201,7 +201,7 @@ export function pseudoMoves(position) {
 }
 
 // Keep the pinned library's direction order: tied search moves must retain
-// their order. Unmoved kings use its special castling handling.
+// their order. Castling follows the ordinary king steps below.
 const SEARCH_MOVEMENT = Array.from({ length: 13 }, (_, type) => ({
   steps: raw.pieceFuncs.movePos(type * 2), rays: raw.pieceFuncs.moveVecs(type * 2),
 }));
@@ -278,6 +278,30 @@ function appendPawnMoves(position, from, piece, even, moves, promotionChoices) {
   }
 }
 
+function appendCastlingMoves(board, from, color, moves) {
+  const [line, turn, rank, file] = from, row = board[line][turn][rank];
+  let notInCheck;
+  // Match the library's kingside-before-queenside order and support its
+  // variable-width boards: an unmoved rook may be farther than three files
+  // away. Keep its exact spatial attack checks for all three king squares.
+  for (const direction of [1, -1]) {
+    const one = file + direction, two = one + direction;
+    if (row[one] !== 0 || row[two] !== 0) continue;
+    for (let rook = two + direction; rook >= 0 && rook < row.length; rook += direction) {
+      if (row[rook] === 0) continue;
+      if (row[rook] - color === -8) {
+        notInCheck ??= !raw.boardFuncs.positionIsAttacked(board, from, color);
+        const transit = [line, turn, rank, one], destination = [line, turn, rank, two];
+        if (notInCheck && !raw.boardFuncs.positionIsAttacked(board, transit, color)
+            && !raw.boardFuncs.positionIsAttacked(board, destination, color)) {
+          moves.push([from, destination, [line, turn, rank, rook], transit]);
+        }
+      }
+      break;
+    }
+  }
+}
+
 function searchPseudoMoves(position) {
   const { board } = position, color = position.action % 2;
   const even = raw.boardFuncs.isEvenTimeline(board), moves = [];
@@ -299,12 +323,6 @@ function searchPseudoMoves(position) {
         const from = [l, t, r, f], type = Math.ceil(absolute / 2);
         if (type === 1 || type === 8) {
           appendPawnMoves(position, from, piece, even, moves, promotionChoices);
-          continue;
-        }
-        if (piece === -11 || piece === -12) {
-          for (const move of raw.pieceFuncs.moves(board, from, false, position.promotions)) {
-            if (!royal(pieceAt(board, move[1]))) moves.push(move);
-          }
           continue;
         }
         const { steps, rays } = movement[type];
@@ -335,6 +353,7 @@ function searchPseudoMoves(position) {
             turn += dt * 2; rank += dr; file += df;
           }
         }
+        if (piece === -11 || piece === -12) appendCastlingMoves(board, from, color, moves);
       }
     }
   }
@@ -383,7 +402,11 @@ export function applyMove(position, move) {
     if (to[2] !== from[2]) next[to[2]] = previous[to[2]].slice();
     next[from[2]][from[3]] = 0;
     next[to[2]][to[3]] = to[4] || Math.abs(previous[from[2]][from[3]]);
-    raw.boardFuncs.setTurn(board, source, from[1] + 1, next);
+    // This source is already the latest board, so setTurn would only append
+    // after walking its complete history. Preserve its normalization of
+    // missing earlier timeline containers without revisiting old turns.
+    for (let line = 0; line < source; line++) if (board[line] === undefined) board[line] = null;
+    board[source].push(next);
   } else raw.boardFuncs.move(board, move);
   return { ...position, board };
 }

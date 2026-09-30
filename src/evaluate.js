@@ -231,24 +231,35 @@ function timelineEvaluation(timeline, spatial, settings, cache) {
   const zoneRisk = [0, 0], royals = [], pawns = [];
   // Retain the first king zone of each half-turn color and recent history: a
   // late blocker cannot erase an early route through a king-zone pawn.
-  const sampleTimes = new Set([t]);
+  const entryTimes = [t], firstTimes = [-1, -1];
   for (const parity of [0, 1]) for (let first = parity; first <= t; first += 2) {
-    if (timeline[first]) { sampleTimes.add(first); break; }
+    if (timeline[first]) {
+      firstTimes[parity] = first;
+      if (first !== t) entryTimes.push(first);
+      break;
+    }
   }
-  for (let past = t - 2, sampled = 0; past >= 0 && sampled < 6; past -= 2, sampled++) sampleTimes.add(past);
-  // Entry opportunities also include intervening half-turn snapshots.
-  const entryTimes = new Set(sampleTimes);
-  for (let past = t - 1, sampled = 0; past >= 0 && sampled < 12; past--, sampled++) entryTimes.add(past);
-  for (const past of entryTimes) {
+  for (let past = t - 2, sampled = 0; past >= 0 && sampled < 6; past -= 2, sampled++) {
+    if (past !== firstTimes[0] && past !== firstTimes[1]) entryTimes.push(past);
+  }
+  // Keep corridor samples first, then add the intervening half-turns used
+  // only for entries. Their parity makes duplicates easy to exclude without
+  // constructing two Sets or probing one again for every king-zone target.
+  const corridorSamples = entryTimes.length;
+  for (let past = t - 1, sampled = 0; past >= 0 && sampled < 6; past -= 2, sampled++) {
+    if (past !== firstTimes[0] && past !== firstTimes[1]) entryTimes.push(past);
+  }
+  for (let index = 0; index < entryTimes.length; index++) {
+    const past = entryTimes[index];
     const snapshot = timeline[past];
     if (!snapshot) continue;
     const targets = boardTargets(snapshot, past === t ? kings : null, cache?.targets);
     if (past < t && past >= t - 12 && (t - past) % 2 === 0) {
       for (const king of targets.kings) royals.push(past, king);
     }
-    const risk = [0, 0];
+    const risk = [0, 0], sampled = index < corridorSamples;
     for (const target of targets.zone) {
-      if (sampleTimes.has(past)) risk[target.color] += corridorRisk(timeline, t, target, enemyCorridors[target.color], past);
+      if (sampled) risk[target.color] += corridorRisk(timeline, t, target, enemyCorridors[target.color], past);
       if (past < t && target.pawn && target.defenders === 0) {
         pawns.push(past, target);
       }
@@ -407,8 +418,9 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
   const totals = { material: 0, activity: 0, kingSafety: 0, temporal: 0, timelines: 0, travel: 0 };
   // Temporal attacks can only reach the opposite color on the same half-turn
   // parity. Group targets once, preserving their order within each group.
-  const royals = [[], [], [], []], entryPawns = [[], [], [], []], attackers = [], frontier = [];
+  const royals = [[], [], [], []], entryPawns = [[], [], [], []], attackers = [];
   let totalWeight = 0;
+  let activeCount = 0, lowestMaterial = Infinity, highestMaterial = -Infinity;
   const worstKing = [0, 0];
   const featureValues = inspect ? Object.fromEntries(FEATURE_SETTINGS.map(entry => [entry.key, 0])) : null;
   const boards = inspect ? [] : null;
@@ -459,7 +471,11 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
     totals.material += weight * material;
     totals.activity += weight * activity;
     totals.kingSafety += weight * kingSafety;
-    frontier.push({ l, t, weight, material });
+    if (active.has(l)) {
+      activeCount++;
+      lowestMaterial = Math.min(lowestMaterial, material);
+      highestMaterial = Math.max(highestMaterial, material);
+    }
     if (inspect) boards.push({ timeline: l, coordinate: line, turn: t, active: active.has(l), weight, material: weight * material,
       activity: weight * activity, kingSafety: weight * kingSafety, phase: middleGame });
   }
@@ -518,11 +534,8 @@ function evaluatePosition(position, heuristics, inspect = false, scoreOnly = fal
   }
   // Additional boards require defending additional kings. Penalize a frontier
   // material weakness that averaging would otherwise conceal.
-  const activeFrontier = frontier.filter(b => active.has(b.l));
-  if (activeFrontier.length > 1) {
-    const low = Math.min(...activeFrontier.map(b => b.material));
-    const high = Math.max(...activeFrontier.map(b => b.material));
-    const weakBoard = (Math.min(0, low) + Math.max(0, high)) * 0.12 * settings.weakBoardWeight;
+  if (activeCount > 1) {
+    const weakBoard = (Math.min(0, lowestMaterial) + Math.max(0, highestMaterial)) * 0.12 * settings.weakBoardWeight;
     totals.timelines += weakBoard;
     if (inspect) featureValues.weakBoardWeight = weakBoard;
   }

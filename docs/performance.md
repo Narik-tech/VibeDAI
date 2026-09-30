@@ -703,6 +703,71 @@ node scripts/strength.js --nodes 1000,5000,20000 --repeat 2 --json
 node --test
 ```
 
+### King geometry, history appends, and matching cache bounds
+
+The next optimization keeps the searched moves and evaluation scores intact:
+
+- Unmoved kings use the same precomputed geometry as other pieces. Castling
+  retains the pinned library's move order and attack checks.
+- Ordinary spatial moves append a board directly instead of scanning every
+  historical turn in the library's `setTurn` helper. Earlier missing timeline
+  containers retain their original normalization.
+- Evaluation builds historical samples in parity order and tracks frontier
+  material extrema directly, reducing temporary Sets, objects, and arrays.
+- Matching upper and lower cache bounds become exact when their scores,
+  depths, and tactical horizons match. The saved continuation comes from the
+  lower bound, which proves that its score can be reached. Mate normalization
+  and the cache memory budget still apply.
+
+Isolated alternating microbenchmarks showed king move generation at 1.09–1.67x
+the previous speed across four fixtures. Spatial move application was 1.30x
+at 32 historical boards, 1.97x at 128, and 2.24x at 512. Evaluator timings were
+mostly unchanged, with a 1.05x result for the two-timeline fixture; all 3,630
+evaluated positions retained their exact scores. These are component timings,
+not whole-search speedups.
+
+Against commit `614dad21f0cfa66c891f1d1cfe9070fb246b9f6b`, five warmed,
+alternating runs on Node 22.15.1 produced these median whole-search times:
+
+| Position | Depth / tactical horizon | Previous ms | Current ms |
+| --- | --- | ---: | ---: |
+| Standard | 4 / 2 | 206 | 172 |
+| Opening | 2 / 2 | 52 | 54 |
+| Two timelines | 2 / 1 | 404 | 349 |
+| Temporal | 2 / 1 | 125 | 102 |
+| Standard, deeper search | 5 / 2 | 1,735 | 1,664 |
+| Temporal, deeper search | 3 / 1 | 2,897 | 2,886 |
+
+All fixed-depth scores matched. Standard depth-five work fell from 161,233
+to 160,880 nodes. Timings varied enough that the longer standard comparison
+did not establish a consistent speedup: both versions completed depth four
+in all five 1.5-second runs. Improvements in individual operations do not
+guarantee another completed depth at every time limit.
+
+At three seconds, the temporal fixture completed depth three in four of five
+updated runs, versus three of five baseline runs. The fixed-depth temporal
+timings were nearly unchanged, so this small sample does not establish a
+consistent depth gain.
+
+All 612 tests pass, including new castling, sparse-history, and cache-bound
+regressions. The tactical suite retains 9/12, 10/12, and 12/12 solutions at
+1,000, 5,000, and 20,000 work nodes respectively, with two deterministic runs
+per case and no invalid turns. Benchmark runs validate complete PV legality,
+unchanged input positions, and balanced work counters.
+
+The local reports are `artifacts/classical-speed-final-depth-20260930.json`
+and the corresponding `standard`, `temporal`, and
+`artifacts/classical-speed-strength-after-20260930.json` reports. Reproduce with:
+
+```sh
+node scripts/snapshot-engine.js 614dad21f0cfa66c891f1d1cfe9070fb246b9f6b artifacts/classical-speed-baseline
+node --expose-gc scripts/benchmark-classical.js --baseline artifacts/classical-speed-baseline/search.js --mode depth --repeat 5 --warmup 3 --depth-time-ms 15000 --json
+node --expose-gc scripts/benchmark-classical.js --baseline artifacts/classical-speed-baseline/search.js --case standard --mode both --depth 5 --time-ms 1500 --repeat 5 --warmup 3 --depth-time-ms 15000 --json
+node --expose-gc scripts/benchmark-classical.js --baseline artifacts/classical-speed-baseline/search.js --case temporal --mode both --depth 3 --time-ms 3000 --repeat 5 --warmup 3 --depth-time-ms 15000 --json
+node scripts/strength.js --nodes 1000,5000,20000 --repeat 2 --json
+node --test
+```
+
 ## Parallel CPU search
 
 Classical analysis supports a configurable root-search pool through the app's

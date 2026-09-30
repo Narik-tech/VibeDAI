@@ -43,6 +43,17 @@ export class SearchCache {
     const old = index?.get(key);
     const identity = namespace === undefined ? key : old;
     if (old && entry.depth < old.entry.depth && entry.flag !== 'exact') return false;
+    if (old && entry.depth === old.entry.depth && entry.quiescenceDepth === old.entry.quiescenceDepth
+        && entry.score === old.entry.score
+        && ((entry.flag === 'upper' && old.entry.flag === 'lower')
+          || (entry.flag === 'lower' && old.entry.flag === 'upper'))) {
+      // A retry can prove the upper bound at the same score as a previous
+      // lower bound. Together they are exact, but only for identical horizons.
+      // Keep the lower-bound line: an upper-bound PV need not attain its score.
+      // Scores are already normalized for mate distance before reaching here.
+      const lower = entry.flag === 'lower' ? entry : old.entry;
+      entry = { ...entry, flag: 'exact', pv: lower.pv, bestAction: lower.bestAction };
+    }
     // Tactical horizons index the same complete history string separately,
     // without allocating and hashing a new prefixed history on every probe.
     // Charge their extra index slot and fields within the shared byte budget.
