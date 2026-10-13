@@ -69,10 +69,13 @@ candidates; it never authorizes a move or certifies mate.
 Each position initially admits up to **8 complete turns**, then resumes its
 candidate generator in growing batches, normally **16 → 32 → 64**. The default
 root and reply caps are both 64 (configurable up to 256). Widening competes with
-deepening, so an expansion no longer has to construct its entire capped list
-before a promising continuation receives search. A frontier with no remaining
-work widens immediately; otherwise width grows approximately with the square
-root of the work spent in that branch.
+deepening, so a promising continuation can receive search before the entire
+capped list is constructed. A frontier with no remaining work widens immediately;
+otherwise width grows approximately with the square root of the work spent in
+that branch. The widening schedule scales with the configured `initialCandidates`,
+bounded by the position's candidate cap. A short initial root batch widens to
+provide three contenders when the generator and cap permit it. Selected internal
+positions also widen when needed to provide two leading replies.
 
 At each component prefix, successor values are evaluated in **batches of 16** by
 default, bounded by the service maximum of 128. Later batches are requested only
@@ -113,26 +116,51 @@ selected continuations exist, the parent backs up the best evaluated continuatio
 for its mover. Unsearched alternatives do not become proof of a forced loss.
 The static submitted-state score and backed search estimate are kept separately.
 
-The scheduler first evaluates up to **three leading root contenders**, then the
-two strongest admitted opponent replies to each expandable contender. It
-subsequently balances the leading continuation, progressive widening, competitive
-sideline catch-up, and exploration. Every eighth scheduled operation reserves an
-exploration opportunity for a less-visited branch. Catch-up has a separate
-periodic allocation and considers score separation, evaluation changes, forcing
-positions, and continuation length; inferior-looking branches do not receive
-unlimited work merely because their lines are short.
+The scheduler first evaluates up to **three leading root contenders**, widening
+an unfinished short root batch when necessary. It then evaluates the two
+strongest admitted opponent replies to each expandable contender. Deeper
+selected positions receive the same minimum leading-reply coverage when enough
+candidates are available. It subsequently balances the leading continuation,
+progressive widening, competitive sideline catch-up, and exploration.
+
+Each position uses its own work count to schedule exploration of less-visited
+branches every eight operations and competitive sideline catch-up every four.
+Mandatory coverage and widening also affect their actual share of work. Catch-up
+considers the score gap for the mover and the line's depth deficit. A line is
+competitive when it is within **150 centipawns** of the leader, its current
+principal-variation tip has an unresolved check, or its decayed evaluation
+correction is at least 150 centipawns. That correction is
+`abs(backed - static) / sqrt(visits + 1)`, so an old evaluation change loses
+urgency as the branch receives work. A check already answered earlier in the
+line no longer supplies forcing priority.
 
 A demoted line already explored more deeply than a stronger alternative does not
-claim catch-up priority. This suppression follows its descendants. Displayed
-rankings retain parent-first order: replies to a stronger parent appear before
-replies to a weaker one. The displayed consecutive True prefix remains a coverage
-statistic, but no longer gates every depth's scheduling.
+claim catch-up priority. This suppression follows its descendants. Selection
+orders children within a position and descends until it finds available work;
+it stops before searching the remaining subtrees. Complete depth rankings are
+built for progress and result snapshots. Those displayed rankings retain
+parent-first order: replies to a stronger parent appear before replies to a
+weaker one. The consecutive True prefix remains a display coverage statistic.
 
 **Dynamic depth (maxDepth: 0)** begins at one complete turn. Its ceiling increases
-one turn at a time when the current leading contenders have selected values,
-initial reply coverage where applicable, and live continuations reaching the
-ceiling. Resolved terminal lines need no further depth. There is no global
-20-entry quota. The ceiling never decreases and is capped at 64.
+one turn at a time after the current top three root contenders have selected
+values and initial opponent-reply coverage, where available. Further depth
+requirements apply to the competitive contenders within that group: leading
+replies along their principal variations must be evaluated inside the ordinary
+horizon, and their live continuations must reach the ceiling. Clearly losing
+contenders still receive initial reply coverage and exploration opportunities.
+Resolved lines and fully closed selective branches need no further work; a
+selective closure does not prove a terminal result. A live alternative at the
+horizon can justify deeper search when the preferred line has closed. At least
+one live continuation must reach the horizon. The ceiling never decreases and
+is capped at 64.
+
+This implementation uses selective minimax backups and heuristic urgency scores.
+It does not implement PUCT or estimate statistical confidence. For related
+search methods, see [AlphaZero's policy/value-guided Monte Carlo tree search](https://arxiv.org/abs/1712.01815)
+and [Continuous Upper Confidence Trees](https://hal.science/hal-00542673) for
+progressive widening. The constants here require evaluation on this engine's
+positions and budgets; those papers do not establish its playing strength.
 
 ### Tactical extensions and proofs
 

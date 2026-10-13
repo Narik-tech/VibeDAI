@@ -207,6 +207,7 @@ export async function analyze(position, options = {}) {
     if (first) {
       node.children = [];
       node.limit = node.depth === 0 ? candidateLimit : innerCandidateLimit;
+      node.initialWidth = Math.min(node.limit, initialCandidates);
       node.stream = createCandidateStream(node.position, {
         ply: node.depth, tick, keyPosition, infer, valueFor: pos => valueCache.get(pos),
         probeTerminal, retainRootCandidate, componentBatchSize, scoreMoves, candidateBranches,
@@ -410,8 +411,9 @@ export async function analyze(position, options = {}) {
       while (true) {
         check();
         const schedulingStarted = performance.now();
-        const rankings = rankDepths(levels, rootSign);
-        if (dynamicDepth && canDeepen(rankings, currentMaxDepth, { root, rootSign })) {
+        // Scheduling follows the tree lazily. Full depth rankings are only
+        // needed for progress snapshots, not for every search operation.
+        if (dynamicDepth && canDeepen([], currentMaxDepth, { root, rootSign })) {
           currentMaxDepth++;
           for (const level of levels) for (const node of level ?? []) {
             if (node.stream && !node.generationDone) {
@@ -426,7 +428,7 @@ export async function analyze(position, options = {}) {
         // Give deferred proofs one operation in four, in FIFO order. Other
         // contenders remain eligible while an expensive proof is unfinished.
         if (!deferredEvaluations.size || root.visits % 4 !== 3) {
-          work = chooseWork(rankings, { maxDepth: currentMaxDepth, root, rootSign, canExpand,
+          work = chooseWork([], { maxDepth: currentMaxDepth, root, rootSign, canExpand,
             canEvaluate: node => !deferredEvaluations.has(node)
               && (deferredEvaluations.size < 32 || terminalCache.has(node.position)) });
         }

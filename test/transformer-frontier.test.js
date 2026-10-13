@@ -108,6 +108,21 @@ test('two strongest replies to every contender precede a deeper principal variat
   assert.equal(graph.choose().kind, 'expand', 'the scheduler can now deepen an evaluated reply');
 });
 
+test('selected internal lines compare leading replies before continuing deeper', () => {
+  for (const rootSign of [1, -1]) {
+    const graph = tree(rootSign);
+    const contender = graph.add(graph.root, 100);
+    const reply = graph.add(contender, 100);
+    graph.add(contender, 110);
+    graph.add(reply, 100);
+    const unexplored = graph.add(reply, 90, false);
+    assert.equal(graph.ready(3), false, 'a long single-reply PV lacks defensive coverage');
+    assert.deepEqual(graph.choose(), { kind: 'evaluate', node: unexplored });
+    complete({ kind: 'evaluate', node: unexplored });
+    assert.equal(graph.ready(3), true);
+  }
+});
+
 test('root contender membership responds immediately to backed score changes', () => {
   const graph = tree();
   const roots = [100, 90, 80, 70].map(score => graph.add(graph.root, score));
@@ -181,7 +196,10 @@ test('equal-score branching eight reaches depth eight with selective work', () =
   const graph = tree();
   for (let index = 0; index < 8; index++) graph.add(graph.root, 0, false);
   let deepestEvaluation = 0, steps = 0;
-  for (; steps < 80 && deepestEvaluation < 8; steps++) {
+  // Include two-reply coverage along selected internal lines as well as the
+  // root contenders. This remains far below the full eight-way depth-8 tree.
+  const workLimit = 128;
+  for (; steps < workLimit && deepestEvaluation < 8; steps++) {
     const work = graph.choose({ maxDepth: 8 });
     assert.ok(work);
     complete(work);
@@ -190,7 +208,7 @@ test('equal-score branching eight reaches depth eight with selective work', () =
   }
   assert.equal(deepestEvaluation, 8,
     'equal neural scores must not turn the entire eight-way tree into breadth-first search');
-  assert.ok(steps < 80);
+  assert.ok(steps < workLimit);
   assert.ok(graph.root.children.slice(0, 3).every(child => child.children?.filter(reply => reply.trueScore !== null).length >= 2),
     'selective depth retains initial defensive coverage under three root contenders');
 });

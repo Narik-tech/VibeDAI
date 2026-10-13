@@ -2,6 +2,7 @@ import { applyMove, presentTimelines, createPositionKeyCache, createSearchMoveGe
 import { createEvaluator, pieceValuesFor } from './evaluate.js';
 import { normalizeHeuristics } from './heuristics.js';
 import { SearchCache } from './search-cache.js';
+import { scanMateInOne } from './mate-search.js';
 
 export const MATE_SCORE = 100_000;
 const MATE_THRESHOLD = MATE_SCORE - 1000;
@@ -65,6 +66,7 @@ function historyKey(position, move) {
 /**
  * Search complete submitted turns under the requested present-spatial policy:
  * ordinary moves from optional boards are excluded, cross-board moves remain.
+ * A bounded root mate probe can override this policy with a full-rule proof.
  * Alpha-beta bounds apply to that selective tree, not every legal action.
  * `nodes` includes generator work ticks, making maxNodes deterministic even
  * when finding one legal multiboard action takes considerable work.
@@ -82,6 +84,8 @@ export function createSearchSession(position, options = {}) {
   const timeMs = finiteOption(options.timeMs, 3000, 0, 3_600_000);
   const maxDepth = Math.floor(finiteOption(options.maxDepth, 8, 1, 64));
   const maxNodes = Math.floor(finiteOption(options.maxNodes, 2_000_000, 0, 1_000_000_000));
+  const mateProbeWork = Math.min(Math.floor(maxNodes / 8),
+    Math.floor(finiteOption(options.mateProbeWork, 4096, 0, 1_000_000)));
   const maxTableEntries = Math.floor(finiteOption(options.maxTableEntries, 100_000, 0, 1_000_000));
   const cacheMemoryMb = finiteOption(options.cacheMemoryMb, 128, 0, 4096);
   const deadline = options.unlimitedTime === true ? Infinity : started + timeMs;
@@ -96,6 +100,7 @@ export function createSearchSession(position, options = {}) {
   let completed = false, status = 'incomplete', rootPartial = null;
   let activeQDepth = 0, completedQDepth = 0;
   let searchingDepth = 0, rootActionsSearched = 0, selectiveDepth = 0, lastProgress = started;
+  let mateProbe = null;
   const rootSign = colorSign(position);
 
   function tick(kind = 'generation') {
@@ -404,11 +409,12 @@ export function createSearchSession(position, options = {}) {
       searchingDepth, rootActionsSearched, selectiveDepth,
       nps: elapsedMs ? Math.round(nodes * 1000 / elapsedMs) : 0, pv, status, completed,
       stoppedReason: interruption, tableEntries: tt.size, cacheMemoryBytes: tt.memoryBytes,
-      searchPolicy: 'present-spatial', policyLeaves, heuristics,
+      searchPolicy: mateProbe?.status === 'mate' ? 'full-rules-mate' : 'present-spatial', policyLeaves, heuristics,
+      mateProbe,
       effectiveQuiescenceDepth: completed ? completedQDepth : activeQDepth,
       scoreType: score === null ? 'unavailable' : Math.abs(score) > MATE_THRESHOLD ? 'mate' : 'cp',
       mateIn: score !== null && Math.abs(score) > MATE_THRESHOLD ? Math.sign(score * rootSign) * (MATE_SCORE - Math.abs(score)) : null,
-      limits: { timeMs, maxDepth, maxNodes, quiescenceDepth: qDepth, cacheMemoryMb, maxTableEntries }
+      limits: { timeMs, maxDepth, maxNodes, quiescenceDepth: qDepth, cacheMemoryMb, maxTableEntries, mateProbeWork }
     };
   }
   function* iterations() {
@@ -416,13 +422,39 @@ export function createSearchSession(position, options = {}) {
       const fallbackIterator = actions(position, null, 0, { firstOnly: true });
       const fallback = fallbackIterator.next();
       fallbackIterator.return?.();
+      if (!fallback.done) { bestAction = fallback.value.moves; pv = [bestAction]; }
+      // A recursive checked horizon can spend its entire budget on the first
+      // compound turn. Give multiverse roots a bounded shallow pass first,
+      // including ordinary moves on optional boards. Only a full-rule mate
+      // proof may override the normal policy; an unfinished scan says nothing
+      // about the unexamined turns and leaves the legal fallback intact.
+      if ((!fallback.done || policyPruned.has(fallbackIterator)) && position.board.length > 1
+          && position.board.some(line => line?.length > 2) && mateProbeWork > 0) {
+        const probe = scanMateInOne(position, {
+          // Use only the shared wall-clock deadline. A second local timer
+          // would make fixed-work searches machine-speed dependent even when
+          // the caller's time limit is never reached.
+          maxWork: mateProbeWork, timeMs: Infinity,
+          tick: () => tick(), keyPosition, generateMoves, royalSafety,
+          preferredAction: bestAction,
+          orderMoves: (current, moves) => orderMoves(current, moves, NO_MOVES, NO_MOVES, true),
+        });
+        const { action, ...statistics } = probe;
+        mateProbe = statistics;
+        if (probe.status === 'mate') {
+          bestAction = action; pv = [action]; score = MATE_SCORE - 1;
+          depth = 1; searchingDepth = 1; rootActionsSearched = probe.candidates; selectiveDepth = 1;
+          completed = true; status = 'ok'; interruption = 'mate';
+          options.onProgress?.(snapshot());
+          return snapshot();
+        }
+      }
       if (fallback.done) {
         const result = emptyResult(position, 0, fallbackIterator);
         if (result.policy) interruption = 'policy';
         else { score = result.score; status = score ? 'checkmate' : 'stalemate'; completed = true; }
         return snapshot();
       }
-      bestAction = fallback.value.moves; pv = [bestAction];
       // A legal fallback is valuable even if the first recursive iteration cannot
       // finish; its score stays explicitly unavailable until a child is searched.
       const iterations = [];

@@ -122,7 +122,7 @@ test('a checking continuation regains normal reply coverage when dynamic depth o
           extended.set(entry.id, row.depth);
         }
         if (extended.has(entry.id) && info.currentMaxDepth > extended.get(entry.id)
-          && entry.generatedReplies > 1) reopened = entry;
+          && entry.generatedReplies > 1 && entry.searchedReplies > 1) reopened = entry;
       }
       stop ||= Boolean(reopened) || info.currentMaxDepth >= 5;
     },

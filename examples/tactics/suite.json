@@ -61,6 +61,21 @@
       "expected": { "action": [[[0,0,1,7],[0,0,0,6]]], "minDepth": 3, "minQuiescenceDepth": 2 }
     },
     {
+      "id": "locked-king-compound-mate", "title": "Complete a bishop mate on two present boards", "category": "mate", "file": "locked-king-compound-mate.5dpgn",
+      "limits": { "maxDepth": 2, "quiescenceDepth": 0, "maxNodes": 2000 },
+      "expected": { "minDepth": 1, "mateIn": 1 }
+    },
+    {
+      "id": "locked-king-compound-late-mate", "title": "Find the late mating component after a temporal knight defense", "category": "mate", "file": "locked-king-compound-late-mate.5dpgn",
+      "limits": { "maxDepth": 2, "quiescenceDepth": 2, "maxNodes": 5000 },
+      "expected": { "minDepth": 1, "mateIn": 1 }
+    },
+    {
+      "id": "locked-king-optional-defense", "title": "Find the bishop-pair mate after an optional-board defense", "category": "mate", "file": "locked-king-optional-defense.5dpgn",
+      "limits": { "maxDepth": 2, "quiescenceDepth": 2, "maxNodes": 20000 },
+      "expected": { "minDepth": 1, "mateIn": 1 }
+    },
+    {
       "id": "checkmate", "title": "Prove no complete legal reply in check", "category": "terminal", "file": "checkmate.5dpgn",
       "limits": { "maxDepth": 1, "quiescenceDepth": 0, "maxNodes": 5000 },
       "expected": { "status": "checkmate", "scoreSign": 1 }

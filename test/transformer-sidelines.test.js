@@ -70,9 +70,23 @@ test('forcing and unstable sidelines retain catch-up eligibility despite their s
     const graph = tree();
     graph.chain(graph.root, 5, 100);
     const sideline = graph.chain(graph.root, 2, -1000);
-    if (reason === 'forcing') sideline[0].forcing = true;
+    if (reason === 'forcing') sideline.at(-1).forcing = true;
     else sideline[0].trueScore = 1000;
     assert.deepEqual(graph.choose(), { kind: 'expand', node: sideline.at(-1) }, reason);
+  }
+});
+
+test('resolved checks and old evaluation corrections lose their extra catch-up priority', () => {
+  for (const reason of ['resolved-check', 'old-correction']) {
+    const graph = tree();
+    const leader = graph.chain(graph.root, 5, 100);
+    const sideline = graph.chain(graph.root, 2, -1000);
+    if (reason === 'resolved-check') sideline[0].forcing = true;
+    else {
+      sideline[0].trueScore = 1000;
+      sideline[0].visits = 400;
+    }
+    assert.deepEqual(graph.choose(), { kind: 'expand', node: leader.at(-1) }, reason);
   }
 });
 
@@ -98,6 +112,7 @@ test('opponent reply sidelines compare scores from the opponent perspective', ()
   for (const rootSign of [1, -1]) {
     const graph = tree(rootSign);
     const parent = graph.add(graph.root, 100);
+    parent.visits = 2;
     graph.chain(parent, 4, 100);
     const sideline = graph.add(parent, 110);
     assert.deepEqual(graph.choose(), { kind: 'expand', node: sideline });

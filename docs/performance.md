@@ -6,20 +6,91 @@ present, search considers only moves to another board (another timeline or
 another time). This also excludes ordinary captures, promotions, en passant,
 and castling from optional boards. The policy is recalculated after each move
 of a partial turn, because branching can change the present and active set.
-Preferred turns, fallback recommendations, and tactical continuations use the
-same policy. Manual play and the rules validator retain all legal moves.
+Preferred turns, fallback recommendations, and quiescence continuations use the
+same policy. The separate root mate-in-one probe described below may override
+it with an unrestricted mate proof. Manual play and the rules validator retain
+all legal moves.
 
 This is a selective search policy. In particular, advancing an optional board
 can make a later arrival branch instead of merge. The rules tests preserve
 that distinction even though search deliberately omits such spatial moves.
 If the restricted action tree is empty, the engine checks for one unrestricted
 legal turn solely to distinguish a policy limit from actual mate or stalemate.
-It does not evaluate or recommend that excluded turn. A root policy limit
+This existence check does not evaluate or recommend that excluded turn. Unless
+the separate root probe proves a mate, a root policy limit
 returns `status: incomplete`, `stoppedReason: policy`, and no recommendation;
 an internal policy limit uses static evaluation. Results identify the policy
 with `searchPolicy: present-spatial` and count internal limits in `policyLeaves`.
 Multi-turn mating lines remain subject to the selected search policy; the
 tactical suite checks its expected mates against unrestricted legal replies.
+
+## Puzzle-inspired tactical search
+
+The [5D Chess Engine Search and Verification Notes](https://chatgpt.com/space/page_4f68507f8de08191a375ce79d4172610)
+motivated a bounded, exact mate-in-one pass before recursive search at roots
+with multiple timelines and at least one timeline containing three half-turn
+boards. Opening roots without such history keep their existing search path.
+
+`src/mate-search.js` streams complete turns, first under the normal search
+policy and then, if any moves were excluded, under the full rules. Duplicate
+successor histories are checked once. Checks are tested for a legal complete
+reply, including optional ordinary moves. A single temporal move can sometimes
+advance several required boards; finding that legal escape first avoids
+expensive combinations of unrelated reply components. Failing to find a quick
+escape still requires full reply enumeration before declaring mate.
+
+The default probe gets at most 4,096 work ticks and one eighth of `maxNodes`,
+charged to the shared search/generation budget. The caller's deadline and
+cancellation apply throughout. API option `mateProbeWork: 0` disables the
+probe for comparisons; larger values remain capped by the one-eighth share.
+`mateProbe` reports `mate`, `no-mate`, or `unknown`, work, candidate/check counts,
+and any local work-limit reason. `no-mate` only excludes an immediate mate,
+not a later forced win. An interrupted scan never supplies a negative proof
+or a cached search score. Completed root proofs report
+`searchPolicy: full-rules-mate`, `depth: 1`, and `mateIn: +/-1`. Parallel search
+can return these proofs before starting workers, with all work counted.
+
+Historical evaluation now also retains kings on the earliest sampled board
+of matching parity, even beyond the six-turn recent window. Those boards were
+already sampled for temporal corridors, so this adds no history scan and at
+most one target board per timeline. Blockers and missing intermediate boards
+still invalidate rays. A verified seven-turn bishop attack that previously
+scored zero temporal pressure now scores 13cp. This does not add a speculative
+score for the puzzle's entire multi-move plan.
+
+Compared with revision `b0482cc52f6bec69b6237f4e2478a3e1f0540553`, using
+50,000 work nodes, depth three and quiescence depth two:
+
+| Fixture | Earlier work | Updated work | Result |
+| --- | ---: | ---: | --- |
+| `locked-king-compound-mate` | 117 | 116 | Verified mate in one |
+| `locked-king-compound-late-mate` | 1,348 | 534 | Verified mate in one |
+| `locked-king-optional-defense` | 49,078 | 2,117 | Verified mate in one |
+| `locked-king-rewind` | 15,754 | 17,346 | Same c7 rewind, search mate in three |
+
+The last row exposes the cost when the root has no immediate mate. At 20,000
+work nodes, the optional-defense fixture remains incomplete with the probe
+disabled but has a full-rule mate certificate with it enabled. Terminal
+regressions replay moves and enumerate replies without the generator's unsafe
+move pruning or move cache. They preserve the puzzle's 17, 22, and 10 defense
+counts and controls where superficially similar compound turns leave a
+temporal escape.
+
+The standard, opening, two-timeline opening, and temporal benchmark cases
+retain identical scores and work counts at their fixed depths. Wall-clock
+measurements are noisy; no general speedup or Elo gain is claimed. These
+changes do not prove the entire initial puzzle or make the normal multi-turn
+search exhaustive. In particular, `Bc3` versus `Bf6` is tested for the relevant
+rewind geometry, not claimed solved by the static evaluator.
+
+Reproduce the tactical comparison after creating an engine snapshot:
+
+```sh
+node scripts/snapshot-engine.js b0482cc52f6bec69b6237f4e2478a3e1f0540553 artifacts/puzzle-before
+node scripts/strength.js --case locked-king-optional-defense --nodes 50000 --repeat 2 --engine artifacts/puzzle-before/search.js --strict
+node scripts/strength.js --case locked-king-optional-defense --nodes 20000 --repeat 2 --strict
+node --test test/locked-king-puzzle.test.js test/mate-search.test.js test/evaluation-historical-royals.test.js
+```
 
 ## CPU improvements
 

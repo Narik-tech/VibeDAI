@@ -254,7 +254,10 @@ function timelineEvaluation(timeline, spatial, settings, cache) {
     const snapshot = timeline[past];
     if (!snapshot) continue;
     const targets = boardTargets(snapshot, past === t ? kings : null, cache?.targets);
-    if (past < t && past >= t - 12 && (t - past) % 2 === 0) {
+    // Old royal copies remain capturable after they leave the recent window.
+    // Reuse the first snapshot already sampled for corridors, adding at most
+    // one matching-parity board without scanning or retaining more history.
+    if (past < t && (t - past) % 2 === 0) {
       for (const king of targets.kings) royals.push(past, king);
     }
     const risk = [0, 0], sampled = index < corridorSamples;
