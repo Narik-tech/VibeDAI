@@ -1,6 +1,6 @@
 # Vibe-D AI
 
-A local analysis and play workbench, command-line engine, and JavaScript library for **5D Chess with Multiverse Time Travel**.
+A local analysis and play workbench, Rust classical engine, and JavaScript API for **5D Chess with Multiverse Time Travel**.
 
 The classical engine searches **complete submitted turns**, including turns that require moves on several timelines. Normal search considers ordinary moves only on boards currently required to advance the present; optional boards contribute cross-board moves. A bounded mate-in-one probe at multiverse roots with history also considers optional ordinary moves, and accepts a win only after checking every legal reply. It uses iterative deepening, principal variation alpha-beta search, full-turn move ordering, transposition caching in both normal and tactical search, capture/promotion quiescence, and a multiverse evaluation. The shared rules layer supports historical travel, branching, inactive timelines, castling, en passant, promotions, and the variant pieces supported by the pinned rules dependency.
 
@@ -10,20 +10,21 @@ The **Position heuristics** panel below the boards explains the displayed positi
 
 ## Run
 
-Install [Node.js 22 or newer](https://nodejs.org/) and run from this directory:
+Install [Node.js 22 or newer](https://nodejs.org/) and the [stable Rust toolchain](https://rustup.rs/), then run from this directory:
 
 ```sh
 npm ci
+npm run build:classical
 npm start
 ```
 
-Open **http://127.0.0.1:5173**. Everything runs on your computer. No API key, cloud service, or account is required. Classical search runs without a GPU or Python installation. Set `PORT` to use a different local port.
+Open **http://127.0.0.1:5173**. Everything runs on your computer. No API key, cloud service, or account is required. Classical search runs in a native Rust subprocess without a GPU or Python installation. `npm start`, `npm run analyze`, `npm run benchmark:classical`, and `npm test` build the native executable first; direct `node` commands require an existing build. Set `PORT` to use a different local port. See [the Rust engine guide](docs/rust-engine.md) for the build, protocol, and compatibility details.
 
 Choose the engine in the Engine panel. The selection and resource settings are saved in your browser and apply to analysis and automatic engine replies. Switching engines cancels the current analysis and clears its recommendation. **Max nodes** (1–1,000,000,000), think time, and depth bound search; reaching the node limit is shown below the results. Set **Think time** to **Infinite (0)** to remove the time limit for either engine; node and depth limits still apply, and **Stop analysis** stops the search early. **Search cache (RAM)** (Off or 16 MiB–4 GiB) applies to Classical search, where a full cache evicts old entries while search continues.
 
-**Search threads** selects 1, 2, 4, 8, or 16 CPU threads for Classical search. One thread remains the default. Multiple threads share the time, node, and cache budgets and search different complete-turn branches after depth-one warmup. Worker startup, copied history, and duplicated work can outweigh the gain on small searches; compare 1, 2, and 4 on your positions with `npm run benchmark:parallel`. See [parallel search behavior and measurements](docs/performance.md#parallel-cpu-search).
+**Search threads** selects 1, 2, 4, 8, or 16 CPU threads for native Classical search. The count includes the coordinator. After a serial depth-one warmup, persistent Rust workers search complete-turn root branches, sharing the time and work limits and dividing the cache budget. `threadsUsed` reports actual worker activation, so short or terminal searches can still report 1. Interrupted results can vary with scheduling. The older `benchmark:parallel` command and [parallel measurements](docs/performance.md#parallel-cpu-search) describe the retained JavaScript implementation.
 
-Classical search does not allocate GPU VRAM. Profiling found rule generation and history handling to dominate its runtime; its small, sequential evaluations do not provide enough batched work to justify GPU transfers. See [the classical engine performance and GPU assessment](docs/performance.md). The cache control caps estimated RAM retained for saved search results, including full position-history keys and move arrays; total process memory is higher. The selected amount is a budget, not an up-front allocation. Results display estimated cache usage against that budget. Choose Off to disable the cache.
+Classical search does not allocate GPU VRAM. Historical JavaScript profiling found rule generation and history handling to dominate its runtime; see [the classical engine performance and GPU assessment](docs/performance.md). The cache control caps estimated RAM retained for saved search results, including full position-history keys and move arrays; total process memory is higher. The selected amount is a budget, not an up-front allocation. Results display estimated cache usage against that budget. Choose Off to disable the cache.
 
 To prepare the transformer on a fresh installation, run these commands from the project folder, then select **Transformer · 800k** and choose **Refresh** in the UI. Skip data generation and training if `artifacts/transformer/model.pt` already exists:
 
@@ -79,10 +80,10 @@ Scores are centipawns from **White's** perspective. A `null` score means no eval
 
 ```js
 import { createPosition, validateAction } from './src/rules.js';
-import { analyze } from './src/search.js';
+import { analyze } from './src/rust-engine.js';
 
 const position = createPosition({ variant: 'standard' });
-const result = analyze(position, {
+const result = await analyze(position, {
   timeMs: 5000,
   maxDepth: 8,
   maxNodes: 2_000_000,
@@ -95,14 +96,15 @@ if (result.bestAction !== null) {
 }
 ```
 
-`analyze` is synchronous; call it in a worker if your application has an event loop to keep responsive. `src/worker.js` shows cancellation with shared memory. An action is an ordered array of raw piece moves. Coordinates are `[timelineIndex, halfTurnIndex, rankIndex, fileIndex]`. Read [the rules and compatibility notes](docs/rules.md) before using raw coordinates.
+`src/rust-engine.js` provides an asynchronous API that launches the native engine, streams progress, and closes the subprocess before resolving. Pass `shouldStop: () => boolean` to request cooperative cancellation; `src/worker.js` connects it to the app's shared-memory stop flag. Results identify `backend: 'rust'`. An action is an ordered array of raw piece moves. Coordinates are `[timelineIndex, halfTurnIndex, rankIndex, fileIndex]`. Read [the rules and compatibility notes](docs/rules.md) before using raw coordinates.
 
-For parallel Classical search, import `analyze` from `src/parallel-search.js` and `await analyze(position, { threads: 4, timeMs: 5000, maxDepth: 8 })`. The existing synchronous `src/search.js` API remains single-threaded. The parallel API accepts 1–16 threads, reports the requested count in `limits.threads` and the count actually activated in `threadsUsed`, and closes its workers before resolving. Search still performs synchronous work on its calling thread; the app and CLI run it in their existing background worker. Parallel scheduling can change tied moves and results at interrupted work budgets; one thread retains deterministic work-budget behavior.
+The synchronous `src/search.js` and asynchronous `src/parallel-search.js` APIs retain the JavaScript reference implementation for compatibility, regression comparisons, and existing training workflows. They are explicitly separate entry points; the app and CLI always select Rust for Classical search and report a build error if the native executable is missing.
 
 ## Verification
 
 ```sh
 npm test
+npm run test:rust
 npm run benchmark
 npm run benchmark:classical
 npm run benchmark:checkmate
@@ -114,17 +116,21 @@ npm run selfplay
 
 Tests cover temporal geometry, history immutability, present shifting, complete-turn legality, optional inactive boards, tactical search, interruption, game export/import, and HTTP integration. The benchmark reports local throughput and verifies returned actions. Self-play is a diagnostic and stops at a turn limit; it does not assign an Elo or count an unfinished game as a draw.
 
-`npm run benchmark:classical -- --baseline path/to/baseline/search.js --repeat 3` compares warmed classical searches at fixed depth and fixed time, alternating engine order. It checks full PV legality, input immutability, and work accounting. `--json` records source hashes and individual measurements; `--mode depth` or `--mode time` runs just one comparison.
+`npm run benchmark:classical -- --baseline path/to/baseline/search.js --repeat 3` compares Rust with a reference module at fixed depth and fixed time, alternating engine order. Wall-clock measurements include native subprocess startup; native `elapsedMs` reports search time. It checks full PV legality, input immutability, and work accounting. `--json` records source hashes and individual measurements; `--mode depth` or `--mode time` runs just one comparison.
 
 The tactical suite in `examples/tactics/` measures captures for both colors, coordinated multi-board captures and evasions, temporal mates, knight underpromotion, defended captures, and terminal positions. `npm run strength -- --nodes 1000,5000,20000,50000 --repeat 2 --json` reports results at fixed work budgets. Each run validates the full principal variation and checks that the input history is unchanged; repeats check deterministic search results. `--strict` exits with failure if a selected case is unsolved or invalid. Use `--case ID` to inspect one case and `--engine PATH` to compare an earlier compatible search module. These are curated regressions, not an independent rating.
 
-The locked-king puzzle adds regressions for bishop rewinds, compound mating turns, and optional-board defenses. Its hardest added mate-in-one case falls from 49,078 to 2,117 work nodes with the bounded probe. Evaluation also retains the earliest sampled historical kings beyond its recent-history window. See [puzzle-inspired changes, measurements, and limits](docs/performance.md#puzzle-inspired-tactical-search).
+The locked-king puzzle adds regressions for bishop rewinds, compound mating turns, and optional-board defenses. In the JavaScript reference, its hardest added mate-in-one case falls from 49,078 to 2,117 work nodes with the bounded probe. Evaluation also retains the earliest sampled historical kings beyond its recent-history window. See [puzzle-inspired changes, measurements, and limits](docs/performance.md#puzzle-inspired-tactical-search).
 
 Paired matches use the independent miniature and opening positions in `examples/matches/suite.json`, giving each engine both colors under equal search/generation work limits. `--suite FILE`, `--case ID,ID`, `--depth N`, and `--qdepth N` control the comparison; alternate modules must export `analyze`. `--seed 1,2 --opening-plies 2` adds reproducible legal opening variations. Seeds without opening plies repeat the same starts and do not add independent evidence. Reports preserve full move traces, validate actions and principal variations, check input immutability, and expose deterministic self-match discrepancies when both engine paths are identical.
 
 Only exhaustive full-rule verification awards a checkmate win or stalemate draw. Verification can become expensive on large multiverses; `--terminal-work N` and `--time-ms N` bound it, and reaching either cap leaves the game `UNFINISHED`. Turn caps, missing moves, time stops and search-policy boundaries also stay unfinished; a legal fallback from an incomplete node-limited search can continue. There is no repetition or evaluation-based draw adjudication. Reports include scores among finished games and separately among complete color-swapped pairs: prefer the paired figure, because differing unfinished rates can bias the former. The suite is a development diagnostic, not an Elo rating or broad strength guarantee.
 
 [The heuristic experiment report](docs/heuristic-tuning.md) records 54 alternatives, paired matches, rejected changes, and reproduction commands. `scripts/snapshot-engine.js` freezes a Git revision for comparison, and `scripts/tune-weights.js` screens isolated evaluation profiles before matches. No candidate established a reliable improvement in this experiment, so the production heuristics were retained.
+
+## JavaScript reference performance history
+
+The implementation details and measurements in this section describe the retained JavaScript reference engine. They document its optimization history; the [Rust engine guide](docs/rust-engine.md) describes the native implementation now used by the app and CLI.
 
 Search retains the exact order of a preferred full turn, including optional moves after a legal submission. Quiet-move history transfers across half-turns, so useful ordering survives as the search deepens. Tactical cache entries are isolated by horizon and share the configured table-size limit; `qTtHits` reports their reuse. The checked-horizon boundary also verifies whether an evasion itself ends the game before assigning a static score. Immutable board encodings are reused within each search while keeping exact, complete-history position keys. Temporal evaluation uses allocation-free integer geometry and includes pawn and brawn royal threats.
 

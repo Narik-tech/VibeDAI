@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -9,6 +9,7 @@ import { createPosition, formatAction, validateAction } from '../src/rules.js';
 const HELP = `Benchmark classical search at fixed depth and fixed time.
 
 Usage: npm run benchmark:classical -- [options]
+  --engine PATH     Current engine module (default: src/rust-engine.js)
   --baseline PATH   Compare with another search.js and its adjacent source files
   --time-ms N       Fixed-time budget per run (default: BENCH_TIME_MS or 1000)
   --depth-time-ms N Fixed-depth safety time limit (default: 3000)
@@ -45,7 +46,7 @@ function settings(args) {
   for (let index = 0; index < args.length; index++) {
     const key = args[index];
     if (['--help', '--json'].includes(key)) parsed[key.slice(2)] = true;
-    else if (['--baseline', '--time-ms', '--depth-time-ms', '--repeat', '--warmup', '--depth', '--mode', '--case'].includes(key)
+    else if (['--engine', '--baseline', '--time-ms', '--depth-time-ms', '--repeat', '--warmup', '--depth', '--mode', '--case'].includes(key)
       && args[index + 1] !== undefined && !args[index + 1].startsWith('--')) parsed[key.slice(2)] = args[++index];
     else throw new Error(`Unknown option or missing value: ${key}`);
   }
@@ -53,6 +54,7 @@ function settings(args) {
   if (parsed.mode && !['both', 'depth', 'time'].includes(parsed.mode)) throw new Error('--mode must be both, depth, or time.');
   if (parsed.case && !['standard', 'opening', 'two-timelines', 'temporal'].includes(parsed.case)) throw new Error('Unknown benchmark case.');
   return {
+    engine: parsed.engine ? resolve(parsed.engine) : fileURLToPath(new URL('../src/rust-engine.js', import.meta.url)),
     baseline: parsed.baseline ? resolve(parsed.baseline) : null,
     timeMs: integer(parsed['time-ms'] ?? process.env.BENCH_TIME_MS ?? 1000, 1, 3600000, 'Time budget'),
     depthTimeMs: integer(parsed['depth-time-ms'] ?? 3000, 1, 3600000, 'Fixed-depth time limit'),
@@ -67,13 +69,20 @@ function settings(args) {
 
 async function loadEngine(name, path) {
   const url = pathToFileURL(path);
-  const { analyze } = await import(url.href);
+  const { analyze, DEFAULT_CLASSICAL_ENGINE_PATH } = await import(url.href);
   if (typeof analyze !== 'function') throw new Error(`${path} does not export analyze().`);
   // Include the dependencies that determine classical search behavior so a
   // saved comparison identifies more than just the entry-point revision.
   const sources = {};
   for (const file of ['search.js', 'rules.js', 'evaluate.js', 'heuristics.js', 'royal-safety.js', 'search-cache.js']) {
     sources[file] = createHash('sha256').update(await readFile(file === 'search.js' ? url : new URL(file, url))).digest('hex');
+  }
+  if (url.pathname.endsWith('/rust-engine.js')) {
+    const nativeSources = (await readdir(new URL('../rust/classical-engine/src/', url))).filter(name => name.endsWith('.rs')).map(name => `src/${name}`);
+    for (const file of ['Cargo.toml', 'Cargo.lock', ...nativeSources]) {
+      sources[`rust/${file}`] = createHash('sha256').update(await readFile(new URL(`../rust/classical-engine/${file}`, url))).digest('hex');
+    }
+    sources.nativeBinary = createHash('sha256').update(await readFile(process.env.CLASSICAL_ENGINE_PATH || DEFAULT_CLASSICAL_ENGINE_PATH)).digest('hex');
   }
   return { name, path, sources, analyze };
 }
@@ -94,11 +103,11 @@ function validate(position, original, result) {
   assert(result.score === null || Number.isFinite(result.score), 'Search returned an invalid score.');
 }
 
-function run(engine, fixture, limits) {
+async function run(engine, fixture, limits) {
   globalThis.gc?.();
   const position = createPosition(fixture.setup), original = structuredClone(position);
   const start = performance.now();
-  const result = engine.analyze(position, limits);
+  const result = await engine.analyze(position, limits);
   const wallMs = performance.now() - start;
   validate(position, original, result);
   return {
@@ -150,7 +159,7 @@ function summaries(rows) {
 async function main() {
   const options = settings(process.argv.slice(2));
   if (options.help) { console.log(HELP); return; }
-  const currentPath = fileURLToPath(new URL('../src/search.js', import.meta.url));
+  const currentPath = options.engine;
   if (options.baseline === currentPath) throw new Error('Baseline must be a different source file.');
   const engines = [];
   if (options.baseline) engines.push(await loadEngine('baseline', options.baseline));
@@ -166,7 +175,7 @@ async function main() {
   // Warm every module and fixture before recording samples. Each analyze call
   // still starts with fresh search tables and ordering history.
   for (let round = 0; round < options.warmup; round++) {
-    for (const fixture of cases) for (const engine of engines) run(engine, fixture, { ...limits(fixture), timeMs: 250 });
+    for (const fixture of cases) for (const engine of engines) await run(engine, fixture, { ...limits(fixture), timeMs: 250 });
   }
   const rows = [];
   for (const fixture of cases) {
@@ -174,7 +183,7 @@ async function main() {
       for (let repeat = 1; repeat <= options.repeat; repeat++) {
         const order = repeat % 2 ? engines : [...engines].reverse();
         for (const engine of order) {
-          const row = run(engine, fixture, { ...limits(fixture),
+          const row = await run(engine, fixture, { ...limits(fixture),
             timeMs: mode === 'depth' ? options.depthTimeMs : options.timeMs,
             maxDepth: mode === 'depth' ? options.depth ?? fixture.depth : 64 });
           Object.assign(row, { mode, repeat });

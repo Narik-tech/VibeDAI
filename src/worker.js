@@ -1,5 +1,5 @@
 import { parentPort, workerData } from 'node:worker_threads';
-import { analyze } from './parallel-search.js';
+import { analyze } from './rust-engine.js';
 import { formatAction, validateAction } from './rules.js';
 import { isNeuralEngine } from './leela-config.js';
 

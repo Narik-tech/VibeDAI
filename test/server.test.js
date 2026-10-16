@@ -46,6 +46,7 @@ test('analysis runs separately, produces a legal action, and can be played', asy
     job = (await request(`/api/analysis/${created.data.jobId}`)).data;
   } while (job.status === 'running' && Date.now() < deadline);
   assert.equal(job.status, 'done', job.error);
+  assert.equal(job.result.backend, 'rust');
   assert.ok(Array.isArray(job.result.bestAction));
   assert.equal(job.result.limits.cacheMemoryMb, 128);
   assert.equal(job.result.limits.maxNodes, 2000000);

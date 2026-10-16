@@ -7,3 +7,4 @@ archive/models-*/
 .venv-transformer/
 __pycache__/
 *.pyc
+rust/classical-engine/target/
